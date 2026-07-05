@@ -38,7 +38,7 @@ function seaStubPlugin() {
 	};
 }
 
-const [major, minor] = require("process").versions.node.split(".").map((part) => Number(part));
+const [major, minor] = process.versions.node.split(".").map((part) => Number(part));
 const canBuildSea = major > 25 || (major === 25 && (minor ?? 0) >= 7);
 
 export default defineConfig([
