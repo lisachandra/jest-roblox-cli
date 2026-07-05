@@ -2,6 +2,7 @@ import { collectPaths, resolveNestedProjects } from "@isentinel/rojo-utils";
 
 import { type } from "arktype";
 import { getTsconfig } from "get-tsconfig";
+import * as cp from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -34,6 +35,7 @@ import { prepareShadowRoot } from "./shadow-root.ts";
 
 const COVERAGE_DIR = ".jest-roblox/coverage";
 const COVERAGE_MANIFEST = "coverage-manifest.json";
+const COVERAGE_PLACE_HOOK_ENV = "JEST_ROBLOX_COVERAGE_PLACE_HOOK";
 
 /** Where the coverage path publishes its sibling manifests (cwd-relative). */
 export const COVERAGE_MANIFEST_PATH: string = path.join(COVERAGE_DIR, COVERAGE_MANIFEST);
@@ -256,6 +258,8 @@ export function prepareCoverage(
 		coverageRoots,
 		placeFile,
 	);
+
+	applyCoveragePlaceHook(placeFile);
 
 	const buildId = crypto.randomUUID();
 	const manifest = buildAndWriteManifest({
@@ -527,4 +531,23 @@ function reuseCoverageResult(options: ReuseCoverageOptions): PrepareCoverageResu
 function hasDroppedLuauRoot(previous: Array<string>, current: Array<string>): boolean {
 	const currentSet = new Set(current.map(normalizeWindowsPath));
 	return previous.some((root) => !currentSet.has(normalizeWindowsPath(root)));
+}
+
+function shellQuote(value: string): string {
+	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function applyCoveragePlaceHook(placeFile: string): void {
+	const command = process.env[COVERAGE_PLACE_HOOK_ENV];
+	if (command === undefined || command.trim() === "") {
+		return;
+	}
+
+	const resolvedPlaceFile = path.resolve(placeFile);
+	const expandedCommand = command.replaceAll("{placeFile}", shellQuote(resolvedPlaceFile));
+	try {
+		cp.execSync(expandedCommand, { stdio: "inherit" });
+	} catch (err) {
+		throw new Error(`${COVERAGE_PLACE_HOOK_ENV} failed`, { cause: err });
+	}
 }

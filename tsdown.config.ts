@@ -38,6 +38,9 @@ function seaStubPlugin() {
 	};
 }
 
+const [major, minor] = require("process").versions.node.split(".").map((part) => Number(part));
+const canBuildSea = major > 25 || (major === 25 && (minor ?? 0) >= 7);
+
 export default defineConfig([
 	{
 		clean: true,
@@ -68,21 +71,25 @@ export default defineConfig([
 		target: ["node24"],
 		unbundle: false,
 	},
-	{
-		deps: { alwaysBundle: [/.*/] },
-		entry: ["src/sea-entry.ts"],
-		exe: {
-			fileName: "jest-roblox",
-			outDir: "dist/sea",
-			seaConfig: {
-				disableExperimentalSEAWarning: true,
-				useCodeCache: true,
-			},
-		},
-		format: ["cjs"],
-		outDir: "dist/sea",
-		plugins: [seaStubPlugin(), luauRawPlugin()],
-		shims: true,
-		target: ["node25"],
-	},
+	...(canBuildSea
+		? [
+				{
+					deps: { alwaysBundle: [/.*/] },
+					entry: ["src/sea-entry.ts"],
+					exe: {
+						fileName: "jest-roblox",
+						outDir: "dist/sea",
+						seaConfig: {
+							disableExperimentalSEAWarning: true,
+							useCodeCache: true,
+						},
+					},
+					format: ["cjs"],
+					outDir: "dist/sea",
+					plugins: [seaStubPlugin(), luauRawPlugin()],
+					shims: true,
+					target: ["node25"],
+				},
+			]
+		: []),
 ]);
