@@ -5,6 +5,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import process from "node:process";
 
+import { applyPlaceHook } from "./utils/place-hook.ts";
+
 import type { Backend, StreamingHooks } from "./backends/interface.ts";
 import { applyExcludes } from "./config/apply-excludes.ts";
 import { deriveTypecheckInclude } from "./config/derive-typecheck-include.ts";
@@ -387,6 +389,8 @@ async function runWorkspaceProfiled(
 			projectFile: synthProjectPath,
 		});
 	});
+
+	applyPlaceHook(synthRbxlPath);
 
 	// Emit only after the shared build succeeds: `buildPlace` throws on a failed
 	// rojo build, so a per-package Build Manifest never points at a place that

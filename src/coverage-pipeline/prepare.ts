@@ -2,12 +2,13 @@ import { collectPaths, resolveNestedProjects } from "@isentinel/rojo-utils";
 
 import { type } from "arktype";
 import { getTsconfig } from "get-tsconfig";
-import * as cp from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import process from "node:process";
 import picomatch from "picomatch";
+
+import { applyPlaceHook } from "../utils/place-hook.ts";
 
 import type { ResolvedConfig } from "../config/schema.ts";
 import { buildPlace } from "../staging/place-builder.ts";
@@ -259,7 +260,7 @@ export function prepareCoverage(
 		placeFile,
 	);
 
-	applyCoveragePlaceHook(placeFile);
+	applyPlaceHook(placeFile, COVERAGE_PLACE_HOOK_ENV);
 
 	const buildId = crypto.randomUUID();
 	const manifest = buildAndWriteManifest({
@@ -531,23 +532,4 @@ function reuseCoverageResult(options: ReuseCoverageOptions): PrepareCoverageResu
 function hasDroppedLuauRoot(previous: Array<string>, current: Array<string>): boolean {
 	const currentSet = new Set(current.map(normalizeWindowsPath));
 	return previous.some((root) => !currentSet.has(normalizeWindowsPath(root)));
-}
-
-function shellQuote(value: string): string {
-	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
-}
-
-function applyCoveragePlaceHook(placeFile: string): void {
-	const command = process.env[COVERAGE_PLACE_HOOK_ENV];
-	if (command === undefined || command.trim() === "") {
-		return;
-	}
-
-	const resolvedPlaceFile = path.resolve(placeFile);
-	const expandedCommand = command.replaceAll("{placeFile}", shellQuote(resolvedPlaceFile));
-	try {
-		cp.execSync(expandedCommand, { stdio: "inherit" });
-	} catch (err) {
-		throw new Error(`${COVERAGE_PLACE_HOOK_ENV} failed`, { cause: err });
-	}
 }

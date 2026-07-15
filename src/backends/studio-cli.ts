@@ -18,6 +18,7 @@ import {
 } from "../staging/place-builder.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import { parseEnvelope } from "./envelope.ts";
+import { applyPlaceHook } from "../utils/place-hook.ts";
 import {
 	type Backend,
 	type BackendOptions,
@@ -349,6 +350,8 @@ export class StudioCliBackend implements Backend {
 			projectFile: path.join(workDirectory, PLACE_PROJECT_FILE),
 			wrap: false,
 		});
+
+		applyPlaceHook(placeFile);
 
 		return placeFile;
 	}
