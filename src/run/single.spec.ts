@@ -589,7 +589,9 @@ describe(runSingleProject, () => {
 			const result = await runSingleProject(makeOptions({ collectCoverage: true }));
 
 			expect(result.preCoverageMs).toBeGreaterThanOrEqual(0);
-			expect(capture.runOptions?.jobs[0]?.config.placeFile).toContain("game.rbxl");
+			expect(capture.runOptions?.jobs[0]?.config.placeFile).toBe(
+				".jest-roblox\\coverage\\game.rbxl",
+			);
 			expect(
 				result.coverageArtifacts?.projects.map((project) => project.projectDataModelPath),
 			).toContain("ReplicatedStorage");
