@@ -50,6 +50,13 @@ if testArgs == nil then
 	return
 end
 
+-- Only jest-roblox sessions carry `test == true`; ignore foreign
+-- StudioTestService sessions (e.g. the @internal/studio-e2e runner) instead
+-- of ending them with a protocol error.
+if testArgs.test ~= true then
+	return
+end
+
 -- Version handshake: reject a missing or mismatched `protocolVersion` before
 -- running anything, mirroring the WebSocket `version_mismatch` path. The error
 -- envelope still echoes our version (via endTest), so the CLI surfaces the
