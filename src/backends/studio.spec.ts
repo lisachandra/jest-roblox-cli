@@ -39,8 +39,8 @@ function job(displayName: string, overrides: Partial<ResolvedConfig> = {}): Proj
 
 // Workspace jobs carry `pkg`; the backend then drives the staged materializer
 // dispatch by sending `workspace.entries` rather than `config.configs`.
-function wsJob(package_: string, displayName: string): ProjectJob {
-	return { ...job(displayName), pkg: package_ };
+function wsJob(packageName: string, displayName: string): ProjectJob {
+	return { ...job(displayName), pkg: packageName };
 }
 
 const singleJobOptions: BackendOptions = { jobs: [job("")] };
@@ -106,7 +106,7 @@ describe("protocol version handshake", () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -133,7 +133,7 @@ describe("protocol version handshake", () => {
 		wss.emit("connection", socket);
 		await promise;
 
-		expect(captured?.protocolVersion).toBeTypeOf("number");
+		expect(captured!.protocolVersion).toBeTypeOf("number");
 	});
 
 	it("should reject a stale v1 plugin response that omits protocolVersion echo", async () => {
@@ -145,7 +145,7 @@ describe("protocol version handshake", () => {
 		// "Invalid plugin message" error rather than running with no
 		// runtime injection.
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -180,7 +180,7 @@ describe("protocol version handshake", () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -212,7 +212,7 @@ describe("protocol version handshake", () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -245,20 +245,27 @@ describe(StudioBackend, () => {
 		expect.assertions(4);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests({
+		const promise = backend.runTestsAsync({
 			jobs: [
 				job("alpha", { testNamePattern: "alpha-pattern" }),
 				job("beta", { testNamePattern: "beta-pattern" }),
 			],
 		});
 
+		// Narrower than the shared `pluginRequest` (whose `configs` is
+		// `unknown[]`): this test reads back each job's `testNamePattern`.
+		const configsRequest = type({
+			config: { configs: type({ "testNamePattern?": "string" }).array() },
+			request_id: "string",
+		});
+
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
-		let capturedConfig: undefined | { configs: Array<{ testNamePattern?: string }> };
+		let capturedConfig: typeof configsRequest.infer.config | undefined;
 
 		socket.send.mockImplementation((data) => {
-			const message = pluginRequest.assert(JSON.parse(data));
-			capturedConfig = message.config as { configs: Array<{ testNamePattern?: string }> };
+			const message = configsRequest.assert(JSON.parse(data));
+			capturedConfig = message.config;
 			queueMicrotask(() => {
 				socket.emit(
 					"message",
@@ -283,9 +290,9 @@ describe(StudioBackend, () => {
 		await promise;
 
 		expect(socket.send).toHaveBeenCalledOnce();
-		expect(capturedConfig?.configs).toHaveLength(2);
-		expect(capturedConfig?.configs[0]?.testNamePattern).toBe("alpha-pattern");
-		expect(capturedConfig?.configs[1]?.testNamePattern).toBe("beta-pattern");
+		expect(capturedConfig!.configs).toHaveLength(2);
+		expect(capturedConfig!.configs[0]!.testNamePattern).toBe("alpha-pattern");
+		expect(capturedConfig!.configs[1]!.testNamePattern).toBe("beta-pattern");
 	});
 
 	it("should send a workspace entries payload when jobs carry pkg", async () => {
@@ -296,7 +303,7 @@ describe(StudioBackend, () => {
 		expect.assertions(3);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests({
+		const promise = backend.runTestsAsync({
 			jobs: [wsJob("@scope/a", "a"), wsJob("@scope/b", "b")],
 		});
 
@@ -334,9 +341,9 @@ describe(StudioBackend, () => {
 		wss.emit("connection", socket);
 		await promise;
 
-		expect(captured?.workspace.entries).toHaveLength(2);
-		expect(captured?.workspace.entries[0]!.pkg).toBe("@scope/a");
-		expect(captured?.workspace.entries[1]!.project).toBe("b");
+		expect(captured!.workspace.entries).toHaveLength(2);
+		expect(captured!.workspace.entries[0]!.pkg).toBe("@scope/a");
+		expect(captured!.workspace.entries[1]!.project).toBe("b");
 	});
 
 	it("should fail fast when a workspace run has a job missing its package name", async () => {
@@ -349,7 +356,7 @@ describe(StudioBackend, () => {
 		const backend = new StudioBackend({ port: 0 });
 
 		await expect(
-			backend.runTests({ jobs: [wsJob("@scope/a", "a"), job("b")] }),
+			backend.runTestsAsync({ jobs: [wsJob("@scope/a", "a"), job("b")] }),
 		).rejects.toThrow(/missing its package name/);
 	});
 
@@ -357,7 +364,7 @@ describe(StudioBackend, () => {
 		expect.assertions(2);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests({ jobs: [job("alpha"), job("beta"), job("gamma")] });
+		const promise = backend.runTestsAsync({ jobs: [job("alpha"), job("beta"), job("gamma")] });
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, {
@@ -378,7 +385,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, {});
@@ -394,7 +401,7 @@ describe(StudioBackend, () => {
 		const fallback = JSON.stringify([{ message: "fallback", messageType: 0, timestamp: 0 }]);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, { gameOutput: fallback });
@@ -415,7 +422,7 @@ describe(StudioBackend, () => {
 		});
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, { rawJestOutput });
@@ -427,7 +434,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, { rawJestOutput: "{bad json" });
@@ -440,7 +447,7 @@ describe(StudioBackend, () => {
 
 		const backend = new StudioBackend({ port: 0, timeout: 100 });
 
-		await expect(backend.runTests(singleJobOptions)).rejects.toThrow(
+		await expect(backend.runTestsAsync(singleJobOptions)).rejects.toThrow(
 			"Timed out waiting for Studio plugin connection",
 		);
 	});
@@ -449,7 +456,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -501,7 +508,7 @@ describe(StudioBackend, () => {
 			preConnected: fromPartial({ server: wss, socket }),
 		});
 
-		const { rawResults } = await backend.runTests(singleJobOptions);
+		const { rawResults } = await backend.runTestsAsync(singleJobOptions);
 
 		expect(rawResults).toHaveLength(1);
 		expect(rawResults[0]!.entry.jestOutput).toContain('"numPassedTests":3');
@@ -511,7 +518,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -531,7 +538,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -548,7 +555,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 
@@ -563,7 +570,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		const socket = new MockWebSocket();
@@ -608,12 +615,12 @@ describe(StudioBackend, () => {
 
 		const backend = new StudioBackend({ port: 0 });
 
-		const firstPromise = backend.runTests(singleJobOptions);
+		const firstPromise = backend.runTestsAsync(singleJobOptions);
 		const firstWss = getLastCreatedServer()!;
 		connectAndReply(firstWss, {});
 		await firstPromise;
 
-		const secondPromise = backend.runTests(singleJobOptions);
+		const secondPromise = backend.runTestsAsync(singleJobOptions);
 		const secondWss = getLastCreatedServer()!;
 		connectAndReply(secondWss, {});
 		await secondPromise;
@@ -626,7 +633,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, {
@@ -645,7 +652,7 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests({ jobs: [job("alpha"), job("beta")] });
+		const promise = backend.runTestsAsync({ jobs: [job("alpha"), job("beta")] });
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, {
@@ -665,7 +672,7 @@ describe(StudioBackend, () => {
 		expect.assertions(2);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests({ jobs: [job("alpha"), job("beta")] });
+		const promise = backend.runTestsAsync({ jobs: [job("alpha"), job("beta")] });
 
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, {
@@ -685,17 +692,17 @@ describe(StudioBackend, () => {
 		expect.assertions(2);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 		const wss = getLastCreatedServer()!;
 		connectAndReply(wss, {});
 		await promise;
 
-		backend.close();
+		backend.closeAsync();
 
 		expect(wss.close).toHaveBeenCalledOnce();
 
 		// A second close() should no-op rather than double-closing.
-		backend.close();
+		backend.closeAsync();
 
 		expect(wss.close).toHaveBeenCalledOnce();
 	});
@@ -707,12 +714,12 @@ describe(StudioBackend, () => {
 		expect.assertions(1);
 
 		const backend = new StudioBackend({ port: 0 });
-		const promise = backend.runTests(singleJobOptions);
+		const promise = backend.runTestsAsync(singleJobOptions);
 		const wss = getLastCreatedServer()!;
 		const socket = connectAndReply(wss, {});
 		await promise;
 
-		backend.close();
+		backend.closeAsync();
 
 		expect(socket.terminate).toHaveBeenCalledOnce();
 	});
@@ -735,7 +742,7 @@ describe(StudioBackend, () => {
 			preConnected: fromPartial({ server: wss, socket }),
 		});
 
-		backend.close();
+		backend.closeAsync();
 
 		expect(socket.terminate).toHaveBeenCalledOnce();
 		expect(wss.close).toHaveBeenCalledOnce();

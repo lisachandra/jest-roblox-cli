@@ -4,20 +4,15 @@ import process from "node:process";
 import type { MockInstance } from "vitest";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { main, parseArgs, run } from "./cli.ts";
+import { main, parseArgs, runAsync } from "./cli.ts";
 import { ConfigError } from "./config/errors.ts";
 import { loadConfig } from "./config/loader.ts";
 import { DEFAULT_CONFIG, type ResolvedConfig } from "./config/schema.ts";
 import type { ExecuteResult } from "./executor.ts";
-import { outputMultiResult, outputSingleResult } from "./output.ts";
+import { outputMultiResultAsync } from "./output.ts";
 import { LuauScriptError } from "./reporter/parser.ts";
-import { runJestRoblox } from "./run.ts";
-import type {
-	MultiRunResult,
-	ProjectResult,
-	SingleRunResult,
-	WorkspaceRunResult,
-} from "./run/types.ts";
+import { runJestRobloxAsync } from "./run.ts";
+import type { MultiRunResult, ProjectResult, WorkspaceRunResult } from "./run/types.ts";
 import type { JestResult } from "./types/jest-result.ts";
 
 vi.mock(import("./config/loader"));
@@ -48,9 +43,8 @@ interface OutputSpies {
 
 const mocks = {
 	loadConfig: vi.mocked(loadConfig),
-	outputMultiResult: vi.mocked(outputMultiResult),
-	outputSingleResult: vi.mocked(outputSingleResult),
-	runJestRoblox: vi.mocked(runJestRoblox),
+	outputMultiResult: vi.mocked(outputMultiResultAsync),
+	runJestRoblox: vi.mocked(runJestRobloxAsync),
 };
 
 function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
@@ -88,15 +82,6 @@ function makeExecuteResult(overrides: Partial<ExecuteResult> = {}): ExecuteResul
 			totalMs: 200,
 			uploadMs: 50,
 		},
-		...overrides,
-	};
-}
-
-function makeSingleResult(overrides: Partial<SingleRunResult> = {}): SingleRunResult {
-	return {
-		mode: "single",
-		preCoverageMs: 0,
-		runtimeResult: makeExecuteResult(),
 		...overrides,
 	};
 }
@@ -140,8 +125,7 @@ function setupOutputSpies(): OutputSpies {
 function setupDefaults(configOverrides: Partial<ResolvedConfig> = {}) {
 	const config = makeConfig(configOverrides);
 	mocks.loadConfig.mockResolvedValue(config);
-	mocks.runJestRoblox.mockResolvedValue(makeSingleResult());
-	mocks.outputSingleResult.mockResolvedValue(0);
+	mocks.runJestRoblox.mockResolvedValue(makeMultiResult());
 	mocks.outputMultiResult.mockResolvedValue(0);
 	return { config };
 }
@@ -149,26 +133,31 @@ function setupDefaults(configOverrides: Partial<ResolvedConfig> = {}) {
 describe(parseArgs, () => {
 	it("should return help when --help is passed", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--help"]).help).toBeTrue();
 	});
 
 	it("should return version when --version is passed", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--version"]).version).toBeTrue();
 	});
 
 	it("should parse --config option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--config", "./custom.config.ts"]).config).toBe("./custom.config.ts");
 	});
 
 	it("should parse --testPathPattern option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--testPathPattern", "player"]).testPathPattern).toBe("player");
 	});
 
 	it("should parse -t / --testNamePattern option", () => {
 		expect.assertions(2);
+
 		expect(parseArgs(["-t", "should spawn"]).testNamePattern).toBe("should spawn");
 		expect(parseArgs(["--testNamePattern", "should spawn"]).testNamePattern).toBe(
 			"should spawn",
@@ -177,21 +166,25 @@ describe(parseArgs, () => {
 
 	it("should parse --formatters json", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--formatters", "json"]).formatters).toStrictEqual(["json"]);
 	});
 
 	it("should parse --outputFile option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--outputFile", "results.json"]).outputFile).toBe("results.json");
 	});
 
 	it("should parse --verbose flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--verbose"]).verbose).toBeTrue();
 	});
 
 	it("should parse --silent flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--silent"]).silent).toBeTrue();
 	});
 
@@ -205,6 +198,7 @@ describe(parseArgs, () => {
 
 	it("should leave files undefined when no positionals", () => {
 		expect.assertions(1);
+
 		expect(parseArgs([]).files).toBeUndefined();
 	});
 
@@ -220,47 +214,68 @@ describe(parseArgs, () => {
 
 	it("should parse --formatters agent", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--formatters", "agent"]).formatters).toStrictEqual(["agent"]);
 	});
 
 	it("should reject --no-cache as an unknown option", () => {
 		expect.assertions(1);
+
 		expect(() => parseArgs(["--no-cache"])).toThrow(/Unknown option/);
 	});
 
 	it("should reject --cache as an unknown option", () => {
 		expect.assertions(1);
+
 		expect(() => parseArgs(["--cache"])).toThrow(/Unknown option/);
 	});
 
 	it("should parse --no-coverage-cache flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--no-coverage-cache"]).coverageCache).toBeFalse();
+	});
+
+	it("should parse --no-upload-cache flag", () => {
+		expect.assertions(1);
+
+		expect(parseArgs(["--no-upload-cache"]).uploadCache).toBeFalse();
+	});
+
+	it("should leave uploadCache unset when the flag is absent", () => {
+		expect.assertions(1);
+
+		expect(parseArgs([]).uploadCache).toBeUndefined();
 	});
 
 	it("should parse --no-color flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--no-color"]).color).toBeFalse();
 	});
 
 	it("should parse --gameOutput option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--gameOutput", "/tmp/game.json"]).gameOutput).toBe("/tmp/game.json");
 	});
 
 	it("should parse --no-show-luau flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--no-show-luau"]).showLuau).toBeFalse();
 	});
 
 	it("should parse -u / --updateSnapshot flag", () => {
 		expect.assertions(2);
+
 		expect(parseArgs(["-u"]).updateSnapshot).toBeTrue();
 		expect(parseArgs(["--updateSnapshot"]).updateSnapshot).toBeTrue();
 	});
 
 	it("should parse --typecheck flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--typecheck"]).typecheck).toBeTrue();
 	});
 
@@ -275,6 +290,7 @@ describe(parseArgs, () => {
 
 	it("should parse --typecheckTsconfig option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--typecheckTsconfig", "tsconfig.test.json"]).typecheckTsconfig).toBe(
 			"tsconfig.test.json",
 		);
@@ -282,6 +298,7 @@ describe(parseArgs, () => {
 
 	it("should parse valid --backend values", () => {
 		expect.assertions(4);
+
 		expect(parseArgs(["--backend", "auto"]).backend).toBe("auto");
 		expect(parseArgs(["--backend", "open-cloud"]).backend).toBe("open-cloud");
 		expect(parseArgs(["--backend", "studio"]).backend).toBe("studio");
@@ -290,6 +307,7 @@ describe(parseArgs, () => {
 
 	it("should parse --studioPath", () => {
 		expect.assertions(2);
+
 		expect(parseArgs(["--studioPath", "C:/Studio/RobloxStudioBeta.exe"]).studioPath).toBe(
 			"C:/Studio/RobloxStudioBeta.exe",
 		);
@@ -298,17 +316,20 @@ describe(parseArgs, () => {
 
 	it("should parse --headed", () => {
 		expect.assertions(2);
+
 		expect(parseArgs(["--headed"]).headed).toBeTrue();
 		expect(parseArgs([]).headed).toBeUndefined();
 	});
 
 	it("should leave backend undefined when not passed", () => {
 		expect.assertions(1);
+
 		expect(parseArgs([]).backend).toBeUndefined();
 	});
 
 	it("should throw on invalid --backend value", () => {
 		expect.assertions(2);
+
 		expect(() => parseArgs(["--backend", "not-a-backend"])).toThrow(
 			'Invalid backend "not-a-backend"',
 		);
@@ -319,21 +340,25 @@ describe(parseArgs, () => {
 
 	it("should parse --coverage flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--coverage"]).collectCoverage).toBeTrue();
 	});
 
 	it("should parse --no-coverage flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--no-coverage"]).collectCoverage).toBeFalse();
 	});
 
 	it("should let --no-coverage take precedence over --coverage when both are passed", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--coverage", "--no-coverage"]).collectCoverage).toBeFalse();
 	});
 
 	it("should parse --coverageDirectory option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--coverageDirectory", "my-coverage"]).coverageDirectory).toBe(
 			"my-coverage",
 		);
@@ -354,6 +379,17 @@ describe(parseArgs, () => {
 		expect(result.coverageReporters).toStrictEqual(["text", "lcov", "html"]);
 	});
 
+	it("should throw on an invalid --coverageReporters value", () => {
+		expect.assertions(2);
+
+		expect(() => parseArgs(["--coverageReporters", "not-a-reporter"])).toThrow(
+			'Invalid coverage reporter "not-a-reporter"',
+		);
+		expect(() => {
+			return parseArgs(["--coverageReporters", "text", "--coverageReporters", "nope"]);
+		}).toThrow("Must be one of: clover, cobertura");
+	});
+
 	it("should parse --collectCoverageFrom with multiple values", () => {
 		expect.assertions(1);
 
@@ -369,23 +405,27 @@ describe(parseArgs, () => {
 
 	it("should leave collectCoverageFrom undefined when not passed", () => {
 		expect.assertions(1);
+
 		expect(parseArgs([]).collectCoverageFrom).toBeUndefined();
 	});
 
 	it("should parse --port option", () => {
 		expect.assertions(2);
+
 		expect(parseArgs(["--port", "4000"]).port).toBe(4000);
 		expect(parseArgs([]).port).toBeUndefined();
 	});
 
 	it("should parse --timeout option", () => {
 		expect.assertions(2);
+
 		expect(parseArgs(["--timeout", "60000"]).timeout).toBe(60000);
 		expect(parseArgs([]).timeout).toBeUndefined();
 	});
 
 	it("should parse single --project flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--project", "client"]).project).toStrictEqual(["client"]);
 	});
 
@@ -399,21 +439,25 @@ describe(parseArgs, () => {
 
 	it("should parse --passWithNoTests flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--passWithNoTests"]).passWithNoTests).toBeTrue();
 	});
 
 	it("should parse --parallel with integer value", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--parallel", "3"]).parallel).toBe(3);
 	});
 
 	it('should parse --parallel with "auto"', () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--parallel", "auto"]).parallel).toBe("auto");
 	});
 
 	it('should treat bare --parallel (no value) as "auto"', () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--parallel"]).parallel).toBe("auto");
 	});
 
@@ -428,36 +472,43 @@ describe(parseArgs, () => {
 
 	it("should leave parallel undefined when flag not present", () => {
 		expect.assertions(1);
+
 		expect(parseArgs([]).parallel).toBeUndefined();
 	});
 
 	it("should throw on --parallel 0", () => {
 		expect.assertions(1);
+
 		expect(() => parseArgs(["--parallel", "0"])).toThrow("Invalid --parallel value");
 	});
 
 	it("should throw on --parallel -1", () => {
 		expect.assertions(1);
+
 		expect(() => parseArgs(["--parallel=-1"])).toThrow("Invalid --parallel value");
 	});
 
 	it("should throw on --parallel non-numeric", () => {
 		expect.assertions(1);
+
 		expect(() => parseArgs(["--parallel=xyz"])).toThrow("Invalid --parallel value");
 	});
 
 	it("should parse --apiKey option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--apiKey", "secret"]).apiKey).toBe("secret");
 	});
 
 	it("should parse --universeId option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--universeId", "123"]).universeId).toBe("123");
 	});
 
 	it("should parse --placeId option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--placeId", "456"]).placeId).toBe("456");
 	});
 
@@ -483,21 +534,25 @@ describe(parseArgs, () => {
 
 	it("should parse --workspace flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--workspace"]).workspace).toBeTrue();
 	});
 
 	it("should parse --packages option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--packages", "foo,bar"]).packages).toBe("foo,bar");
 	});
 
 	it("should parse --affected-since option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--affected-since", "main"]).affectedSince).toBe("main");
 	});
 
 	it("should parse --workspace-root option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--workspace-root", "./pkgs/testing"]).workspaceRoot).toBe(
 			"./pkgs/testing",
 		);
@@ -521,6 +576,7 @@ describe(parseArgs, () => {
 
 	it("should parse --rojoProject option", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--rojoProject", "custom.project.json"]).rojoProject).toBe(
 			"custom.project.json",
 		);
@@ -528,11 +584,12 @@ describe(parseArgs, () => {
 
 	it("should parse --sourceMap flag", () => {
 		expect.assertions(1);
+
 		expect(parseArgs(["--sourceMap"]).sourceMap).toBeTrue();
 	});
 });
 
-describe(run, () => {
+describe(runAsync, () => {
 	it("should return 2 and print banner for ConfigError with hint", async () => {
 		expect.assertions(3);
 
@@ -540,7 +597,7 @@ describe(run, () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue(new ConfigError("bad value", "try this instead"));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("bad value"));
@@ -554,7 +611,7 @@ describe(run, () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue(new ConfigError("missing field"));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("missing field"));
@@ -570,7 +627,7 @@ describe(run, () => {
 			new LuauScriptError("Failed to find Jest instance in ReplicatedStorage"),
 		);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Luau Error"));
@@ -584,7 +641,7 @@ describe(run, () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue(new LuauScriptError("Some unrelated runtime error"));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Hint:"));
@@ -612,7 +669,7 @@ describe(run, () => {
 		]);
 		mocks.loadConfig.mockRejectedValue(error);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Test Run Failed"));
@@ -637,7 +694,7 @@ describe(run, () => {
 		]);
 		mocks.loadConfig.mockRejectedValue(error);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Luau Error"));
@@ -654,7 +711,7 @@ describe(run, () => {
 		error.bannerOutput = "[]";
 		mocks.loadConfig.mockRejectedValue(error);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Game output:"));
@@ -667,7 +724,7 @@ describe(run, () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue(new LuauScriptError("Exited with code: 1"));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Game output:"));
@@ -680,7 +737,7 @@ describe(run, () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue(new Error("something broke"));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.consoleError).toHaveBeenCalledWith("Error: something broke");
@@ -693,7 +750,7 @@ describe(run, () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue("string-error");
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.consoleError).toHaveBeenCalledWith("An unknown error occurred");
@@ -709,7 +766,7 @@ describe(run, () => {
 		});
 		mocks.loadConfig.mockRejectedValue(wrapped);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Backend Error"));
@@ -733,7 +790,7 @@ describe(run, () => {
 		});
 		mocks.loadConfig.mockRejectedValue(wrapped);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Caused by:"));
@@ -760,7 +817,7 @@ describe(run, () => {
 		);
 		mocks.loadConfig.mockRejectedValue(wrapped);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("universe-places:write"));
@@ -779,7 +836,7 @@ describe(run, () => {
 		});
 		mocks.loadConfig.mockRejectedValue(wrapped);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.consoleError).toHaveBeenCalledWith("Error: wrapped non-ocale");
@@ -802,7 +859,7 @@ describe("lUAU_ERROR_HINTS", () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue(new LuauScriptError(message));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining(fragment));
@@ -815,7 +872,7 @@ describe("lUAU_ERROR_HINTS", () => {
 		setupDefaults();
 		mocks.loadConfig.mockRejectedValue(new LuauScriptError("No projects configured"));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("projects"));
@@ -852,7 +909,7 @@ describe("runInner orchestration", () => {
 		const spies = setupOutputSpies();
 		setupDefaults();
 
-		const code = await run(["--help"]);
+		const code = await runAsync(["--help"]);
 
 		expect(code).toBe(0);
 		expect(spies.consoleLog).toHaveBeenCalledWith(
@@ -867,7 +924,7 @@ describe("runInner orchestration", () => {
 		const spies = setupOutputSpies();
 		setupDefaults();
 
-		const code = await run(["--version"]);
+		const code = await runAsync(["--version"]);
 
 		expect(code).toBe(0);
 		expect(spies.consoleLog).toHaveBeenCalledOnce();
@@ -880,17 +937,9 @@ describe("runInner orchestration", () => {
 		const spies = setupOutputSpies();
 		setupDefaults();
 
-		const previous = process.env["JEST_ROBLOX_SEA"];
-		process.env["JEST_ROBLOX_SEA"] = "true";
-		onTestFinished(() => {
-			if (previous === undefined) {
-				delete process.env["JEST_ROBLOX_SEA"];
-			} else {
-				process.env["JEST_ROBLOX_SEA"] = previous;
-			}
-		});
+		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const code = await run(["--typecheck"]);
+		const code = await runAsync(["--typecheck"]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("standalone binary"));
@@ -902,7 +951,7 @@ describe("runInner orchestration", () => {
 		setupOutputSpies();
 		setupDefaults();
 
-		await run(["--config", "./custom.ts"]);
+		await runAsync(["--config", "./custom.ts"]);
 
 		expect(mocks.loadConfig).toHaveBeenCalledWith("./custom.ts", undefined);
 	});
@@ -913,7 +962,7 @@ describe("runInner orchestration", () => {
 		setupOutputSpies();
 		setupDefaults();
 
-		await run(["--workspace", "--packages", "foo", "--workspace-root", "/ws"]);
+		await runAsync(["--workspace", "--packages", "foo", "--workspace-root", "/ws"]);
 
 		expect(mocks.loadConfig).toHaveBeenCalledWith(undefined, "/ws");
 	});
@@ -924,7 +973,7 @@ describe("runInner orchestration", () => {
 		setupOutputSpies();
 		setupDefaults();
 
-		await run(["--verbose"]);
+		await runAsync(["--verbose"]);
 
 		expect(mocks.runJestRoblox).toHaveBeenCalledOnce();
 
@@ -933,66 +982,48 @@ describe("runInner orchestration", () => {
 		expect(cli.verbose).toBeTrue();
 	});
 
-	it("should dispatch SingleRunResult to outputSingleResult", async () => {
-		expect.assertions(3);
-
-		setupOutputSpies();
-		setupDefaults();
-		const single = makeSingleResult();
-		mocks.runJestRoblox.mockResolvedValue(single);
-		mocks.outputSingleResult.mockResolvedValue(0);
-
-		const code = await run([]);
-
-		expect(code).toBe(0);
-		expect(mocks.outputSingleResult).toHaveBeenCalledWith(expect.any(Object), single);
-		expect(mocks.outputMultiResult).not.toHaveBeenCalled();
-	});
-
-	it("should propagate non-zero exit code from outputSingleResult", async () => {
+	it("should propagate a non-zero exit code from outputMultiResult", async () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
 		setupDefaults();
-		mocks.outputSingleResult.mockResolvedValue(1);
+		mocks.outputMultiResult.mockResolvedValue(1);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(1);
 	});
 
 	it("should dispatch MultiRunResult to outputMultiResult", async () => {
-		expect.assertions(3);
+		expect.assertions(2);
 
 		setupOutputSpies();
 		setupDefaults();
 		const multi = makeMultiResult();
 		mocks.runJestRoblox.mockResolvedValue(multi);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(0);
 		expect(mocks.outputMultiResult).toHaveBeenCalledWith(expect.any(Object), multi);
-		expect(mocks.outputSingleResult).not.toHaveBeenCalled();
 	});
 
 	it("should dispatch WorkspaceRunResult to outputMultiResult", async () => {
-		expect.assertions(3);
+		expect.assertions(2);
 
 		setupOutputSpies();
 		setupDefaults();
 		const workspace = makeWorkspaceResult();
 		mocks.runJestRoblox.mockResolvedValue(workspace);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(0);
 		expect(mocks.outputMultiResult).toHaveBeenCalledWith(expect.any(Object), workspace);
-		expect(mocks.outputSingleResult).not.toHaveBeenCalled();
 	});
 
 	it("should write validationMessage to stderr and return validationExitCode", async () => {
-		expect.assertions(4);
+		expect.assertions(3);
 
 		const spies = setupOutputSpies();
 		setupDefaults();
@@ -1004,12 +1035,11 @@ describe("runInner orchestration", () => {
 			}),
 		);
 
-		const code = await run(["--workspace"]);
+		const code = await runAsync(["--workspace"]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith("Error: --workspace requires --packages.\n");
 		expect(mocks.outputMultiResult).not.toHaveBeenCalled();
-		expect(mocks.outputSingleResult).not.toHaveBeenCalled();
 	});
 
 	it("should not write to stderr when validationMessage is undefined", async () => {
@@ -1021,7 +1051,7 @@ describe("runInner orchestration", () => {
 			makeMultiResult({ projectResults: [], validationExitCode: 2 }),
 		);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).not.toHaveBeenCalled();
@@ -1034,43 +1064,10 @@ describe("runInner orchestration", () => {
 		setupDefaults();
 		mocks.runJestRoblox.mockResolvedValue(makeWorkspaceResult({ projectResults: [] }));
 
-		const code = await run(["--workspace", "--affected-since", "main"]);
+		const code = await runAsync(["--workspace", "--affected-since", "main"]);
 
 		expect(code).toBe(0);
 		expect(mocks.outputMultiResult).not.toHaveBeenCalled();
-	});
-
-	it("should return 0 for single mode with no runtime and no typecheck result", async () => {
-		expect.assertions(2);
-
-		setupOutputSpies();
-		setupDefaults();
-		mocks.runJestRoblox.mockResolvedValue(
-			makeSingleResult({ runtimeResult: undefined, typecheckResult: undefined }),
-		);
-
-		const code = await run([]);
-
-		expect(code).toBe(0);
-		expect(mocks.outputSingleResult).not.toHaveBeenCalled();
-	});
-
-	it("should dispatch single mode with only typecheckResult", async () => {
-		expect.assertions(2);
-
-		setupOutputSpies();
-		setupDefaults();
-		mocks.runJestRoblox.mockResolvedValue(
-			makeSingleResult({
-				runtimeResult: undefined,
-				typecheckResult: makeJestResult(),
-			}),
-		);
-
-		const code = await run(["--typecheckOnly"]);
-
-		expect(code).toBe(0);
-		expect(mocks.outputSingleResult).toHaveBeenCalledOnce();
 	});
 
 	it("should return 0 for multi mode with empty projects and no typecheck", async () => {
@@ -1080,7 +1077,7 @@ describe("runInner orchestration", () => {
 		setupDefaults();
 		mocks.runJestRoblox.mockResolvedValue(makeMultiResult({ projectResults: [] }));
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(0);
 		expect(mocks.outputMultiResult).not.toHaveBeenCalled();
@@ -1095,7 +1092,7 @@ describe("runInner orchestration", () => {
 			makeMultiResult({ projectResults: [], typecheckResult: makeJestResult() }),
 		);
 
-		const code = await run([]);
+		const code = await runAsync([]);
 
 		expect(code).toBe(0);
 		expect(mocks.outputMultiResult).toHaveBeenCalledOnce();
@@ -1107,7 +1104,7 @@ describe("runInner orchestration", () => {
 		setupOutputSpies();
 		setupDefaults({ collectCoverage: true });
 
-		await run(["--no-coverage"]);
+		await runAsync(["--no-coverage"]);
 
 		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
 
@@ -1120,7 +1117,7 @@ describe("runInner orchestration", () => {
 		setupOutputSpies();
 		setupDefaults();
 
-		await run(["--formatters", "json"]);
+		await runAsync(["--formatters", "json"]);
 
 		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
 
@@ -1138,7 +1135,7 @@ describe("runInner orchestration", () => {
 			stdEnvironmentMock.isAgent = false;
 		});
 
-		await run([]);
+		await runAsync([]);
 
 		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
 
@@ -1151,17 +1148,9 @@ describe("runInner orchestration", () => {
 		setupOutputSpies();
 		setupDefaults();
 
-		const previous = process.env["GITHUB_ACTIONS"];
-		process.env["GITHUB_ACTIONS"] = "true";
-		onTestFinished(() => {
-			if (previous === undefined) {
-				delete process.env["GITHUB_ACTIONS"];
-			} else {
-				process.env["GITHUB_ACTIONS"] = previous;
-			}
-		});
+		vi.stubEnv("GITHUB_ACTIONS", "true");
 
-		await run([]);
+		await runAsync([]);
 
 		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
 

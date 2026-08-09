@@ -37,8 +37,8 @@ describe(mapFromSourceMap, () => {
 		const result = mapFromSourceMap("output.luau", 1);
 
 		expect(result).toBeDefined();
-		expect(result?.source).toBe("../src/input.ts");
-		expect(result?.line).toBe(1);
+		expect(result!.source).toBe("../src/input.ts");
+		expect(result!.line).toBe(1);
 	});
 
 	it("should return undefined for unmapped lines", () => {
@@ -65,8 +65,6 @@ describe(mapFromSourceMap, () => {
 		expect.assertions(2);
 
 		onTestFinished(clearMapCache);
-
-		vi.clearAllMocks();
 
 		const sourceMap = JSON.stringify({
 			file: "output.luau",

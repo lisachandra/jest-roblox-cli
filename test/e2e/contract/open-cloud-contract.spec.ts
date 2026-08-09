@@ -5,7 +5,7 @@ import * as path from "node:path";
 import process from "node:process";
 import { describe, expect, it } from "vitest";
 
-import { type FakeOpenCloudTask, startFakeOpenCloudServer } from "../cli/fake-open-cloud.ts";
+import { type FakeOpenCloudTask, startFakeOpenCloudServerAsync } from "../cli/fake-open-cloud.ts";
 
 interface HttpResponse {
 	body: unknown;
@@ -68,7 +68,7 @@ const liveCase = resolveLiveCase();
 const fake: ContractCase = {
 	apiKey: "test-api-key",
 	resolve: async (tasks) => {
-		const server = await startFakeOpenCloudServer(tasks);
+		const server = await startFakeOpenCloudServerAsync(tasks);
 		return { baseUrl: server.baseUrl, placeId: "456", universeId: "123" };
 	},
 };
@@ -123,18 +123,23 @@ describe.for(cases)("open Cloud contract ($name)", ({ testCase }) => {
 				{ jestOutput: JSON.stringify(buildPassingJestPayload()) },
 			]);
 			const http = createHttpClient(testCase.apiKey);
-			const taskPath = await createTask({
+			const taskPath = await createTaskAsync({
 				baseUrl,
 				http,
 				placeId,
 				script: buildSuccessLuauScript(),
 				universeId,
 			});
-			const status = await pollUntilTerminal(http, baseUrl, taskPath, SUCCESS_TIMEOUT_MS);
+			const status = await pollUntilTerminalAsync(
+				http,
+				baseUrl,
+				taskPath,
+				SUCCESS_TIMEOUT_MS,
+			);
 
 			expect(status.state).toBe("COMPLETE");
 
-			const results = status.output?.results ?? [];
+			const results = status.output!.results!;
 			const envelopeRaw = results[0];
 			const parsed = parseEnvelope(envelopeRaw);
 
@@ -142,12 +147,10 @@ describe.for(cases)("open Cloud contract ($name)", ({ testCase }) => {
 			// Assert at least one entry has a `jestOutput` string — the
 			// minimum shape `parseEnvelope` and `buildProjectResult` rely on.
 			expect(
-				parsed?.entries.some((entry) => typeof entry.jestOutput === "string"),
+				parsed!.entries.some((entry) => typeof entry.jestOutput === "string"),
 			).toBeTrue();
 
-			const second: unknown = results[1];
-
-			expect(second === undefined || typeof second === "string").toBeTrue();
+			expect(isAbsentOrString(results[1])).toBeTrue();
 		},
 		SUCCESS_TIMEOUT_MS + 5000,
 	);
@@ -161,24 +164,38 @@ describe.for(cases)("open Cloud contract ($name)", ({ testCase }) => {
 				{ errorMessage: "contract-failure", jestOutput: "", state: "FAILED" },
 			]);
 			const http = createHttpClient(testCase.apiKey);
-			const taskPath = await createTask({
+			const taskPath = await createTaskAsync({
 				baseUrl,
 				http,
 				placeId,
 				script: 'error("contract-failure")',
 				universeId,
 			});
-			const status = await pollUntilTerminal(http, baseUrl, taskPath, FAILURE_TIMEOUT_MS);
+			const status = await pollUntilTerminalAsync(
+				http,
+				baseUrl,
+				taskPath,
+				FAILURE_TIMEOUT_MS,
+			);
 
 			expect(status.state).toBe("FAILED");
-			expect(status.error?.message).toBeString();
+			expect(status.error!.message).toBeString();
 		},
 		FAILURE_TIMEOUT_MS + 5000,
 	);
 });
 
+/**
+ * A `results` slot past the envelope is optional on the wire, but when present
+ * the backend reads it as a string.
+ */
+function isAbsentOrString(value: string | undefined): boolean {
+	return value === undefined || typeof value === "string";
+}
+
 function createHttpClient(apiKey: string): HttpClient {
 	return {
+		// eslint-disable-next-line small-rules/require-async-suffix -- HttpClient contract uses the external method name.
 		async request(method, url, options) {
 			const headers: Record<string, string> = {
 				"x-api-key": apiKey,
@@ -190,8 +207,14 @@ function createHttpClient(apiKey: string): HttpClient {
 				if (options.body instanceof buffer.Buffer) {
 					fetchOptions.body = options.body;
 				} else {
-					fetchOptions.body = JSON.stringify(options.body);
-					headers["Content-Type"] = "application/json";
+					// `JSON.stringify` is typed as possibly returning undefined,
+					// which `RequestInit.body` refuses under
+					// exactOptionalPropertyTypes.
+					const serialized = JSON.stringify(options.body);
+					if (serialized !== undefined) {
+						fetchOptions.body = serialized;
+						headers["Content-Type"] = "application/json";
+					}
 				}
 			}
 
@@ -237,14 +260,19 @@ function resolveLiveCase(): ContractCase | undefined {
 	};
 }
 
-async function createTask(args: {
+async function createTaskAsync({
+	baseUrl,
+	http,
+	placeId,
+	script,
+	universeId,
+}: {
 	baseUrl: string;
 	http: HttpClient;
 	placeId: string;
 	script: string;
 	universeId: string;
 }): Promise<string> {
-	const { baseUrl, http, placeId, script, universeId } = args;
 	const url = `${baseUrl}/cloud/v2/universes/${universeId}/places/${placeId}/luau-execution-session-tasks`;
 	const response = await http.request("POST", url, {
 		body: { script, timeout: "60s" },
@@ -258,13 +286,13 @@ async function createTask(args: {
 	return parsed.path;
 }
 
-async function sleep(ms: number): Promise<void> {
+async function sleepAsync(ms: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
 }
 
-async function pollUntilTerminal(
+async function pollUntilTerminalAsync(
 	http: HttpClient,
 	baseUrl: string,
 	taskPath: string,
@@ -284,7 +312,7 @@ async function pollUntilTerminal(
 			return status;
 		}
 
-		await sleep(POLL_INTERVAL_MS);
+		await sleepAsync(POLL_INTERVAL_MS);
 	}
 
 	throw new Error(

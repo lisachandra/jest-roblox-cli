@@ -7,7 +7,7 @@ import process from "node:process";
 import type { ResolvedConfig } from "../config/schema.ts";
 import { resolvePlaceFilePath } from "../config/schema.ts";
 import { generateTestScript, type JestArgvInput } from "../test-script.ts";
-import { formatMissingScopes } from "../utils/error-chain.ts";
+import { formatMissingScopes, walkErrorChain } from "../utils/error-chain.ts";
 import { parseEnvelope } from "./envelope.ts";
 import type {
 	Backend,
@@ -18,6 +18,13 @@ import type {
 	RawBackendEntry,
 	StreamingHooks,
 } from "./interface.ts";
+import type { UploadCacheTarget } from "./upload-cache.ts";
+import {
+	hashPlaceFile,
+	invalidateCachedVersion,
+	readCachedVersion,
+	writeCachedVersion,
+} from "./upload-cache.ts";
 
 /**
  * The value the version guard returns when the booted server is not running
@@ -33,7 +40,6 @@ const PARALLEL_AUTO_CAP = 3;
 const BASE_URL_ENV = "JEST_ROBLOX_OPEN_CLOUD_BASE_URL";
 const MAX_RETRIES_ENV = "JEST_ROBLOX_OCALE_MAX_RETRIES";
 const DEFAULT_STREAM_POLL_MS = 250;
-const TrailingSlashesPattern = /\/+$/;
 
 export type OpenCloudCredentials = RunnerCredentials;
 
@@ -44,7 +50,7 @@ export interface OpenCloudOptions {
 	 * the injected runner already owns its own credentials. Intended
 	 * primarily as a test seam.
 	 */
-	runner?: RemoteRunner;
+	runner?: RemoteRunner | undefined;
 }
 
 interface JobBucket {
@@ -56,7 +62,27 @@ interface PollState {
 	warned: boolean;
 }
 
+interface UploadOutcome {
+	/** True when the version came from the cache instead of a fresh upload. */
+	fromCache: boolean;
+	uploadMs: number;
+	versionNumber: number;
+}
+
+interface StealingPoolOutcome {
+	/**
+	 * A holder rather than a bare `unknown` so "no failure" stays
+	 * distinguishable from "failed with an undefined reason".
+	 */
+	failure?: undefined | { error: unknown };
+	results: Array<ScriptResult>;
+}
+
 export class OpenCloudBackend implements Backend {
+	/**
+	 * Kept so the upload cache can key on the universe and place it targets.
+	 */
+	private readonly credentials: OpenCloudCredentials;
 	private readonly runner: RemoteRunner;
 
 	/** One-shot per run so parallel raced tasks don't repeat the warning. */
@@ -65,45 +91,51 @@ export class OpenCloudBackend implements Backend {
 	public readonly kind = "open-cloud" as const;
 
 	constructor(credentials: OpenCloudCredentials, options?: OpenCloudOptions) {
+		this.credentials = credentials;
 		this.runner = options?.runner ?? new OcaleRunner(credentials, resolveRunnerOptions());
 	}
 
-	public async runTests(options: BackendOptions): Promise<BackendResult> {
+	public async runTestsAsync({
+		jobs,
+		parallel,
+		scriptOverride,
+		streaming,
+		workStealing,
+	}: BackendOptions): Promise<BackendResult> {
 		this.raceWarned = false;
-		const { jobs, parallel, scriptOverride, streaming, workStealing } = options;
-		if (jobs.length === 0) {
-			throw new Error("OpenCloudBackend requires at least one job");
-		}
-
-		if (workStealing === true && scriptOverride === undefined) {
-			throw new Error("OpenCloudBackend work-stealing mode requires scriptOverride");
-		}
-
+		const primary = resolvePrimaryJob(jobs, scriptOverride, workStealing);
 		// timeout is picked from the first job — it's a per-run knob.
-		// eslint-disable-next-line ts/no-non-null-assertion -- length checked above
-		const primary = jobs[0]!;
-		const placeFilePath = resolvePlaceFilePath(primary.config);
+		const target = toCacheTarget(this.credentials, resolvePlaceFilePath(primary.config));
 
-		const upload = await this.runner.uploadPlace({ placeFilePath });
-
-		const executionStart = Date.now();
-		const flattened =
-			workStealing === true
-				? await this.runWorkStealing({
+		const upload = await this.uploadOrReuseAsync(primary.config, target);
+		const executeAsync = async (placeVersion: number): Promise<Array<RawBackendEntry>> => {
+			return workStealing === true
+				? this.runWorkStealingAsync({
 						jobs,
 						parallel,
-						placeVersion: upload.versionNumber,
+						placeVersion,
 						primaryConfig: primary.config,
 						// eslint-disable-next-line ts/no-non-null-assertion -- length checked above
 						scriptOverride: scriptOverride!,
 						streaming,
 					})
-				: await this.runStaticBuckets(jobs, parallel, upload.versionNumber, scriptOverride);
-		const executionMs = Date.now() - executionStart;
+				: this.runStaticBucketsAsync(jobs, parallel, placeVersion, scriptOverride);
+		};
+
+		const executionStart = Date.now();
+		const { extraUploadMs, rawResults } = await this.executeReusingUploadAsync(
+			{ config: primary.config, target, upload },
+			executeAsync,
+		);
 
 		return {
-			rawResults: flattened,
-			timing: { executionMs, uploadMs: upload.uploadMs },
+			rawResults,
+			// A self-heal re-upload runs inside the execution window, so it
+			// belongs to `uploadMs` and comes back out of `executionMs`.
+			timing: {
+				executionMs: Date.now() - executionStart - extraUploadMs,
+				uploadMs: upload.uploadMs + extraUploadMs,
+			},
 		};
 	}
 
@@ -120,14 +152,17 @@ export class OpenCloudBackend implements Backend {
 	 * (the version exists even when it is no longer head), and no unpinned
 	 * retry loop for a concurrent uploader to keep winning against.
 	 */
-	private async executeGuarded(options: {
+	private async executeGuardedAsync({
+		placeVersion,
+		script,
+		timeout,
+	}: {
 		placeVersion: number;
 		script: string;
 		timeout: number;
 	}): Promise<ScriptResult> {
-		const { placeVersion, script, timeout } = options;
 		const guarded = injectVersionGuard(script, placeVersion);
-		const first = await this.runner.executeScript({ script: guarded, timeout });
+		const first = await this.runner.executeScriptAsync({ script: guarded, timeout });
 		if (first.outputs[0] !== PLACE_VERSION_RACE_SENTINEL) {
 			return first;
 		}
@@ -139,15 +174,51 @@ export class OpenCloudBackend implements Backend {
 			);
 		}
 
-		return this.runner.executeScript({ placeVersion, script, timeout });
+		return this.runner.executeScriptAsync({ placeVersion, script, timeout });
 	}
 
-	private async runBucket(
-		bucket: JobBucket,
+	/**
+	 * Run the wave, and give a reused version exactly one second chance: if
+	 * Roblox no longer serves the cached version, drop the entry, upload for
+	 * real, and run again. Without this a bad entry fails every later run the
+	 * same way, since nothing else ever rewrites it.
+	 */
+	private async executeReusingUploadAsync(
+		{
+			config,
+			target,
+			upload,
+		}: {
+			config: ResolvedConfig;
+			target: UploadCacheTarget;
+			upload: UploadOutcome;
+		},
+		executeAsync: (placeVersion: number) => Promise<Array<RawBackendEntry>>,
+	): Promise<{ extraUploadMs: number; rawResults: Array<RawBackendEntry> }> {
+		try {
+			return { extraUploadMs: 0, rawResults: await executeAsync(upload.versionNumber) };
+		} catch (err) {
+			if (!upload.fromCache || !isMissingVersionError(err)) {
+				throw err;
+			}
+
+			process.stderr.write(
+				"Warning: cached place version is gone — re-uploading and retrying.\n",
+			);
+			invalidateCachedVersion(config.rootDir, target);
+			const fresh = await this.uploadOrReuseAsync(config, target);
+			return {
+				extraUploadMs: fresh.uploadMs,
+				rawResults: await executeAsync(fresh.versionNumber),
+			};
+		}
+	}
+
+	private async runBucketAsync(
+		{ indices, jobs }: JobBucket,
 		placeVersion: number,
 		scriptOverride?: string,
 	): Promise<{ indices: Array<number>; rawResults: Array<RawBackendEntry> }> {
-		const { indices, jobs } = bucket;
 		// A bucket is only created for at least one job, so jobs[0] is defined.
 		// eslint-disable-next-line ts/no-non-null-assertion -- bucket non-empty
 		const primary = jobs[0]!;
@@ -156,7 +227,7 @@ export class OpenCloudBackend implements Backend {
 		});
 
 		const script = scriptOverride ?? generateTestScript(inputs);
-		const scriptResult = await this.executeGuarded({
+		const scriptResult = await this.executeGuardedAsync({
 			placeVersion,
 			script,
 			timeout: primary.config.timeout,
@@ -184,7 +255,7 @@ export class OpenCloudBackend implements Backend {
 		return { indices, rawResults };
 	}
 
-	private async runStaticBuckets(
+	private async runStaticBucketsAsync(
 		jobs: Array<ProjectJob>,
 		parallel: BackendOptions["parallel"],
 		placeVersion: number,
@@ -192,7 +263,9 @@ export class OpenCloudBackend implements Backend {
 	): Promise<Array<RawBackendEntry>> {
 		const buckets = bucketJobs(jobs, parallel);
 		const bucketResults = await Promise.all(
-			buckets.map(async (bucket) => this.runBucket(bucket, placeVersion, scriptOverride)),
+			buckets.map(async (bucket) => {
+				return this.runBucketAsync(bucket, placeVersion, scriptOverride);
+			}),
 		);
 
 		// Flatten bucket results in original job order via the indices recorded
@@ -209,7 +282,14 @@ export class OpenCloudBackend implements Backend {
 		return flattened;
 	}
 
-	private async runWorkStealing(args: {
+	private async runWorkStealingAsync({
+		jobs,
+		parallel,
+		placeVersion,
+		primaryConfig,
+		scriptOverride,
+		streaming,
+	}: {
 		jobs: Array<ProjectJob>;
 		parallel: BackendOptions["parallel"];
 		placeVersion: number;
@@ -217,117 +297,62 @@ export class OpenCloudBackend implements Backend {
 		scriptOverride: string;
 		streaming: StreamingHooks | undefined;
 	}): Promise<Array<RawBackendEntry>> {
-		const { jobs, parallel, placeVersion, primaryConfig, scriptOverride, streaming } = args;
-		const taskCount = resolveBucketCount(parallel, jobs.length);
-
-		// Drive the fixed task set through the shared roblox-runner pool. jest's
-		// work is single-wave — the queue is enqueued upstream and each task
-		// drains it until empty — so once `taskCount` tasks have launched the
-		// known set is covered. Gating `isDone` on the launch count is the
-		// "no-op replenishment": when a task returns its slot is never refilled,
-		// so the pool fires exactly `taskCount` tasks and behaves like the old
-		// `Promise.all` wave while reusing one orchestration path.
-		const tasksDone = { value: false };
-		const taskResults: Array<ScriptResult> = [];
-		let launched = 0;
-		let taskFailure: undefined | { error: unknown };
-		const poolPromise = runTaskPool({
-			concurrency: taskCount,
-			isDone: () => launched >= taskCount,
-			onError: (error) => {
-				// The pool folds a task failure into a freed slot and resolves,
-				// so without this the failure would be masked whenever a sibling
-				// task drains the whole queue and covers every package. Capture
-				// it and rethrow once the pool settles so an infrastructure or
-				// script failure always fails the run, as the old `Promise.all`
-				// wave did.
-				taskFailure = { error };
+		const taskResults = await drainStealingPoolAsync(
+			resolveBucketCount(parallel, jobs.length),
+			async () => {
+				return this.executeGuardedAsync({
+					placeVersion,
+					script: scriptOverride,
+					timeout: primaryConfig.timeout,
+				});
 			},
-			onResult: (result) => {
-				taskResults.push(result);
-			},
-			places: [
-				{
-					runTask: async () => {
-						launched += 1;
-						return this.executeGuarded({
-							placeVersion,
-							script: scriptOverride,
-							timeout: primaryConfig.timeout,
-						});
-					},
-				},
-			],
-		}).finally(() => {
-			tasksDone.value = true;
-		});
-
-		const pollPromise =
-			streaming !== undefined
-				? pollStreamingResults(streaming, () => tasksDone.value)
-				: Promise.resolve();
-
-		// The pool never rejects (it folds task errors into freed slots) and its
-		// `.finally` always flips tasksDone, so pollPromise terminates within
-		// ~pollMs — neither promise orphans the other.
-		await Promise.all([poolPromise, pollPromise]);
-
-		if (taskFailure !== undefined) {
-			throw taskFailure.error;
-		}
+			streaming,
+		);
 
 		// Parse after the pool settles so a task that returned no usable output
 		// throws here, in the normal flow, rather than being swallowed by the
 		// pool's per-task error handling.
 		const taskEnvelopes = taskResults.map(parseStealingEnvelope);
-		const entryByKey = aggregateEntriesByKey(taskEnvelopes);
+		return collectStealingResults(jobs, aggregateEntriesByKey(taskEnvelopes));
+	}
 
-		const missing: Array<string> = [];
-		const rawResults: Array<RawBackendEntry> = [];
-		for (const job of jobs) {
-			const found = entryByKey.get(
-				entryLookupKey(job.pkg ?? job.displayName, job.displayName),
-			);
-			if (found === undefined) {
-				missing.push(job.displayName);
-				continue;
+	/**
+	 * Skip `places.save` when these exact place bytes already have a version.
+	 * An upload is the only thing measured to precede a cold place boot (~22s
+	 * against ~3s warm), so an unchanged build that reuses its version keeps
+	 * the fast path. Correctness rests on the guard in
+	 * {@link OpenCloudBackend.executeGuardedAsync}, not on the cache: a stale
+	 * entry can only make the sentinel fire and the task retry pinned to the
+	 * recorded version, which holds exactly the bytes that were hashed.
+	 */
+	private async uploadOrReuseAsync(
+		config: ResolvedConfig,
+		target: UploadCacheTarget,
+	): Promise<UploadOutcome> {
+		const start = Date.now();
+		const hash = config.uploadCache ? hashPlaceFile(target.placeFilePath) : undefined;
+		// A hash of undefined means "no cache this run" for both reads and
+		// writes: either the caller disabled it, or the file could not be read.
+		if (hash !== undefined) {
+			const cached = readCachedVersion(config.rootDir, target, hash);
+			if (cached !== undefined) {
+				return { fromCache: true, uploadMs: Date.now() - start, versionNumber: cached };
 			}
-
-			rawResults.push({ entry: found.entry, fallbackGameOutput: found.gameOutput });
 		}
 
-		if (missing.length > 0) {
-			throw new Error(
-				`Open Cloud work-stealing returned no entries for ${missing.length.toString()} package(s): ${missing.join(", ")}`,
-			);
+		const upload = await this.runner.uploadPlaceAsync({
+			placeFilePath: target.placeFilePath,
+		});
+		if (hash !== undefined) {
+			writeCachedVersion(config.rootDir, target, hash, upload.versionNumber);
 		}
 
-		return rawResults;
+		return {
+			fromCache: false,
+			uploadMs: Date.now() - start,
+			versionNumber: upload.versionNumber,
+		};
 	}
-}
-
-/**
- * Poll the streaming SortedMap until `isDone()` returns true, then perform
- * one final drain. Each newly-observed entry is forwarded to
- * `onPackageResult` and deleted from the map. Errors are swallowed so a
- * transient HTTP failure doesn't take down the test run — the final task
- * envelope still carries authoritative results.
- */
-export async function pollStreamingResults(
-	hooks: StreamingHooks,
-	isDone: () => boolean,
-): Promise<void> {
-	const pollMs = hooks.pollMs ?? DEFAULT_STREAM_POLL_MS;
-	const state: PollState = { warned: false };
-
-	while (!isDone()) {
-		await drainOnce(hooks, state);
-		await sleep(pollMs);
-	}
-
-	// Final pass to catch any entries written between the last drain and
-	// tasksDone.
-	await drainOnce(hooks, state);
 }
 
 export function resolveOpenCloudBaseUrl(): string | undefined {
@@ -336,7 +361,12 @@ export function resolveOpenCloudBaseUrl(): string | undefined {
 		return undefined;
 	}
 
-	return override.replace(TrailingSlashesPattern, "");
+	let end = override.length;
+	while (end > 0 && override.charAt(end - 1) === "/") {
+		end -= 1;
+	}
+
+	return override.slice(0, end);
 }
 
 /**
@@ -358,65 +388,70 @@ export function resolveOcaleMaxRetries(): number | undefined {
 	return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
+/**
+ * Poll the streaming SortedMap until `isDone()` returns true, then perform
+ * one final drain. Each newly-observed entry is forwarded to
+ * `onPackageResult` and deleted from the map. Errors are swallowed so a
+ * transient HTTP failure doesn't take down the test run — the final task
+ * envelope still carries authoritative results.
+ */
+export async function pollStreamingResultsAsync(
+	hooks: StreamingHooks,
+	isDone: () => boolean,
+): Promise<void> {
+	const pollMs = hooks.pollMs ?? DEFAULT_STREAM_POLL_MS;
+	const state: PollState = { warned: false };
+
+	while (!isDone()) {
+		await drainOnceAsync(hooks, state);
+		await sleepAsync(pollMs);
+	}
+
+	// Final pass to catch any entries written between the last drain and
+	// tasksDone.
+	await drainOnceAsync(hooks, state);
+}
+
 export function createOpenCloudBackend(credentials: OpenCloudCredentials): OpenCloudBackend {
 	return new OpenCloudBackend(credentials);
 }
 
-function describeError(err: unknown): string {
-	const cause = err instanceof Error ? err.cause : undefined;
-	if (cause instanceof PermissionError) {
-		return formatMissingScopes(cause.requiredScopes);
-	}
-
-	return err instanceof Error ? err.message : String(err);
+function toCacheTarget(
+	credentials: OpenCloudCredentials,
+	placeFilePath: string,
+): UploadCacheTarget {
+	return {
+		placeFilePath,
+		placeId: credentials.placeId,
+		universeId: credentials.universeId,
+	};
 }
 
-function warnStreamingDisabled(err: unknown, state: PollState): void {
-	if (state.warned) {
-		return;
-	}
-
-	state.warned = true;
-	process.stderr.write(`Warning: live per-package streaming disabled — ${describeError(err)}\n`);
-	process.stderr.write("  Tests still run; results print as usual once each task finishes.\n");
+/**
+ * True when the failure reads as "that place version does not exist" — the
+ * shape a cached version number takes once Roblox no longer serves it. Matches
+ * on the API's own 404 rather than on message text, and walks the chain because
+ * the runner wraps the client error.
+ */
+function isMissingVersionError(err: unknown): boolean {
+	return walkErrorChain(err).some((entry) => entry.statusCode === 404);
 }
 
-async function drainOnce(hooks: StreamingHooks, state: PollState): Promise<void> {
-	let records;
-	try {
-		records = await hooks.reader.readAll();
-	} catch (err) {
-		warnStreamingDisabled(err, state);
-		return;
+function resolvePrimaryJob(
+	jobs: Array<ProjectJob>,
+	scriptOverride: string | undefined,
+	workStealing = false,
+): ProjectJob {
+	const primary = jobs[0];
+	if (primary === undefined) {
+		throw new Error("OpenCloudBackend requires at least one job");
 	}
 
-	// Forward in arrival order so the streaming-progress lines stay
-	// deterministic, then fire deletes in parallel — when several packages
-	// land between two poll ticks, serial deletes can stack up to a full
-	// poll interval of latency before the next read sees fresh entries.
-	for (const record of records) {
-		hooks.onPackageResult(record.value);
+	if (workStealing && scriptOverride === undefined) {
+		throw new Error("OpenCloudBackend work-stealing mode requires scriptOverride");
 	}
 
-	await Promise.all(
-		records.map(async (record) => {
-			try {
-				await hooks.reader.delete(record.id);
-			} catch (err) {
-				// Best-effort; if delete fails the entry will reappear on the
-				// next poll and onPackageResult dedupes downstream. Still surface
-				// the first failure so users know their key can read but not
-				// write.
-				warnStreamingDisabled(err, state);
-			}
-		}),
-	);
-}
-
-async function sleep(ms: number): Promise<void> {
-	await new Promise((resolve) => {
-		setTimeout(resolve, ms);
-	});
+	return primary;
 }
 
 /**
@@ -489,8 +524,172 @@ function bucketJobs(
 	return buckets;
 }
 
-function entryLookupKey(package_: string, project: string | undefined): string {
-	return project === undefined || project === package_ ? package_ : `${package_}::${project}`;
+function describeError(err: unknown): string {
+	const cause = err instanceof Error ? err.cause : undefined;
+	if (cause instanceof PermissionError) {
+		return formatMissingScopes(cause.requiredScopes);
+	}
+
+	return err instanceof Error ? err.message : String(err);
+}
+
+function warnStreamingDisabled(err: unknown, state: PollState): void {
+	if (state.warned) {
+		return;
+	}
+
+	state.warned = true;
+	process.stderr.write(`Warning: live per-package streaming disabled — ${describeError(err)}\n`);
+	process.stderr.write("  Tests still run; results print as usual once each task finishes.\n");
+}
+
+async function drainOnceAsync(hooks: StreamingHooks, state: PollState): Promise<void> {
+	let records;
+	try {
+		records = await hooks.reader.readAllAsync();
+	} catch (err) {
+		warnStreamingDisabled(err, state);
+		return;
+	}
+
+	// Forward in arrival order so the streaming-progress lines stay
+	// deterministic, then fire deletes in parallel — when several packages
+	// land between two poll ticks, serial deletes can stack up to a full
+	// poll interval of latency before the next read sees fresh entries.
+	for (const record of records) {
+		hooks.onPackageResult(record.value);
+	}
+
+	await Promise.all(
+		records.map(async (record) => {
+			try {
+				await hooks.reader.deleteAsync(record.id);
+			} catch (err) {
+				// Best-effort; if delete fails the entry will reappear on the
+				// next poll and onPackageResult dedupes downstream. Still surface
+				// the first failure so users know their key can read but not
+				// write.
+				warnStreamingDisabled(err, state);
+			}
+		}),
+	);
+}
+
+async function sleepAsync(ms: number): Promise<void> {
+	await new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
+}
+
+/**
+ * Drive the fixed task set through the shared roblox-runner pool. jest's work
+ * is single-wave — the queue is enqueued upstream and each task drains it
+ * until empty — so once `taskCount` tasks have launched the known set is
+ * covered. Gating `isDone` on the launch count is the "no-op replenishment":
+ * when a task returns its slot is never refilled, so the pool fires exactly
+ * `taskCount` tasks and behaves like the old `Promise.all` wave while reusing
+ * one orchestration path.
+ */
+async function runStealingTasksAsync(
+	taskCount: number,
+	runTask: () => Promise<ScriptResult>,
+	outcome: StealingPoolOutcome,
+): Promise<void> {
+	let launched = 0;
+	await runTaskPool({
+		concurrency: taskCount,
+		isDone: () => launched >= taskCount,
+		onError: (error) => {
+			// The pool folds a task failure into a freed slot and resolves, so
+			// without this the failure would be masked whenever a sibling task
+			// drains the whole queue and covers every package. Capture it and
+			// rethrow once the pool settles so an infrastructure or script
+			// failure always fails the run, as the old `Promise.all` wave did.
+			outcome.failure = { error };
+		},
+		onResult: (result) => {
+			outcome.results.push(result);
+		},
+		places: [
+			{
+				runTask: async () => {
+					launched += 1;
+					return runTask();
+				},
+			},
+		],
+	});
+}
+
+/**
+ * Run the work-stealing task wave and, when streaming is enabled, poll the
+ * streaming map alongside it. Returns every task's result once the wave has
+ * settled; rethrows the first task failure the pool folded into a freed slot.
+ */
+async function drainStealingPoolAsync(
+	taskCount: number,
+	runTask: () => Promise<ScriptResult>,
+	streaming: StreamingHooks | undefined,
+): Promise<Array<ScriptResult>> {
+	// A holder, not a plain boolean, so the poll's `isDone` arrow reads the
+	// live value instead of capturing false forever.
+	const tasksDone = { value: false };
+	const outcome: StealingPoolOutcome = { results: [] };
+	const poolPromise = runStealingTasksAsync(taskCount, runTask, outcome).finally(() => {
+		tasksDone.value = true;
+	});
+
+	const pollPromise =
+		streaming !== undefined
+			? pollStreamingResultsAsync(streaming, () => tasksDone.value)
+			: Promise.resolve();
+
+	// The pool never rejects (it folds task errors into freed slots) and its
+	// `.finally` always flips tasksDone, so pollPromise terminates within
+	// ~pollMs — neither promise orphans the other.
+	await Promise.all([poolPromise, pollPromise]);
+
+	if (outcome.failure !== undefined) {
+		throw outcome.failure.error;
+	}
+
+	return outcome.results;
+}
+
+function entryLookupKey(packageName: string, project: string | undefined): string {
+	return project === undefined || project === packageName
+		? packageName
+		: `${packageName}::${project}`;
+}
+
+/**
+ * Pair every job with its aggregated entry, in request order. Jobs whose
+ * package never came back are collected so one failure message names them all
+ * rather than failing on the first gap.
+ */
+function collectStealingResults(
+	jobs: Array<ProjectJob>,
+	entryByKey: Map<string, { entry: EnvelopeEntry; gameOutput: string | undefined }>,
+): Array<RawBackendEntry> {
+	const missing: Array<string> = [];
+	const rawResults: Array<RawBackendEntry> = [];
+	for (const job of jobs) {
+		const found = entryByKey.get(entryLookupKey(job.pkg ?? job.displayName, job.displayName));
+		if (found === undefined) {
+			missing.push(job.displayName);
+			continue;
+		}
+
+		rawResults.push({ entry: found.entry, fallbackGameOutput: found.gameOutput });
+	}
+
+	if (missing.length > 0) {
+		throw new Error(
+			`Open Cloud work-stealing returned no entries for ${missing.length.toString()} package(s): ${missing.join(", ")}`,
+		);
+	}
+
+	return rawResults;
 }
 
 /**

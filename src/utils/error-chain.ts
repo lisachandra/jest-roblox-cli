@@ -2,11 +2,15 @@ import { PermissionError } from "@bedrock-rbx/ocale";
 
 export interface ChainEntry {
 	readonly name: string;
-	readonly code?: string;
-	readonly errno?: string;
+	readonly code?: string | undefined;
+	readonly errno?: string | undefined;
 	readonly message: string;
-	readonly requiredScopes?: ReadonlyArray<string>;
-	readonly syscall?: string;
+	readonly requiredScopes?: ReadonlyArray<string> | undefined;
+	/**
+	 * HTTP status from an Open Cloud `ApiError`, when the entry carries one.
+	 */
+	readonly statusCode?: number | undefined;
+	readonly syscall?: string | undefined;
 }
 
 const MAX_DEPTH = 5;
@@ -21,6 +25,7 @@ export function walkErrorChain(err: unknown): Array<ChainEntry> {
 			errno: readStringProperty(current, "errno"),
 			message: current.message,
 			requiredScopes: current instanceof PermissionError ? current.requiredScopes : undefined,
+			statusCode: readNumberProperty(current, "statusCode"),
 			syscall: readStringProperty(current, "syscall"),
 		});
 		current = current.cause;
@@ -38,12 +43,23 @@ export function formatMissingScopes(scopes: ReadonlyArray<string>): string {
 	return `API key missing scope${scopes.length === 1 ? "" : "s"} ${joined}. Add via Creator Dashboard.`;
 }
 
-function readStringProperty(err: Error, key: string): string | undefined {
-	const value = Reflect.get(err, key);
+function readNumberProperty(err: Error, key: string): number | undefined {
+	const value: unknown = Reflect.get(err, key);
+	return typeof value === "number" ? value : undefined;
+}
 
-	if (value === undefined || value === null) {
-		return undefined;
+function readStringProperty(err: Error, key: string): string | undefined {
+	const value: unknown = Reflect.get(err, key);
+
+	if (typeof value === "string") {
+		return value;
 	}
 
-	return String(value);
+	// Node errors carry `errno` as a number; anything else (object, boolean) has
+	// no useful string form, so it reads as absent.
+	if (typeof value === "number") {
+		return String(value);
+	}
+
+	return undefined;
 }

@@ -4,10 +4,10 @@ export default isentinel({
 	name: "packages/luau-ast",
 	jsdoc: false,
 	namedConfigs: true,
+	naming: true,
 	roblox: false,
 	rules: {
-		"max-lines": "off",
-		"max-lines-per-function": "off",
+		"package-json/restrict-private-properties": "off",
 	},
 	test: {
 		vitest: {

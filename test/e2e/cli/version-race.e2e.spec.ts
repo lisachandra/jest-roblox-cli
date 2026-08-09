@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { PLACE_VERSION_RACE_SENTINEL } from "../../../src/backends/open-cloud.ts";
-import { startFakeOpenCloudServer } from "./fake-open-cloud.ts";
+import { startFakeOpenCloudServerAsync } from "./fake-open-cloud.ts";
 import {
 	buildMixedOutput,
 	buildPassingPayload,
@@ -13,6 +13,10 @@ import {
 
 const RBXTS_FIXTURE = path.resolve(__dirname, "../fixtures/rbxts-project");
 
+function isTaskCreatePost(call: { method: string; url: string }): boolean {
+	return call.method === "POST" && call.url.endsWith("/luau-execution-session-tasks");
+}
+
 describe("optimistic place-version pinning", () => {
 	it("should retry a raced task pinned to the uploaded version and still pass", async () => {
 		expect.assertions(7);
@@ -21,7 +25,7 @@ describe("optimistic place-version pinning", () => {
 		// First task boots on the wrong version (a concurrent upload won the
 		// boot race) and returns the guard sentinel; the pinned retry runs the
 		// suite for real.
-		const server = await startFakeOpenCloudServer([
+		const server = await startFakeOpenCloudServerAsync([
 			{ rawOutput: PLACE_VERSION_RACE_SENTINEL },
 			{ jestOutput: buildMixedOutput(buildPassingPayload()) },
 		]);
@@ -35,9 +39,7 @@ describe("optimistic place-version pinning", () => {
 		expect(result.stderr).toContain("place version raced");
 		expect(server.requests[0]!.script).toContain(PLACE_VERSION_RACE_SENTINEL);
 
-		const taskPosts = server.calls.filter(
-			(call) => call.method === "POST" && call.url.endsWith("/luau-execution-session-tasks"),
-		);
+		const taskPosts = server.calls.filter(isTaskCreatePost);
 
 		expect(taskPosts).toHaveLength(2);
 		// First attempt is unpinned (warm-pool route), the retry is pinned to

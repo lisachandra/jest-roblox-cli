@@ -1,9 +1,20 @@
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
+import type { TestProjectInlineConfiguration } from "vitest/config";
 import { defineConfig } from "vitest/config";
 
-import { normalizeWindowsPath } from "./src/utils/normalize-windows-path.ts";
+const DRIVE_LETTER_START_REGEX = /^[A-Za-z]:\//;
+
+function normalizeWindowsPath(input = ""): string {
+	if (!input) {
+		return input;
+	}
+
+	return input
+		.replace(/\\/g, "/")
+		.replace(DRIVE_LETTER_START_REGEX, (driveLetterMatch) => driveLetterMatch.toUpperCase());
+}
 
 const luauPlugin = {
 	name: "luau-raw",
@@ -23,33 +34,46 @@ const luauPlugin = {
 
 const setupFiles = ["./test/setup/enable-colors.ts", "./test/setup/jest-extended.ts"];
 
-interface PackageJsonWithSourceExport {
-	exports?: {
-		"."?: null | { source?: string };
-	};
-}
-
 // This package has fixture configs that import `@isentinel/jest-roblox`.
 // Avoid the broad `source` condition here so those self-imports keep exercising
 // the built package during coverage; alias only the workspace deps that need
 // inline source for node-builtin mocks.
+//
+// `createRequire` earns its keep for `.resolve()` only — mapping a bare
+// `<pkg>/package.json` specifier to a path needs CJS resolution. Reading the
+// file goes through `readFileSync`, because `require()` returns `any` and
+// casting it back to a shape is what `ts/no-unsafe-type-assertion` forbids.
 const requireFromConfig = createRequire(import.meta.url);
+
+/** Digs `exports["."].source` out of a package.json, narrowing as it goes. */
+function readSourceEntry(packageJsonPath: string): string | undefined {
+	const parsed = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
+	if (typeof parsed !== "object" || parsed === null || !("exports" in parsed)) {
+		return undefined;
+	}
+
+	const exportsField = parsed["exports"];
+	if (typeof exportsField !== "object" || exportsField === null || !("." in exportsField)) {
+		return undefined;
+	}
+
+	const dotExport = exportsField["."];
+	if (typeof dotExport !== "object" || dotExport === null || !("source" in dotExport)) {
+		return undefined;
+	}
+
+	return typeof dotExport["source"] === "string" ? dotExport["source"] : undefined;
+}
 
 function sourceAlias(packageName: string) {
 	const packageJsonPath = requireFromConfig.resolve(`${packageName}/package.json`);
-	const packageRoot = dirname(packageJsonPath);
-	const packageJson = requireFromConfig(packageJsonPath) as PackageJsonWithSourceExport;
-	const packageExport = packageJson.exports?.["."];
-	const sourceEntry =
-		typeof packageExport === "object" && packageExport !== null
-			? packageExport.source
-			: undefined;
+	const sourceEntry = readSourceEntry(packageJsonPath);
 
-	if (typeof sourceEntry !== "string") {
+	if (sourceEntry === undefined) {
 		throw new Error(`${packageName} must expose exports["."].source for Vitest tests`);
 	}
 
-	return { find: packageName, replacement: resolve(packageRoot, sourceEntry) };
+	return { find: packageName, replacement: resolve(dirname(packageJsonPath), sourceEntry) };
 }
 
 const workspaceSourceAliases = [
@@ -74,9 +98,8 @@ const workspaceSourceAliases = [
 // files, shadowing the genuine `unit` coverage down from 100%. A separate
 // no-coverage run sidesteps the collision entirely.
 function selfSourceEntry(): string {
-	const packageJson = requireFromConfig("./package.json") as PackageJsonWithSourceExport;
-	const sourceEntry = packageJson.exports?.["."]?.source;
-	if (typeof sourceEntry !== "string") {
+	const sourceEntry = readSourceEntry(resolve(import.meta.dirname, "package.json"));
+	if (sourceEntry === undefined) {
 		throw new Error('package.json must expose exports["."].source for integration tests');
 	}
 
@@ -86,10 +109,77 @@ function selfSourceEntry(): string {
 	return normalizeWindowsPath(resolve(import.meta.dirname, sourceEntry));
 }
 
-const jitiSourceAlias = JSON.stringify({ "@isentinel/jest-roblox": selfSourceEntry() });
+const JITI_SOURCE_ALIAS = JSON.stringify({ "@isentinel/jest-roblox": selfSourceEntry() });
+
+/**
+ * The Vite-level options every project needs: the `.luau` raw loader and the
+ * workspace source aliases. Spread into each project rather than declared once
+ * on the root, because an inline project still inherits nothing from it —
+ * Vitest 5 documents `extends` as defaulting to `true`, but 5.0.0-beta.7 has
+ * yet to flip it, so an absent `extends` resolves to `false`. Once it flips,
+ * the root declaration alone suffices and the spreads can go.
+ */
+const sharedViteOptions = {
+	plugins: [luauPlugin],
+	resolve: { alias: workspaceSourceAliases },
+} satisfies TestProjectInlineConfiguration;
+
+/**
+ * The coverage-measured suite. Exported so `vitest.stryker.config.ts` can run
+ * exactly this project — and only this one — without restating its settings.
+ */
+export const unitProject = {
+	...sharedViteOptions,
+	test: {
+		name: "unit",
+		// `*.bench.ts` benchmarks live beside the unit specs. Scope
+		// them to this project so the e2e/live projects — the latter
+		// has a network globalSetup — never pick them up. `vitest
+		// bench` derives a separate project per entry, so this one's
+		// benchmarks run as `unit (bench)`; that is the name the
+		// `bench` package script filters on.
+		benchmark: {
+			include: ["src/**/*.bench.ts"],
+		},
+		clearMocks: true,
+		env: {
+			GITHUB_ACTIONS: "",
+		},
+		exclude: [
+			"src/**/__fixtures__/**",
+			"test/fixtures/**",
+			"test/e2e/**",
+			// Config-loading integration tests run in the
+			// `integration` project (no coverage) — see the
+			// JITI_ALIAS note above.
+			"test/integration/config/**",
+			"test/integration/executor/**",
+			"**/src/types/**",
+			"./src/cli.ts",
+			"**/*.luau",
+		],
+		include: ["src/**/*.spec.ts", "test/**/*.spec.ts"],
+		restoreMocks: true,
+		setupFiles,
+		typecheck: {
+			// Resolves `tsconfig.spec.json`'s reference to
+			// `tsconfig.lib.json` by building it. Without this the checker
+			// runs `--noEmit -p`, which reads the reference's emitted
+			// declarations and fails TS6305 until some earlier
+			// `tsgo --build` has produced them — which is what this
+			// target used to inline.
+			build: true,
+			checker: "tsgo",
+			enabled: true,
+			include: ["src/**/*.spec-d.ts"],
+			tsconfig: "./tsconfig.spec.json",
+		},
+		unstubEnvs: true,
+	},
+} satisfies TestProjectInlineConfiguration;
 
 export default defineConfig({
-	plugins: [luauPlugin],
+	...sharedViteOptions,
 	test: {
 		coverage: {
 			exclude: [
@@ -110,50 +200,9 @@ export default defineConfig({
 			},
 		},
 		projects: [
+			unitProject,
 			{
-				plugins: [luauPlugin],
-				resolve: { alias: workspaceSourceAliases },
-				test: {
-					name: "unit",
-					// `*.bench.ts` benchmarks (run via `vitest bench`) live
-					// beside the unit specs. Scope them to this project so the
-					// e2e/live projects — the latter has a network globalSetup —
-					// never pick them up.
-					benchmark: {
-						include: ["src/**/*.bench.ts"],
-					},
-					clearMocks: true,
-					env: {
-						GITHUB_ACTIONS: "",
-					},
-					exclude: [
-						"src/**/__fixtures__/**",
-						"test/fixtures/**",
-						"test/e2e/**",
-						// Config-loading integration tests run in the
-						// `integration` project (no coverage) — see the
-						// JITI_ALIAS note above.
-						"test/integration/config/**",
-						"test/integration/executor/**",
-						"**/src/types/**",
-						"./src/cli.ts",
-						"**/*.luau",
-					],
-					include: ["src/**/*.spec.ts", "test/**/*.spec.ts"],
-					restoreMocks: true,
-					setupFiles,
-					typecheck: {
-						checker: "tsgo",
-						enabled: true,
-						include: ["src/**/*.spec-d.ts"],
-						tsconfig: "./tsconfig.spec.json",
-					},
-					unstubEnvs: true,
-				},
-			},
-			{
-				plugins: [luauPlugin],
-				resolve: { alias: workspaceSourceAliases },
+				...sharedViteOptions,
 				test: {
 					name: "integration",
 					// Benchmarks belong to the unit project only.
@@ -167,7 +216,7 @@ export default defineConfig({
 					// isolated from coverage.
 					env: {
 						GITHUB_ACTIONS: "",
-						JITI_ALIAS: jitiSourceAlias,
+						JITI_ALIAS: JITI_SOURCE_ALIAS,
 					},
 					include: [
 						"test/integration/config/**/*.spec.ts",
@@ -179,12 +228,11 @@ export default defineConfig({
 				},
 			},
 			{
-				plugins: [luauPlugin],
-				resolve: { alias: workspaceSourceAliases },
+				...sharedViteOptions,
 				test: {
 					name: "e2e",
-					// Benchmarks belong to the unit project only; opt this one
-					// out so `vitest bench` never runs them here.
+					// Benchmarks belong to the unit project only, so leave
+					// `e2e (bench)` with nothing to collect.
 					benchmark: {
 						include: [],
 					},
@@ -197,13 +245,14 @@ export default defineConfig({
 				},
 			},
 			{
-				plugins: [luauPlugin],
-				resolve: { alias: workspaceSourceAliases },
+				...sharedViteOptions,
 				test: {
 					name: "live",
-					// Benchmarks belong to the unit project only; opt this one
-					// out so `vitest bench` never triggers the network
-					// globalSetup.
+					// Benchmarks belong to the unit project only, so leave
+					// `live (bench)` with nothing to collect. Note this alone
+					// no longer keeps the network globalSetup out of a bare
+					// `vitest bench` — the derived project exists either way —
+					// which is why the `bench` script names `unit (bench)`.
 					benchmark: {
 						include: [],
 					},

@@ -4,13 +4,11 @@ import { type CliOptions, DEFAULT_CONFIG, type ResolvedConfig } from "./config/s
 import type { CoverageArtifacts } from "./coverage-pipeline/build-manifest.ts";
 import { emitBuildManifest } from "./coverage-pipeline/build-manifest.ts";
 import { COVERAGE_BUILD_MANIFEST_PATH } from "./coverage-pipeline/prepare.ts";
-import { runJestRoblox } from "./run.ts";
-import { runMultiProject, runResolvedProjects } from "./run/multi.ts";
-import { runSingleProject } from "./run/single.ts";
-import type { MultiRunResult, SingleRunResult, WorkspaceRunResult } from "./run/types.ts";
-import { runWorkspaceMode } from "./run/workspace.ts";
+import { runJestRobloxAsync } from "./run.ts";
+import { loadRojoTree, runMultiProjectAsync, runResolvedProjectsAsync } from "./run/multi.ts";
+import type { MultiRunResult, WorkspaceRunResult } from "./run/types.ts";
+import { runWorkspaceModeAsync } from "./run/workspace.ts";
 
-vi.mock(import("./run/single"));
 vi.mock(import("./run/multi"));
 // `loadRojoTree` + `buildImplicitProject` are auto-mocked here so the collapse
 // path resolves to the `runResolvedProjects` mock without touching real Rojo.
@@ -20,10 +18,10 @@ vi.mock(import("./coverage-pipeline/build-manifest"));
 
 const mocks = {
 	emitBuildManifest: vi.mocked(emitBuildManifest),
-	runMultiProject: vi.mocked(runMultiProject),
-	runResolvedProjects: vi.mocked(runResolvedProjects),
-	runSingleProject: vi.mocked(runSingleProject),
-	runWorkspaceMode: vi.mocked(runWorkspaceMode),
+	loadRojoTree: vi.mocked(loadRojoTree),
+	runMultiProject: vi.mocked(runMultiProjectAsync),
+	runResolvedProjects: vi.mocked(runResolvedProjectsAsync),
+	runWorkspaceMode: vi.mocked(runWorkspaceModeAsync),
 };
 
 const COVERAGE_ARTIFACTS: CoverageArtifacts = {
@@ -49,7 +47,6 @@ function makeCli(overrides: Partial<CliOptions> = {}): CliOptions {
 	return { ...overrides };
 }
 
-const SINGLE: SingleRunResult = { mode: "single", preCoverageMs: 0 };
 const MULTI: MultiRunResult = {
 	merged: {},
 	mode: "multi",
@@ -63,13 +60,13 @@ const WORKSPACE: WorkspaceRunResult = {
 	projectResults: [],
 };
 
-describe(runJestRoblox, () => {
+describe(runJestRobloxAsync, () => {
 	it("should dispatch to runWorkspaceMode when --workspace is set", async () => {
 		expect.assertions(2);
 
 		mocks.runWorkspaceMode.mockResolvedValue(WORKSPACE);
 
-		const result = await runJestRoblox(makeCli({ workspace: true }), makeConfig());
+		const result = await runJestRobloxAsync(makeCli({ workspace: true }), makeConfig());
 
 		expect(result).toBe(WORKSPACE);
 		expect(mocks.runWorkspaceMode).toHaveBeenCalledOnce();
@@ -80,7 +77,7 @@ describe(runJestRoblox, () => {
 
 		mocks.runWorkspaceMode.mockResolvedValue(WORKSPACE);
 
-		await runJestRoblox(makeCli({ packages: "foo,bar" }), makeConfig());
+		await runJestRobloxAsync(makeCli({ packages: "foo,bar" }), makeConfig());
 
 		expect(mocks.runWorkspaceMode).toHaveBeenCalledOnce();
 	});
@@ -90,7 +87,7 @@ describe(runJestRoblox, () => {
 
 		mocks.runWorkspaceMode.mockResolvedValue(WORKSPACE);
 
-		await runJestRoblox(makeCli({ affectedSince: "main" }), makeConfig());
+		await runJestRobloxAsync(makeCli({ affectedSince: "main" }), makeConfig());
 
 		expect(mocks.runWorkspaceMode).toHaveBeenCalledOnce();
 	});
@@ -100,10 +97,12 @@ describe(runJestRoblox, () => {
 
 		mocks.runMultiProject.mockResolvedValue(MULTI);
 
+		// `projects` still holds raw `ProjectEntry` objects at dispatch time,
+		// which `ResolvedConfig` types as `Array<string>` post-resolution.
 		const config = makeConfig();
-		(config as unknown as { projects: Array<unknown> }).projects = [{ projects: ["client"] }];
+		Reflect.set(config, "projects", [{ projects: ["client"] }]);
 
-		const result = await runJestRoblox(makeCli(), config);
+		const result = await runJestRobloxAsync(makeCli(), config);
 
 		expect(result).toBe(MULTI);
 		expect(mocks.runMultiProject).toHaveBeenCalledOnce();
@@ -114,11 +113,11 @@ describe(runJestRoblox, () => {
 
 		mocks.runResolvedProjects.mockResolvedValue(MULTI);
 
-		const result = await runJestRoblox(makeCli(), makeConfig());
+		const result = await runJestRobloxAsync(makeCli(), makeConfig());
 
 		expect(result).toBe(MULTI);
 		expect(mocks.runResolvedProjects).toHaveBeenCalledOnce();
-		expect(mocks.runSingleProject).not.toHaveBeenCalled();
+		expect(mocks.loadRojoTree).toHaveBeenCalledOnce();
 	});
 
 	it("should collapse to runResolvedProjects when config.projects is an empty array", async () => {
@@ -127,22 +126,26 @@ describe(runJestRoblox, () => {
 		mocks.runResolvedProjects.mockResolvedValue(MULTI);
 
 		const config = makeConfig();
-		(config as unknown as { projects: Array<unknown> }).projects = [];
+		Reflect.set(config, "projects", []);
 
-		await runJestRoblox(makeCli(), config);
+		await runJestRobloxAsync(makeCli(), config);
 
 		expect(mocks.runResolvedProjects).toHaveBeenCalledOnce();
 	});
 
-	it("should dispatch to runSingleProject for a typecheck-only no-projects run", async () => {
-		expect.assertions(2);
+	// `--typecheckOnly` is pure-local tsgo, so the collapse must not require a
+	// Rojo project on disk: the tree is never loaded and the implicit project is
+	// built mountless.
+	it("should collapse a typecheck-only no-projects run without loading a Rojo tree", async () => {
+		expect.assertions(3);
 
-		mocks.runSingleProject.mockResolvedValue(SINGLE);
+		mocks.runResolvedProjects.mockResolvedValue(MULTI);
 
-		const result = await runJestRoblox(makeCli({ typecheckOnly: true }), makeConfig());
+		const result = await runJestRobloxAsync(makeCli({ typecheckOnly: true }), makeConfig());
 
-		expect(result).toBe(SINGLE);
-		expect(mocks.runResolvedProjects).not.toHaveBeenCalled();
+		expect(result).toBe(MULTI);
+		expect(mocks.runResolvedProjects).toHaveBeenCalledOnce();
+		expect(mocks.loadRojoTree).not.toHaveBeenCalled();
 	});
 
 	it("should pass cli through to workspace mode without merging workspace-root config", async () => {
@@ -151,9 +154,9 @@ describe(runJestRoblox, () => {
 		mocks.runWorkspaceMode.mockResolvedValue(WORKSPACE);
 
 		const cli = makeCli({ collectCoverage: true, packages: "a", workspace: true });
-		await runJestRoblox(cli, makeConfig({ collectCoverage: false }));
+		await runJestRobloxAsync(cli, makeConfig({ collectCoverage: false }));
 
-		const [forwardedCli] = mocks.runWorkspaceMode.mock.calls[0] ?? [];
+		const [forwardedCli] = mocks.runWorkspaceMode.mock.calls[0]!;
 
 		expect(forwardedCli).toBe(cli);
 	});
@@ -164,9 +167,9 @@ describe(runJestRoblox, () => {
 		mocks.runWorkspaceMode.mockResolvedValue(WORKSPACE);
 
 		const config = makeConfig({ workspace: { packages: ["packages/*"], root: "/ws" } });
-		await runJestRoblox(makeCli({ packages: "foo", workspace: true }), config);
+		await runJestRobloxAsync(makeCli({ packages: "foo", workspace: true }), config);
 
-		const [, forwardedWorkspace] = mocks.runWorkspaceMode.mock.calls[0] ?? [];
+		const [, forwardedWorkspace] = mocks.runWorkspaceMode.mock.calls[0]!;
 
 		expect(forwardedWorkspace).toStrictEqual({ packages: ["packages/*"], root: "/ws" });
 	});
@@ -179,7 +182,7 @@ describe(runJestRoblox, () => {
 			coverageArtifacts: COVERAGE_ARTIFACTS,
 		});
 
-		await runJestRoblox(makeCli(), makeConfig());
+		await runJestRobloxAsync(makeCli(), makeConfig());
 
 		expect(mocks.emitBuildManifest).toHaveBeenCalledWith(
 			COVERAGE_BUILD_MANIFEST_PATH,
@@ -195,7 +198,7 @@ describe(runJestRoblox, () => {
 			coverageArtifacts: { ...COVERAGE_ARTIFACTS, rebuilt: false },
 		});
 
-		await runJestRoblox(makeCli(), makeConfig());
+		await runJestRobloxAsync(makeCli(), makeConfig());
 
 		expect(mocks.emitBuildManifest).not.toHaveBeenCalled();
 	});
@@ -205,7 +208,7 @@ describe(runJestRoblox, () => {
 
 		mocks.runResolvedProjects.mockResolvedValue(MULTI);
 
-		await runJestRoblox(makeCli(), makeConfig());
+		await runJestRobloxAsync(makeCli(), makeConfig());
 
 		expect(mocks.emitBuildManifest).not.toHaveBeenCalled();
 	});

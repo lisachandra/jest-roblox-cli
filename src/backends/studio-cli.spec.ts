@@ -123,10 +123,10 @@ function resultFrame(requestId: string, reply: ReplyOptions): string {
 }
 
 /**
- * A launcher that, once the backend is listening, drives the canned result frame
- * back over the mock WebSocket server — the socket stand-in for a real bootstrap
- * pushing its envelope. `onLaunch` runs synchronously with the launch request
- * (to capture args/bootstrap before the reply).
+ * A launcher that, once the backend is listening, drives the canned result
+ * frame back over the mock WebSocket server — the socket stand-in for a real
+ * bootstrap pushing its envelope. `onLaunch` runs synchronously with the
+ * launch request (to capture args/bootstrap before the reply).
  */
 function replyWith(
 	reply: ReplyOptions = {},
@@ -179,7 +179,7 @@ function backendReplying(reply: ReplyOptions = {}): StudioCliBackend {
 // pointing at the mega-place the workspace runner already built. studio-cli
 // keys off `pkg` to switch into the staged/materializer dispatch.
 function workspaceJob(
-	package_: string,
+	packageName: string,
 	displayName: string,
 	overrides: Partial<ResolvedConfig> = {},
 ): ProjectJob {
@@ -188,7 +188,7 @@ function workspaceJob(
 			placeFile: "/repo/.jest-roblox/workspace/synthesized.rbxl",
 			...overrides,
 		}),
-		pkg: package_,
+		pkg: packageName,
 	};
 }
 
@@ -206,7 +206,7 @@ describe(StudioCliBackend, () => {
 
 		resetVol();
 
-		const { rawResults, timing } = await backendReplying().runTests(singleJob);
+		const { rawResults, timing } = await backendReplying().runTestsAsync(singleJob);
 
 		expect(rawResults).toHaveLength(1);
 		expect(rawResults[0]!.entry.jestOutput).toContain('"numPassedTests":2');
@@ -225,7 +225,7 @@ describe(StudioCliBackend, () => {
 			],
 		});
 
-		const { rawResults } = await backend.runTests({ jobs: [job("alpha"), job("beta")] });
+		const { rawResults } = await backend.runTestsAsync({ jobs: [job("alpha"), job("beta")] });
 
 		expect(rawResults).toHaveLength(2);
 		expect(rawResults.map((raw) => raw.entry.elapsedMs)).toStrictEqual([11, 22]);
@@ -242,7 +242,7 @@ describe(StudioCliBackend, () => {
 			gameOutput: fallback,
 		});
 
-		const { rawResults } = await backend.runTests(singleJob);
+		const { rawResults } = await backend.runTestsAsync(singleJob);
 
 		expect(rawResults[0]!.fallbackGameOutput).toBe(fallback);
 	});
@@ -260,7 +260,7 @@ describe(StudioCliBackend, () => {
 			launch: replyWith().launch,
 		});
 
-		await backend.runTests(singleJob);
+		await backend.runTestsAsync(singleJob);
 
 		const built = buildPlace.mock.calls[0]![0];
 
@@ -284,7 +284,7 @@ describe(StudioCliBackend, () => {
 		});
 		const backend = makeBackend(launch);
 
-		await backend.runTests({ jobs: [job("alpha", { testNamePattern: "alpha-pattern" })] });
+		await backend.runTestsAsync({ jobs: [job("alpha", { testNamePattern: "alpha-pattern" })] });
 
 		expect(bootstrap).toContain("ExecuteRunModeAsync");
 		expect(bootstrap).toContain("alpha-pattern");
@@ -309,7 +309,7 @@ describe(StudioCliBackend, () => {
 		});
 		const backend = makeBackend(launch);
 
-		await backend.runTests({ jobs: [job("alpha", { testNamePattern: "x]=]y" })] });
+		await backend.runTestsAsync({ jobs: [job("alpha", { testNamePattern: "x]=]y" })] });
 
 		// Level escalated to `[==[ … ]==]`, and the `]=]` payload sits intact
 		// inside without closing it.
@@ -327,7 +327,7 @@ describe(StudioCliBackend, () => {
 
 		const backend = backendReplying({ omitProtocolVersion: true });
 
-		await expect(backend.runTests(singleJob)).rejects.toThrow(/protocol.*mismatch/i);
+		await expect(backend.runTestsAsync(singleJob)).rejects.toThrow(/protocol.*mismatch/i);
 	});
 
 	it("should surface a version-mismatch error when the plugin echoes a different protocolVersion", async () => {
@@ -337,7 +337,7 @@ describe(StudioCliBackend, () => {
 
 		const backend = backendReplying({ protocolVersion: 2 });
 
-		await expect(backend.runTests(singleJob)).rejects.toThrow(/protocol.*mismatch/i);
+		await expect(backend.runTestsAsync(singleJob)).rejects.toThrow(/protocol.*mismatch/i);
 	});
 
 	it("should carry a large jestOutput through the socket frame intact (no print cap)", async () => {
@@ -352,7 +352,7 @@ describe(StudioCliBackend, () => {
 		const jestOutput = envelope([{ jestOutput: `{"success":true,"value":"${bigName}"}` }]);
 		const backend = backendReplying({ rawJestOutput: jestOutput });
 
-		const { rawResults } = await backend.runTests(singleJob);
+		const { rawResults } = await backend.runTestsAsync(singleJob);
 
 		expect(rawResults).toHaveLength(1);
 		expect(rawResults[0]!.entry.jestOutput).toContain(bigName);
@@ -367,7 +367,7 @@ describe(StudioCliBackend, () => {
 			rawJestOutput: JSON.stringify({ err: "plugin produced no result", success: false }),
 		});
 
-		await expect(backend.runTests(singleJob)).rejects.toThrow(/plugin produced no result/);
+		await expect(backend.runTestsAsync(singleJob)).rejects.toThrow(/plugin produced no result/);
 	});
 
 	it("should ignore non-result frames and resolve on the matching result", async () => {
@@ -395,7 +395,7 @@ describe(StudioCliBackend, () => {
 				socket.emit("message", frame);
 			});
 			return process;
-		}).runTests(singleJob);
+		}).runTestsAsync(singleJob);
 
 		expect(rawResults).toHaveLength(1);
 	});
@@ -414,7 +414,7 @@ describe(StudioCliBackend, () => {
 			timeout: 40,
 		});
 
-		await expect(backend.runTests(singleJob)).rejects.toThrow(
+		await expect(backend.runTestsAsync(singleJob)).rejects.toThrow(
 			/timed out after 40ms and was terminated/,
 		);
 		// The run kills Studio on the way out even on the timeout path.
@@ -434,7 +434,7 @@ describe(StudioCliBackend, () => {
 					getLastCreatedServer()!.emit("error", new Error("EADDRINUSE"));
 				});
 				return process;
-			}).runTests(singleJob),
+			}).runTestsAsync(singleJob),
 		).rejects.toThrow(/EADDRINUSE/);
 	});
 
@@ -451,7 +451,7 @@ describe(StudioCliBackend, () => {
 					process.emitError(new Error("spawn ENOENT"));
 				});
 				return process;
-			}).runTests(singleJob),
+			}).runTestsAsync(singleJob),
 		).rejects.toThrow(/spawn ENOENT/);
 	});
 
@@ -466,10 +466,10 @@ describe(StudioCliBackend, () => {
 		});
 		const backend = makeBackend(launch);
 
-		await backend.runTests(singleJob);
+		await backend.runTestsAsync(singleJob);
 
-		expect(captured?.studioPath).toBe("C:/Studio/RobloxStudioBeta.exe");
-		expect(captured?.args).toStrictEqual(
+		expect(captured!.studioPath).toBe("C:/Studio/RobloxStudioBeta.exe");
+		expect(captured!.args).toStrictEqual(
 			expect.arrayContaining([
 				"--task",
 				"RunScript",
@@ -486,14 +486,14 @@ describe(StudioCliBackend, () => {
 
 		resetVol();
 
-		let captured: boolean | undefined;
+		let wasHeadedRequested: boolean | undefined;
 		const { launch } = replyWith({}, (request) => {
-			captured = request.headed;
+			wasHeadedRequested = request.headed;
 		});
 
-		await makeBackend(launch, { headed: true }).runTests(singleJob);
+		await makeBackend(launch, { headed: true }).runTestsAsync(singleJob);
 
-		expect(captured).toBeTrue();
+		expect(wasHeadedRequested).toBeTrue();
 	});
 
 	it("should default headed to false in the launch request", async () => {
@@ -501,14 +501,14 @@ describe(StudioCliBackend, () => {
 
 		resetVol();
 
-		let captured: boolean | undefined;
+		let wasHeadedRequested: boolean | undefined;
 		const { launch } = replyWith({}, (request) => {
-			captured = request.headed;
+			wasHeadedRequested = request.headed;
 		});
 
-		await makeBackend(launch).runTests(singleJob);
+		await makeBackend(launch).runTestsAsync(singleJob);
 
-		expect(captured).toBeFalse();
+		expect(wasHeadedRequested).toBeFalse();
 	});
 
 	it("should pass the studioPath override to the discover seam", async () => {
@@ -526,7 +526,7 @@ describe(StudioCliBackend, () => {
 			studioPath: "C:/override/RobloxStudioBeta.exe",
 		});
 
-		await backend.runTests(singleJob);
+		await backend.runTestsAsync(singleJob);
 
 		expect(discover).toHaveBeenCalledWith("C:/override/RobloxStudioBeta.exe");
 	});
@@ -536,9 +536,9 @@ describe(StudioCliBackend, () => {
 
 		resetVol();
 
-		await expect(backendReplying().runTests({ jobs: [job("")], parallel: 2 })).rejects.toThrow(
-			/--parallel > 1 is not supported/,
-		);
+		await expect(
+			backendReplying().runTestsAsync({ jobs: [job("")], parallel: 2 }),
+		).rejects.toThrow(/--parallel > 1 is not supported/);
 	});
 
 	it("should allow --parallel of 1", async () => {
@@ -546,7 +546,10 @@ describe(StudioCliBackend, () => {
 
 		resetVol();
 
-		const { rawResults } = await backendReplying().runTests({ jobs: [job("")], parallel: 1 });
+		const { rawResults } = await backendReplying().runTestsAsync({
+			jobs: [job("")],
+			parallel: 1,
+		});
 
 		expect(rawResults).toHaveLength(1);
 	});
@@ -557,7 +560,7 @@ describe(StudioCliBackend, () => {
 		resetVol();
 
 		await expect(
-			backendReplying().runTests({ jobs: [job("")], workStealing: true }),
+			backendReplying().runTestsAsync({ jobs: [job("")], workStealing: true }),
 		).rejects.toThrow(/does not support work-stealing/);
 	});
 
@@ -566,7 +569,7 @@ describe(StudioCliBackend, () => {
 
 		resetVol();
 
-		await expect(backendReplying().runTests({ jobs: [] })).rejects.toThrow(
+		await expect(backendReplying().runTestsAsync({ jobs: [] })).rejects.toThrow(
 			"StudioCliBackend requires at least one job",
 		);
 	});
@@ -580,7 +583,7 @@ describe(StudioCliBackend, () => {
 			entries: [{ jestOutput: successResult() }, { jestOutput: successResult() }],
 		});
 
-		await expect(backend.runTests(singleJob)).rejects.toThrow(
+		await expect(backend.runTestsAsync(singleJob)).rejects.toThrow(
 			/returned 2 entries but request had 1 jobs/,
 		);
 	});
@@ -602,7 +605,7 @@ describe(StudioCliBackend, () => {
 			launch,
 		});
 
-		await backend.runTests({ jobs: [workspaceJob("@scope/a", "a")] });
+		await backend.runTestsAsync({ jobs: [workspaceJob("@scope/a", "a")] });
 
 		// The mega-place is already built by the workspace runner; studio-cli
 		// must drive it, not build a second place from one package's rojo
@@ -630,7 +633,7 @@ describe(StudioCliBackend, () => {
 		);
 		const backend = makeBackend(launch);
 
-		await backend.runTests({
+		await backend.runTestsAsync({
 			jobs: [workspaceJob("@scope/a", "a"), workspaceJob("@scope/b", "b")],
 		});
 
@@ -651,7 +654,7 @@ describe(StudioCliBackend, () => {
 			],
 		});
 
-		const { rawResults } = await backend.runTests({
+		const { rawResults } = await backend.runTestsAsync({
 			jobs: [workspaceJob("@scope/a", "a"), workspaceJob("@scope/b", "b")],
 		});
 
@@ -681,7 +684,7 @@ describe(StudioCliBackend, () => {
 			studioPath: "C:/seeded/RobloxStudioBeta.exe",
 		});
 
-		await backend.runTests(singleJob);
+		await backend.runTestsAsync(singleJob);
 
 		expect(launchedPath).toBe("C:/seeded/RobloxStudioBeta.exe");
 	});
@@ -699,7 +702,7 @@ describe(StudioCliBackend, () => {
 		});
 		const backend = new StudioCliBackend({ buildPlace: fakeBuildPlace(), launch });
 
-		await backend.runTests(singleJob);
+		await backend.runTestsAsync(singleJob);
 
 		expect(launchedPath).toBe("C:/from-env/RobloxStudioBeta.exe");
 	});
@@ -715,7 +718,7 @@ describe(StudioCliBackend, () => {
 			// port. State on an object so the lazy implementation re-reads it.
 			const state = { listening: false };
 			vi.spyOn(server, "address").mockImplementation(() => {
-				if (state.listening && boundPort !== undefined) {
+				if (boundPort !== undefined && state.listening) {
 					return { port: boundPort };
 				}
 
@@ -747,7 +750,7 @@ describe(StudioCliBackend, () => {
 				launch,
 			});
 
-			await backend.runTests(singleJob);
+			await backend.runTestsAsync(singleJob);
 
 			expect(bootstrap).toContain("ws://localhost:54321");
 		});
@@ -764,7 +767,7 @@ describe(StudioCliBackend, () => {
 				launch: replyWith().launch,
 			});
 
-			await expect(backend.runTests(singleJob)).rejects.toThrow(/failed to bind a port/);
+			await expect(backend.runTestsAsync(singleJob)).rejects.toThrow(/failed to bind a port/);
 		});
 	});
 
@@ -798,7 +801,7 @@ describe(StudioCliBackend, () => {
 				launch,
 			});
 
-			await backend.runTests({ jobs: [coverageJob()] });
+			await backend.runTestsAsync({ jobs: [coverageJob()] });
 
 			// Exact path (not just `toContain`) so a rootDir/CWD resolution
 			// drift is caught, and the clean place is provably never built.
@@ -817,7 +820,7 @@ describe(StudioCliBackend, () => {
 			const jestOutput = successResult({ _coverage: coverageData });
 			const backend = backendReplying({ entries: [{ jestOutput }] });
 
-			const { rawResults } = await backend.runTests({ jobs: [coverageJob()] });
+			const { rawResults } = await backend.runTestsAsync({ jobs: [coverageJob()] });
 
 			// The coverage-bearing jestOutput rides through verbatim, so the
 			// downstream parser/mapper produce the report exactly as on
@@ -834,7 +837,7 @@ describe(StudioCliBackend, () => {
 
 			const { launch, process } = replyWith();
 
-			await makeBackend(launch).runTests(singleJob);
+			await makeBackend(launch).runTestsAsync(singleJob);
 
 			// Default ON: hand teardown to the lock-release watch (which lets
 			// edit- mode BindToClose run + frees the lock) instead of
@@ -850,7 +853,7 @@ describe(StudioCliBackend, () => {
 
 			const { launch, process } = replyWith();
 
-			await makeBackend(launch, { gracefulShutdownTimeout: 9999 }).runTests(singleJob);
+			await makeBackend(launch, { gracefulShutdownTimeout: 9999 }).runTestsAsync(singleJob);
 
 			expect(process.killOnLockRelease).toHaveBeenCalledWith(9999);
 		});
@@ -866,7 +869,7 @@ describe(StudioCliBackend, () => {
 
 			const { launch, process } = replyWith({ protocolVersion: 2 });
 
-			await expect(makeBackend(launch).runTests(singleJob)).rejects.toThrow(
+			await expect(makeBackend(launch).runTestsAsync(singleJob)).rejects.toThrow(
 				/protocol.*mismatch/i,
 			);
 			expect(process.killOnLockRelease).toHaveBeenCalledOnce();
@@ -885,10 +888,12 @@ describe(StudioCliBackend, () => {
 		function stubSpawn(): { args: () => Array<string>; child: FakeChild } {
 			const child = new FakeChild();
 			let capturedArgs: Array<string> = [];
-			vi.mocked(spawn).mockImplementation(((_file: string, args: Array<string>) => {
-				capturedArgs = args;
-				return child as unknown as ChildProcess;
-			}) as unknown as typeof spawn);
+			vi.mocked(spawn).mockImplementation(
+				fromAny((_file: string, args: Array<string>) => {
+					capturedArgs = args;
+					return child;
+				}),
+			);
 			return { args: () => capturedArgs, child };
 		}
 
@@ -908,7 +913,7 @@ describe(StudioCliBackend, () => {
 
 		// Drive the result frame back over the server once the backend is
 		// listening (the real spawnStudio does not reply on its own).
-		async function replyOverServer(args: () => Array<string>): Promise<void> {
+		async function replyOverServerAsync(args: () => Array<string>): Promise<void> {
 			await Promise.resolve();
 			const server = getLastCreatedServer()!;
 			const socket = new MockWebSocket();
@@ -933,8 +938,8 @@ describe(StudioCliBackend, () => {
 			useLockPollTimers();
 
 			const { args } = stubSpawn();
-			const promise = backendWithDefaultLaunch().runTests(singleJob);
-			await replyOverServer(args);
+			const promise = backendWithDefaultLaunch().runTestsAsync(singleJob);
+			await replyOverServerAsync(args);
 			const { rawResults } = await promise;
 
 			expect(rawResults).toHaveLength(1);
@@ -953,8 +958,8 @@ describe(StudioCliBackend, () => {
 			fs.writeFileSync(lockPath, "stale lock from a killed Studio");
 
 			const { args } = stubSpawn();
-			const promise = backendWithDefaultLaunch().runTests(singleJob);
-			await replyOverServer(args);
+			const promise = backendWithDefaultLaunch().runTestsAsync(singleJob);
+			await replyOverServerAsync(args);
 			await promise;
 
 			expect(fs.existsSync(lockPath)).toBeFalse();
@@ -966,7 +971,7 @@ describe(StudioCliBackend, () => {
 			resetVol();
 
 			const { child } = stubSpawn();
-			const promise = backendWithDefaultLaunch().runTests(singleJob);
+			const promise = backendWithDefaultLaunch().runTestsAsync(singleJob);
 			await Promise.resolve();
 			child.emit("error", Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }));
 
@@ -981,7 +986,7 @@ describe(StudioCliBackend, () => {
 			const { child } = stubSpawn();
 
 			await expect(
-				backendWithDefaultLaunch({ timeout: 40 }).runTests(singleJob),
+				backendWithDefaultLaunch({ timeout: 40 }).runTestsAsync(singleJob),
 			).rejects.toThrow(/timed out after 40ms and was terminated/);
 			expect(child.kill).toHaveBeenCalledOnce();
 		});
@@ -994,8 +999,8 @@ describe(StudioCliBackend, () => {
 				useLockPollTimers();
 
 				const { args, child } = stubSpawn();
-				const promise = backendWithDefaultLaunch().runTests(singleJob);
-				await replyOverServer(args);
+				const promise = backendWithDefaultLaunch().runTestsAsync(singleJob);
+				await replyOverServerAsync(args);
 				await promise;
 
 				// Studio holds the lock through the graceful ClosePlace; the
@@ -1022,8 +1027,8 @@ describe(StudioCliBackend, () => {
 				const { args, child } = stubSpawn();
 				const promise = backendWithDefaultLaunch({
 					gracefulShutdownTimeout: 5000,
-				}).runTests(singleJob);
-				await replyOverServer(args);
+				}).runTestsAsync(singleJob);
+				await replyOverServerAsync(args);
 				await promise;
 
 				// A long-yielding BindToClose keeps the lock held past the cap.

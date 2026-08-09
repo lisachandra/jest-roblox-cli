@@ -48,17 +48,17 @@ import {
 	loadConfig,
 	parseGameOutput,
 	parseJestOutput,
-	prepareArtifacts,
+	prepareArtifactsAsync,
 	readBuildManifest,
 	readCoverageManifest,
 	resolveConfig,
-	runProjects,
-	runTypecheck,
+	runProjectsAsync,
+	runTypecheckAsync,
 	writeGameOutput,
-	writeJsonFile,
+	writeJsonFileAsync,
 } from "./index.ts";
 
-describe("defineConfig", () => {
+describe(defineConfig, () => {
 	it("should accept empty config", () => {
 		expectTypeOf(defineConfig).toBeCallableWith({});
 	});
@@ -101,14 +101,14 @@ describe("DEFAULT_CONFIG", () => {
 	});
 });
 
-describe("resolveConfig", () => {
+describe(resolveConfig, () => {
 	it("should accept Config and return ResolvedConfig", () => {
 		expectTypeOf(resolveConfig).parameter(0).toExtend<Config>();
 		expectTypeOf(resolveConfig).returns.toEqualTypeOf<ResolvedConfig>();
 	});
 });
 
-describe("loadConfig", () => {
+describe(loadConfig, () => {
 	it("should return Promise<ResolvedConfig>", () => {
 		expectTypeOf(loadConfig).returns.toEqualTypeOf<Promise<ResolvedConfig>>();
 	});
@@ -125,10 +125,10 @@ describe("loadConfig", () => {
 	});
 });
 
-describe("runProjects", () => {
+describe(runProjectsAsync, () => {
 	it("should accept RunProjectsOptions and return Promise<RunProjectsResult>", () => {
-		expectTypeOf(runProjects).parameter(0).toExtend<RunProjectsOptions>();
-		expectTypeOf(runProjects).returns.toEqualTypeOf<Promise<RunProjectsResult>>();
+		expectTypeOf(runProjectsAsync).parameter(0).toExtend<RunProjectsOptions>();
+		expectTypeOf(runProjectsAsync).returns.toEqualTypeOf<Promise<RunProjectsResult>>();
 	});
 });
 
@@ -174,8 +174,8 @@ describe("formatters", () => {
 		expectTypeOf(formatJson).returns.toBeString();
 	});
 
-	it("should return void promise from writeJsonFile", () => {
-		expectTypeOf(writeJsonFile).returns.toEqualTypeOf<Promise<void>>();
+	it("should return void promise from writeJsonFileAsync", () => {
+		expectTypeOf(writeJsonFileAsync).returns.toEqualTypeOf<Promise<void>>();
 	});
 });
 
@@ -219,10 +219,10 @@ describe("backends", () => {
 	});
 });
 
-describe("runTypecheck", () => {
+describe(runTypecheckAsync, () => {
 	it("should accept TypecheckOptions and return a Promise of JestResult", () => {
-		expectTypeOf(runTypecheck).parameter(0).toExtend<TypecheckOptions>();
-		expectTypeOf(runTypecheck).returns.toEqualTypeOf<Promise<JestResult>>();
+		expectTypeOf(runTypecheckAsync).parameter(0).toExtend<TypecheckOptions>();
+		expectTypeOf(runTypecheckAsync).returns.toEqualTypeOf<Promise<JestResult>>();
 	});
 });
 
@@ -314,8 +314,8 @@ describe("artifact contract", () => {
 		expectTypeOf<InstrumentedFileRecord>().toHaveProperty("sourceHash");
 	});
 
-	it("should expose prepareArtifacts returning an ArtifactBundle", () => {
-		expectTypeOf(prepareArtifacts).returns.resolves.toEqualTypeOf<ArtifactBundle>();
+	it("should expose prepareArtifactsAsync returning an ArtifactBundle", () => {
+		expectTypeOf(prepareArtifactsAsync).returns.toEqualTypeOf<Promise<ArtifactBundle>>();
 	});
 
 	it("should export ArtifactBundle with both places and the manifest paths", () => {

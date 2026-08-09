@@ -15,12 +15,11 @@ export default isentinel(
 		],
 		jsdoc: false,
 		namedConfigs: true,
+		naming: true,
 		pnpm: false,
 		roblox: false,
 		rules: {
 			"max-lines": "off",
-			"max-lines-per-function": "off",
-			"test/require-hook": "off",
 		},
 		test: {
 			vitest: {

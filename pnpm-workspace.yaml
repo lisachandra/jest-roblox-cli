@@ -1,5 +1,5 @@
 packages:
-  - "packages/*"
+  - packages/*
 
 overrides:
   "@typescript-eslint/eslint-plugin": 8.62.1
@@ -10,8 +10,8 @@ overrides:
   "@typescript-eslint/utils": 8.62.1
 
 minimumReleaseAgeExclude:
-  - "@bedrock-rbx/ocale@0.1.0-beta.19"
-  - "@isentinel/eslint-config@6.0.0-beta.3"
+  - "@bedrock-rbx/ocale@0.1.4"
+  - "@isentinel/eslint-config"
 
 publicHoistPattern:
   - "*@rbxts*"

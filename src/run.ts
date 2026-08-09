@@ -3,11 +3,10 @@ import { resolveTypecheckConfig } from "./config/resolve-typecheck-config.ts";
 import type { CliOptions, ProjectEntry, ResolvedConfig } from "./config/schema.ts";
 import { emitBuildManifest } from "./coverage-pipeline/build-manifest.ts";
 import { COVERAGE_BUILD_MANIFEST_PATH } from "./coverage-pipeline/prepare.ts";
-import { loadRojoTree, runMultiProject, runResolvedProjects } from "./run/multi.ts";
+import { loadRojoTree, runMultiProjectAsync, runResolvedProjectsAsync } from "./run/multi.ts";
 import { buildImplicitProject } from "./run/single-projects.ts";
-import { runSingleProject } from "./run/single.ts";
-import type { MultiRunResult, RunResult, SingleRunResult } from "./run/types.ts";
-import { runWorkspaceMode } from "./run/workspace.ts";
+import type { MultiRunResult, WorkspaceRunResult } from "./run/types.ts";
+import { runWorkspaceModeAsync } from "./run/workspace.ts";
 import { createTimingCollector, type TimingCollector } from "./timing/orchestration-collector.ts";
 
 export function isWorkspaceInvocation(cli: CliOptions): boolean {
@@ -15,13 +14,15 @@ export function isWorkspaceInvocation(cli: CliOptions): boolean {
 }
 
 /**
- * The raw `projects` entries off a resolved config. `ResolvedConfig.projects` is
- * structurally typed `Array<string>` post-resolution, but single/multi dispatch
- * reads it before resolution when entries are still raw `ProjectEntry`. The cast
- * is bounded by the `Array.isArray`-style length check at every call site.
+ * The raw `projects` entries off a resolved config. `ResolvedConfig.projects`
+ * is structurally typed `Array<string>` post-resolution, but single/multi
+ * dispatch reads it before resolution when entries are still raw
+ * `ProjectEntry` — so the field is read off the config as unknown and branded
+ * by the array check every call site already relies on.
  */
 export function getRawProjects(config: ResolvedConfig): Array<ProjectEntry> | undefined {
-	return (config as unknown as { projects?: Array<ProjectEntry> }).projects;
+	const projects: unknown = config.projects;
+	return isProjectEntryArray(projects) ? projects : undefined;
 }
 
 /**
@@ -30,37 +31,42 @@ export function getRawProjects(config: ResolvedConfig): Array<ProjectEntry> | un
  * runs the suite, returning `coverageArtifacts` for the caller to emit a Build
  * Manifest from — the core never writes that manifest itself.
  */
-export async function runSingleOrMulti(
+export async function runSingleOrMultiAsync(
 	cli: CliOptions,
 	merged: ResolvedConfig,
 	timing: TimingCollector,
-): Promise<MultiRunResult | SingleRunResult> {
+): Promise<MultiRunResult> {
 	const rawProjects = getRawProjects(merged);
 	if (rawProjects !== undefined && rawProjects.length > 0) {
-		return runMultiProject({ cli, config: merged, rawProjects, timing });
+		return runMultiProjectAsync({ cli, config: merged, rawProjects, timing });
 	}
 
-	// No explicit `projects`. A pure typecheck-only run stays local in single
-	// mode (no backend, place, or Rojo project required). Any run that can
-	// produce runtime tests collapses into the multi pipeline: synthesize one
-	// project from the config's luau roots so the runner gets the per-root
-	// `jest.config` stub and rebuilt place it requires (the runner resolves
-	// per-project config from a `jest.config` ModuleScript at each project root,
-	// which single mode never generated).
+	// No explicit `projects`: synthesize one project from the config's luau
+	// roots so the runner gets the per-root `jest.config` stub and rebuilt place
+	// it requires (the runner resolves per-project config from a `jest.config`
+	// ModuleScript at each project root), then run it through the multi
+	// pipeline.
+	//
+	// A pure typecheck-only run is host-local tsgo: `runResolvedProjects`
+	// short-circuits into `runMultiTypecheckOnly` before any backend, place, or
+	// coverage work, and nothing is mounted into a DataModel. It therefore needs
+	// no Rojo project **on disk** — so the tree is left unloaded and the
+	// implicit project carries no mounts.
 	const typecheck = resolveTypecheckConfig({
 		cli: { enabled: cli.typecheck, only: cli.typecheckOnly, tsconfig: cli.typecheckTsconfig },
 		root: merged.typecheck,
 	});
-	if (typecheck.only) {
-		return runSingleProject({ cli, config: merged, timing });
-	}
-
-	const rojoTree = timing.profile("loadRojoTree", () => loadRojoTree(merged));
+	const rojoTree = typecheck.only
+		? undefined
+		: timing.profile("loadRojoTree", () => loadRojoTree(merged));
 	const project = buildImplicitProject(merged, rojoTree);
-	return runResolvedProjects([project], merged, cli, timing);
+	return runResolvedProjectsAsync([project], merged, cli, timing);
 }
 
-export async function runJestRoblox(cli: CliOptions, config: ResolvedConfig): Promise<RunResult> {
+export async function runJestRobloxAsync(
+	cli: CliOptions,
+	config: ResolvedConfig,
+): Promise<MultiRunResult | WorkspaceRunResult> {
 	// One collector per top-level run, flushed in `finally` so a TIMING run
 	// still emits the host waterfall when a profiled phase throws (missing
 	// lute, rojo build failure, dispatch timeout) — exactly the slow or
@@ -74,13 +80,13 @@ export async function runJestRoblox(cli: CliOptions, config: ResolvedConfig): Pr
 		// absolute at load) and drive package enumeration in repos without a
 		// pnpm-workspace.yaml.
 		if (isWorkspaceInvocation(cli)) {
-			return await runWorkspaceMode(cli, config.workspace, timing);
+			return await runWorkspaceModeAsync(cli, config.workspace, timing);
 		}
 
 		// Single/multi paths keep the CLI > config precedence so programmatic
 		// callers passing a raw config still get CLI overrides folded in.
 		const merged = mergeCliWithConfig(cli, config);
-		const result = await runSingleOrMulti(cli, merged, timing);
+		const result = await runSingleOrMultiAsync(cli, merged, timing);
 
 		// Entry point owns Build Manifest emission. A `runJestRoblox` run never
 		// builds a Clean Place, so it records `coveragePlace` only. The reuse
@@ -93,4 +99,8 @@ export async function runJestRoblox(cli: CliOptions, config: ResolvedConfig): Pr
 	} finally {
 		timing.flushTimingReport();
 	}
+}
+
+function isProjectEntryArray(value: unknown): value is Array<ProjectEntry> {
+	return Array.isArray(value);
 }

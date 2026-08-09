@@ -175,6 +175,7 @@ package's own jest.config or in a shared config that every package extends.
 | `jestPath`      | Where Jest lives in the DataModel                                 | auto                        |
 | `showLuau`      | Show Luau code snippets in failure output                         | `true`                      |
 | `coverageCache` | Reuse incrementally-instrumented coverage shadow dir between runs | `true`                      |
+| `uploadCache`   | Skip the place upload when the place file's bytes are unchanged   | `true`                      |
 | `luauRoots`     | Where Luau files live for coverage instrumentation                | auto from tsconfig `outDir` |
 
 ### Test fields
@@ -481,19 +482,19 @@ or add a re-export at the repo root so the config is discovered there:
 export { default } from "./packages/testing/jest.shared.ts";
 ```
 
-Per-package coverage is aggregated into a single report under
-`<rootDir>/<coverageDirectory>`. `rootDir` defaults to the current working
-directory, so run from the workspace root (or set `rootDir`) if you want the
-report to land there.
+Coverage reports per package. Each opted-in package gets its own report, built
+from its own `collectCoverageFrom` and `coveragePathIgnorePatterns`, rendered by
+its own `coverageReporters`, into its own `<rootDir>/<coverageDirectory>` — its
+`rootDir` being the package directory, so the report lands beside the package.
 
 Coverage is opt-in per package (each package's own `collectCoverage`), and
 `coverageThreshold` is enforced per package: every opted-in package is gated
-against its own files. The workspace-root config's threshold is the metric-level
-base for all packages; a package's own declaration overrides the metrics it
-names — even downward — while unnamed metrics inherit the root's. There is no
-pooled cross-package gate, so one package's high coverage cannot mask another's
-shortfall. Declaring a threshold without `collectCoverage` prints a warning: it
-cannot be enforced without instrumentation.
+against its own files, by the threshold it declared itself. A package that
+declares none is not gated — there is no run-level threshold to inherit, since
+the file at the directory you happen to run from is not a source of truth. There
+is no pooled cross-package gate either, so one package's high coverage cannot
+mask another's shortfall. Declaring a threshold without `collectCoverage` prints
+a warning: it cannot be enforced without instrumentation.
 
 Game Output has two independent sinks. Setting `gameOutput` (a path, or `true`)
 writes one **grouped** aggregate file at the workspace root —
@@ -536,6 +537,7 @@ project) under `.jest-roblox/output/`.
 | `--silent`                       | Hide all output                                                                                             |
 | `--no-color`                     | Turn off colors                                                                                             |
 | `--no-coverage-cache`            | Force a clean coverage re-instrumentation                                                                   |
+| `--no-upload-cache`              | Always upload the place, even when its bytes are unchanged                                                  |
 | `--parallel [n]`                 | Open Cloud concurrent sessions, or `auto` (= `min(jobs, 3)`)                                                |
 | `--project <name...>`            | Filter which named projects to run                                                                          |
 | `--setupFiles <path...>`         | Scripts to run before env                                                                                   |

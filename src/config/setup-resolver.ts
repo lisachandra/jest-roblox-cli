@@ -11,9 +11,15 @@ export interface SetupResolverOptions {
 
 const PROBE_EXTENSIONS = [".ts", ".tsx", ".lua", ".luau"];
 
-export function createSetupResolver(options: SetupResolverOptions): (input: string) => string {
-	const { configDirectory, resolveModule, rojoConfigPath } = options;
+export function createSetupResolver({
+	configDirectory,
+	resolveModule,
+	rojoConfigPath,
+}: SetupResolverOptions): (input: string) => string {
 	const resolve = resolveModule ?? createRequire(path.join(configDirectory, "noop.js")).resolve;
+	// mapFsPathToDataModel is not an equivalent substitution for this walk: the
+	// resolver follows the pnpm symlink and any nested rojo config, so it strips
+	// `out` from a package path where the tree mapper keeps it.
 	const rojoResolver = RojoResolver.fromPath(rojoConfigPath);
 
 	return (input: string): string => {

@@ -1,9 +1,10 @@
+import { type } from "arktype";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { startFakeOpenCloudServer } from "../cli/fake-open-cloud.ts";
+import { startFakeOpenCloudServerAsync } from "../cli/fake-open-cloud.ts";
 import { createFixtureSandbox, readJsonSync, runCliAsync } from "../cli/helpers.ts";
 
 // Regression: `--workspace --coverage` against a package whose rojo
@@ -20,6 +21,15 @@ import { createFixtureSandbox, readJsonSync, runCliAsync } from "../cli/helpers.
 
 const WORKSPACE_FIXTURE_PATH = path.resolve(__dirname, "../fixtures/workspace");
 const RUN_TIMEOUT_MS = 60_000;
+
+// Only the field these regressions read — the manifest's full schema lives in
+// `src/coverage-pipeline/manifest.ts` and is validated by the CLI itself.
+const manifestFilesSchema = type({ files: "object" });
+
+function readManifestFileKeys(manifestPath: string): Array<string> {
+	const manifest = manifestFilesSchema.assert(readJsonSync(manifestPath));
+	return Object.keys(manifest.files);
+}
 
 function rojoOnPath(): boolean {
 	try {
@@ -39,15 +49,19 @@ function luteOnPath(): boolean {
 	}
 }
 
+function hasExecutableOnPath(): boolean {
+	return rojoOnPath() || luteOnPath();
+}
+
 describe("workspace coverage — $path mounts specs alongside helpers", () => {
-	it.skipIf(!rojoOnPath() || !luteOnPath())(
+	it.skipIf(!hasExecutableOnPath())(
 		"should preserve spec files in the shadow and reach backend dispatch",
 		async () => {
 			expect.assertions(4);
 
 			const sandbox = createFixtureSandbox(WORKSPACE_FIXTURE_PATH);
 
-			const server = await startFakeOpenCloudServer([
+			const server = await startFakeOpenCloudServerAsync([
 				{
 					jestOutput: passingJestOutput(),
 					pkg: "@e2e/nested",
@@ -118,14 +132,14 @@ function passingJestOutput(overrides: Record<string, unknown> = {}): string {
 // vendored mount must not appear under the shadow.
 
 describe("workspace coverage — multi-$path rojo tree honors per-pkg luauRoots", () => {
-	it.skipIf(!rojoOnPath() || !luteOnPath())(
+	it.skipIf(!hasExecutableOnPath())(
 		"should instrument only the luauRoot-listed mounts, skipping vendored $path dirs",
 		async () => {
 			expect.assertions(5);
 
 			const sandbox = createFixtureSandbox(WORKSPACE_FIXTURE_PATH);
 
-			const server = await startFakeOpenCloudServer([
+			const server = await startFakeOpenCloudServerAsync([
 				{
 					jestOutput: passingJestOutput(),
 					pkg: "@e2e/vendored-mount",
@@ -163,19 +177,17 @@ describe("workspace coverage — multi-$path rojo tree honors per-pkg luauRoots"
 			expect(fs.existsSync(path.join(shadowRoot, "src/init.luau"))).toBeTrue();
 			expect(fs.existsSync(path.join(shadowRoot, "vendored-packages"))).toBeFalse();
 
-			const manifest = readJsonSync(path.join(shadowRoot, "coverage-manifest.json")) as {
-				files: Record<string, unknown>;
-			};
+			const manifestFileKeys = readManifestFileKeys(
+				path.join(shadowRoot, "coverage-manifest.json"),
+			);
 
-			expect(
-				Object.keys(manifest.files).some((key) => key.includes("/vendored-packages/")),
-			).toBeFalse();
+			expect(manifestFileKeys.some((key) => key.includes("/vendored-packages/"))).toBeFalse();
 			expect(server.uploadCount).toBe(1);
 		},
 		RUN_TIMEOUT_MS + 5000,
 	);
 
-	it.skipIf(!rojoOnPath() || !luteOnPath())(
+	it.skipIf(!hasExecutableOnPath())(
 		"should respect per-package coveragePathIgnorePatterns over workspace defaults",
 		async () => {
 			expect.assertions(5);
@@ -211,7 +223,7 @@ describe("workspace coverage — multi-$path rojo tree honors per-pkg luauRoots"
 				].join("\n"),
 			);
 
-			const server = await startFakeOpenCloudServer([
+			const server = await startFakeOpenCloudServerAsync([
 				{
 					jestOutput: passingJestOutput(),
 					pkg: "@e2e/vendored-mount",
@@ -249,13 +261,11 @@ describe("workspace coverage — multi-$path rojo tree honors per-pkg luauRoots"
 			expect(fs.existsSync(path.join(shadowRoot, "src/init.luau"))).toBeTrue();
 			expect(fs.existsSync(path.join(shadowRoot, "vendored-packages"))).toBeFalse();
 
-			const manifest = readJsonSync(path.join(shadowRoot, "coverage-manifest.json")) as {
-				files: Record<string, unknown>;
-			};
+			const manifestFileKeys = readManifestFileKeys(
+				path.join(shadowRoot, "coverage-manifest.json"),
+			);
 
-			expect(
-				Object.keys(manifest.files).some((key) => key.includes("/vendored-packages/")),
-			).toBeFalse();
+			expect(manifestFileKeys.some((key) => key.includes("/vendored-packages/"))).toBeFalse();
 			expect(server.uploadCount).toBe(1);
 		},
 		RUN_TIMEOUT_MS + 5000,
