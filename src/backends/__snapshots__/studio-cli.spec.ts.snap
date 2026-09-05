@@ -4,7 +4,7 @@ exports[`StudioCliBackend > should write a bootstrap that drives ExecuteRunModeA
 "local HttpService = game:GetService("HttpService")
 local StudioTestService = game:GetService("StudioTestService")
 local payload = HttpService:JSONDecode([=[{"protocolVersion":7,"test":true,"config":{"configs":[{"testMatch":["**/*.spec","**/*.spec","**/*.test","**/*.test","**/*.spec-d","**/*.test-d","**/*.spec","**/*.spec","**/*.test","**/*.test"],"passWithNoTests":false,"silent":false,"testPathIgnorePatterns":["/node_modules/","/dist/","/out/"],"verbose":false,"testNamePattern":"alpha-pattern","runnerTimeoutMs":60000,"reporters":[]}]},"runtimeStubMounts":[[]]}]=])
-local URL = "ws://localhost:<port>"
+local URL = "http://localhost:<port>/results"
 local REQUEST_ID = [=[<request-id>]=]
 local ok, result = pcall(function()
 	return StudioTestService:ExecuteRunModeAsync(payload)
@@ -18,27 +18,25 @@ else
 	message = { type = "results", requestId = REQUEST_ID, protocolVersion = result.protocolVersion, pluginVersion = result.pluginVersion, gameOutput = result.gameOutput or "[]", jestOutput = result.jestOutput }
 end
 local encoded = HttpService:JSONEncode(message)
-local connected, socket = pcall(function()
-	return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = URL })
-end)
-if not connected then
-	print("studio-cli: failed to open result socket: " .. tostring(socket))
-	return
-end
-local finished = false
-socket.Opened:Once(function()
-	socket:Send(encoded)
-end)
-socket.Error:Once(function(_statusCode, errorMessage)
-	print("studio-cli: result socket error: " .. tostring(errorMessage))
-	finished = true
-end)
-socket.Closed:Once(function()
-	finished = true
-end)
+local sent = false
 local start = os.clock()
-while not finished and os.clock() - start < 30 do
-	task.wait(0.05)
+while not sent and os.clock() - start < 30 do
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = URL,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = encoded,
+		})
+	end)
+	if ok and typeof(response) == "table" and response.Success and response.StatusCode == 200 then
+		sent = true
+		break
+	end
+	task.wait(0.1)
+end
+if not sent then
+	print("studio-cli: failed to post results to host")
 end
 "
 `;

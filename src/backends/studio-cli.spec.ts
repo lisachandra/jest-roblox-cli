@@ -1,13 +1,13 @@
-import { fromAny, fromExact, fromPartial } from "@total-typescript/shoehorn";
+import { fromAny, fromExact } from "@total-typescript/shoehorn";
 
 import { vol } from "memfs";
-import { Buffer } from "node:buffer";
+import type { AddressInfo } from "node:net";
 import { type ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { assert, describe, expect, it, type Mock, onTestFinished, vi } from "vitest";
-import type { WebSocketServer } from "ws";
+import * as http from "node:http";
 
 import { DEFAULT_CONFIG } from "../config/schema.ts";
 import type { ResolvedConfig } from "../config/schema.ts";
@@ -20,11 +20,46 @@ import type { BackendOptions, ProjectJob } from "./interface.ts";
 import { createStudioCliBackend, StudioCliBackend } from "./studio-cli.ts";
 import type { StudioCliLauncher, StudioCliProcess } from "./studio-cli.ts";
 
-const { getLastCreatedServer, MockWebSocket, MockWebSocketServer } = await vi.hoisted(
-	async () => import("../../test/mocks/mock-ws"),
-);
+// Real loopback HTTP harness: the backend listens on an ephemeral port, so
+// tests drive result frames back over `http.request` to the server each run
+// creates. Track every created server so tests can hand the pending one to
+// `postResultFrame` once the run has bound it.
+const createdServers: http.Server[] = [];
+function getLastCreatedServer(): http.Server | undefined {
+	return createdServers.at(-1);
+}
+function trackServer(server: http.Server): http.Server {
+	createdServers.push(server);
+	return server;
+}
 
-vi.mock(import("ws"), async () => fromPartial({ WebSocketServer: MockWebSocketServer }));
+/** POST a canned result frame to a bound loopback result server. */
+async function postResultFrame(server: http.Server, frame: string): Promise<void> {
+	const address = server.address();
+	if (address === null || typeof address === "string") {
+		// The run already settled and graceful teardown closed the server, so a
+		// trailing duplicate frame (which the run must ignore) has nowhere to
+		// go. Treat it as a no-op rather than an unhandled rejection.
+		return;
+	}
+	const port = address.port;
+	await new Promise<void>((resolve, reject) => {
+		const req = http.request(
+			{
+				host: "127.0.0.1",
+				port,
+				method: "POST",
+				path: "/results",
+			},
+			(res) => {
+				res.resume();
+				res.on("end", () => resolve());
+			},
+		);
+		req.on("error", reject);
+		req.end(frame);
+	});
+}
 
 vi.mock(import("node:fs"), async () => {
 	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
@@ -169,11 +204,9 @@ function replyWith(
 					return;
 				}
 
-				const socket = new MockWebSocket();
-				server.emit("connection", socket);
-				socket.emit(
-					"message",
-					Buffer.from(resultFrame(readRequestId(request.args), reply)),
+				void postResultFrame(
+					server,
+					resultFrame(readRequestId(request.args), reply),
 				);
 			});
 			return process;
@@ -192,6 +225,7 @@ function makeBackend(
 ): StudioCliBackend {
 	return new StudioCliBackend({
 		buildPlaceAsync: fakeBuildPlace(),
+		createServer: () => trackServer(http.createServer()),
 		discover: () => "C:/Studio/RobloxStudioBeta.exe",
 		launch,
 		...extra,
@@ -356,6 +390,7 @@ describe(StudioCliBackend, () => {
 			vi.fn<(options: BuildPlaceOptions) => Promise<BuildManifestArtifact>>(fakeBuildPlace());
 		const backend = new StudioCliBackend({
 			buildPlaceAsync,
+			createServer: () => trackServer(http.createServer()),
 			discover: () => "C:/Studio/RobloxStudioBeta.exe",
 			launch: replyWith().launch,
 		});
@@ -388,8 +423,8 @@ describe(StudioCliBackend, () => {
 
 		expect(bootstrap).toContain("ExecuteRunModeAsync");
 		expect(bootstrap).toContain("alpha-pattern");
-		expect(bootstrap).toContain("CreateWebStreamClient");
-		expect(bootstrap).toContain("ws://localhost:");
+		expect(bootstrap).toContain("HttpService:RequestAsync");
+		expect(bootstrap).toContain("http://localhost:");
 		// The bootstrap is an executable wire-protocol artifact. Its digest
 		// complements the readable assertions without duplicating the script.
 
@@ -398,7 +433,7 @@ describe(StudioCliBackend, () => {
 				/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gu,
 				"<request-id>",
 			)
-			.replaceAll(/ws:\/\/localhost:\d+/gu, "ws://localhost:<port>");
+			.replaceAll(/http:\/\/localhost:\d+/gu, "http://localhost:<port>");
 
 		expect(stableBootstrap).toMatchSnapshot();
 	});
@@ -506,18 +541,18 @@ describe(StudioCliBackend, () => {
 		const { rawResults } = await makeBackend((request) => {
 			queueMicrotask(() => {
 				const server = getLastCreatedServer()!;
-				const socket = new MockWebSocket();
-				server.emit("connection", socket);
 				// Non-JSON noise, a non-results frame, and a result for a
-				// different request — each ignored — then the real one.
-				socket.emit("message", Buffer.from("not json {{"));
-				socket.emit("message", Buffer.from(JSON.stringify({ hello: 1, type: "log" })));
-				socket.emit("message", Buffer.from(resultFrame("a-different-request", {})));
-				const frame = Buffer.from(resultFrame(readRequestId(request.args), {}));
-				socket.emit("message", frame);
-				// A duplicate frame after the first resolves must be ignored, not
-				// re-settle the run.
-				socket.emit("message", frame);
+				// different request — each rejected — then the real one.
+				void (async () => {
+					await postResultFrame(server, "not json {{");
+					await postResultFrame(server, JSON.stringify({ hello: 1, type: "log" }));
+					await postResultFrame(server, resultFrame("a-different-request", {}));
+					const frame = resultFrame(readRequestId(request.args), {});
+					await postResultFrame(server, frame);
+					// A duplicate frame after the first resolves must be ignored, not
+					// re-settle the run.
+					await postResultFrame(server, frame);
+				})();
 			});
 			return process;
 		}).runTestsAsync(singleJob);
@@ -709,6 +744,7 @@ describe(StudioCliBackend, () => {
 		);
 		const backend = new StudioCliBackend({
 			buildPlaceAsync: fakeBuildPlace(),
+			createServer: () => trackServer(http.createServer()),
 			discover,
 			launch: replyWith().launch,
 			studioPath: "C:/override/RobloxStudioBeta.exe",
@@ -813,6 +849,7 @@ describe(StudioCliBackend, () => {
 		});
 		const backend = new StudioCliBackend({
 			buildPlaceAsync,
+			createServer: () => trackServer(http.createServer()),
 			discover: () => "C:/Studio/RobloxStudioBeta.exe",
 			launch,
 		});
@@ -892,6 +929,7 @@ describe(StudioCliBackend, () => {
 		});
 		const backend = new StudioCliBackend({
 			buildPlaceAsync: fakeBuildPlace(),
+			createServer: () => trackServer(http.createServer()),
 			launch,
 			studioPath: "C:/seeded/RobloxStudioBeta.exe",
 		});
@@ -912,7 +950,11 @@ describe(StudioCliBackend, () => {
 		const { launch } = replyWith({}, (request) => {
 			launchedPath = request.studioPath;
 		});
-		const backend = new StudioCliBackend({ buildPlaceAsync: fakeBuildPlace(), launch });
+		const backend = new StudioCliBackend({
+			buildPlaceAsync: fakeBuildPlace(),
+			createServer: () => trackServer(http.createServer()),
+			launch,
+		});
 
 		await backend.runTestsAsync(singleJob);
 
@@ -924,23 +966,27 @@ describe(StudioCliBackend, () => {
 		// asynchronously, so the backend waits for `listening` then reads the
 		// assigned port. These drive that path with a fake server (the mock
 		// reports its port up front and is returned without waiting).
-		function pendingServer(boundPort: number | undefined): WebSocketServer {
-			const server = new MockWebSocketServer({ port: 0 });
-			// Report "not yet bound" until `listening` fires, then the assigned
-			// port. State on an object so the lazy implementation re-reads it.
-			const state = { listening: false };
-			vi.spyOn(server, "address").mockImplementation(() => {
-				if (boundPort !== undefined && state.listening) {
-					return { port: boundPort };
-				}
+		// Real loopback servers bind asynchronously, so the backend waits for
+		// `listening` then reads the assigned port into the bootstrap the run
+		// POSTs to. `boundPort` is accepted for the never-bound path (a server
+		// whose `listen` acknowledges but whose `address` stays null); anything
+		// else returns a real tracked ephemeral-port server.
+		function pendingServer(boundPort: number | undefined): http.Server {
+			if (boundPort === undefined) {
+				return fromAny({
+					address: () => null,
+					close: () => undefined,
+					closeAllConnections: () => undefined,
+					listen: (_port: number, _host: string, onListening?: () => void) => {
+						onListening?.();
+						return undefined;
+					},
+					off: () => undefined,
+					once: () => undefined,
+				});
+			}
 
-				return fromAny(null);
-			});
-			queueMicrotask(() => {
-				state.listening = true;
-				server.emit("listening");
-			});
-			return fromAny(server);
+			return trackServer(http.createServer());
 		}
 
 		it("should wait for `listening` and bake the assigned ephemeral port", async () => {
@@ -949,7 +995,9 @@ describe(StudioCliBackend, () => {
 			resetVol();
 
 			let bootstrap = "";
+			let boundPort = 0;
 			const { launch } = replyWith({}, (request) => {
+				boundPort = (getLastCreatedServer()!.address() as AddressInfo).port;
 				bootstrap = fs.readFileSync(
 					request.args[request.args.indexOf("--runScriptFile") + 1]!,
 					"utf8",
@@ -957,14 +1005,14 @@ describe(StudioCliBackend, () => {
 			});
 			const backend = new StudioCliBackend({
 				buildPlaceAsync: fakeBuildPlace(),
-				createServer: () => pendingServer(54_321),
+				createServer: () => pendingServer(0),
 				discover: () => "C:/Studio/RobloxStudioBeta.exe",
 				launch,
 			});
 
 			await backend.runTestsAsync(singleJob);
 
-			expect(bootstrap).toContain("ws://localhost:54321");
+			expect(bootstrap).toContain(`http://localhost:${boundPort.toString()}`);
 		});
 
 		it("should throw when the result server never reports a bound port", async () => {
@@ -1009,6 +1057,7 @@ describe(StudioCliBackend, () => {
 			);
 			const backend = new StudioCliBackend({
 				buildPlaceAsync,
+				createServer: () => trackServer(http.createServer()),
 				discover: () => "C:/Studio/RobloxStudioBeta.exe",
 				launch,
 			});
@@ -1128,6 +1177,7 @@ describe(StudioCliBackend, () => {
 		): StudioCliBackend {
 			return new StudioCliBackend({
 				buildPlaceAsync: fakeBuildPlace(),
+				createServer: () => trackServer(http.createServer()),
 				discover: () => "C:/Studio/RobloxStudioBeta.exe",
 				...extra,
 			});
@@ -1141,12 +1191,15 @@ describe(StudioCliBackend, () => {
 		// listening (the real spawnStudio does not reply on its own).
 		async function replyOverServerAsync(
 			args: () => Array<string>,
-			previous: InstanceType<typeof MockWebSocketServer> | undefined,
+			previous: http.Server | undefined,
 		): Promise<void> {
+			// The bootstrap is only written (and spawn only shelled out) after the
+			// host HTTP server is listening. `settledSpawnAsync` drains the async
+			// place-build/spawn cascade so the launch stub has captured `args`;
+			// only then is the frame read from and posted to the live server.
+			await settledSpawnAsync();
 			const server = await settledServerAsync(previous);
-			const socket = new MockWebSocket();
-			server.emit("connection", socket);
-			socket.emit("message", Buffer.from(resultFrame(readRequestId(args()), {})));
+			await postResultFrame(server, resultFrame(readRequestId(args()), {}));
 		}
 
 		/** Waits out the place build, so the spawn stub has been called. */
@@ -1157,7 +1210,10 @@ describe(StudioCliBackend, () => {
 					return;
 				}
 
-				await Promise.resolve();
+				// A real result-server `listen()` binds asynchronously: the backend's
+				// `serverPortAsync` only continues once the event loop turns, so a
+				// microtask-only yield would starve it forever.
+				await new Promise<void>((resolve) => setImmediate(resolve));
 			}
 
 			throw new Error("the backend never spawned Studio");
@@ -1171,15 +1227,15 @@ describe(StudioCliBackend, () => {
 		 * mock's instance list outlives one test.
 		 */
 		async function settledServerAsync(
-			previous: InstanceType<typeof MockWebSocketServer> | undefined,
-		): Promise<InstanceType<typeof MockWebSocketServer>> {
+			previous: http.Server | undefined,
+		): Promise<http.Server> {
 			for (let turn = 0; turn < SERVER_TURNS; turn += 1) {
 				const server = getLastCreatedServer();
 				if (server !== undefined && server !== previous) {
 					return server;
 				}
 
-				await Promise.resolve();
+				await new Promise<void>((resolve) => setImmediate(resolve));
 			}
 
 			throw new Error("the backend never created a result server");
