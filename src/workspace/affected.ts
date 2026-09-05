@@ -82,61 +82,11 @@ export function getAffectedPackages(workspaceRoot: string, ref: string): Array<P
 	}
 
 	if (fs.existsSync(path.join(workspaceRoot, TURBO_MARKER))) {
-		// `--filter=...[<ref>]` = packages changed since <ref> plus their
-		// dependents. That's exactly the set the user asked for.
-		//
-		// Don't pass `--affected` alongside it. `--affected` doesn't take a
-		// ref — it auto-detects a base (GITHUB_BASE_REF, then merge-base with
-		// main) and intersects with the filter. If the auto-detected base
-		// differs from <ref> (common on CI where GITHUB_BASE_REF is set), the
-		// intersection silently narrows the result. Some turbo versions
-		// (e.g. 2.8.x) also reject the combination outright. The filter alone
-		// is the precise expression of intent and works on every 2.x.
-		const stdout = runTool(
-			"turbo",
-			["ls", `--filter=...[${ref}]`, "--output=json"],
-			workspaceRoot,
-		);
-		// turbo names projects by `package.json#name` by convention, so the
-		// name needs no further resolution — just anchor the directory. Filter
-		// before mapping so dropped packages don't pay for an extra alloc.
-		return parseTurboOutput(stdout)
-			.filter((item) => hasJestConfig(path.join(workspaceRoot, item.relativePath)))
-			.map((item) => {
-				return {
-					name: item.name,
-					packageDirectory: path.join(workspaceRoot, item.relativePath),
-				};
-			});
+		return resolveTurboAffected(workspaceRoot, ref);
 	}
 
 	if (fs.existsSync(path.join(workspaceRoot, NX_MARKER))) {
-		// nx project names live in a separate namespace from
-		// `package.json.name`, so we can't map them via pnpm-workspace.yaml
-		// without false-green-ing affected projects whose two names diverge.
-		// Ask nx itself for each project's root via `nx show project --json`,
-		// then read the real `package.json#name` there (falling back to the nx
-		// name when no package.json exists). Mirrors the turbo path, which gets
-		// `path` and the package name for free from `turbo ls`.
-		const affected = parseNxOutput(
-			runTool(
-				"nx",
-				["show", "projects", "--affected", `--base=${ref}`, "--json"],
-				workspaceRoot,
-			),
-		);
-		return affected.flatMap((nxName) => {
-			const packageDirectory = path.join(workspaceRoot, nxProjectRoot(workspaceRoot, nxName));
-			if (!hasJestConfig(packageDirectory)) {
-				return [];
-			}
-
-			// Fall back to the nx name (not the directory basename, as
-			// `inferPackageName` does): a Luau-only nx project may have no
-			// package.json, and the nx name is its only stable identifier.
-			const name = readPackageJsonName(path.join(packageDirectory, "package.json")) ?? nxName;
-			return [{ name, packageDirectory }];
-		});
+		return resolveNxAffected(workspaceRoot, ref);
 	}
 
 	throw new Error(
@@ -157,23 +107,30 @@ function hasJestConfig(packageDirectory: string): boolean {
 	return fs.readdirSync(packageDirectory).some((entry) => JEST_CONFIG_MARKER.test(entry));
 }
 
-function hasStringField<K extends string>(value: unknown, key: K): value is Record<K, string> {
-	return (
-		value !== null &&
-		typeof value === "object" &&
-		key in value &&
-		typeof Reflect.get(value, key) === "string"
-	);
+// runTool passes `encoding: "utf8"` so child_process surfaces these as strings
+// — Buffer would only appear if we dropped that option.
+const toolFailureSchema = type({ "stderr?": "string", "stdout?": "string" });
+
+type ToolFailure = typeof toolFailureSchema.infer;
+
+function readStream(failure: ToolFailure, key: "stderr" | "stdout"): string | undefined {
+	const stream = failure[key]?.trim();
+	return stream !== undefined && stream.length > 0 ? stream : undefined;
 }
 
-function readStream(err: unknown, key: "stderr" | "stdout"): string | undefined {
-	// runTool passes `encoding: "utf8"` so child_process surfaces these as
-	// strings — Buffer would only appear if we dropped that option.
-	if (!hasStringField(err, key)) {
-		return undefined;
+// Reshape a failed tool invocation into a readable error. nx writes its branded
+// diagnostic to stdout, not stderr, when --base references an unknown ref —
+// fall back to stdout so users see it.
+function toToolError(command: string, err: unknown): Error {
+	if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+		return new Error(`${command} was not found on PATH`);
 	}
 
-	return err[key].trim();
+	const parsed = toolFailureSchema(err);
+	const failure = parsed instanceof type.errors ? {} : parsed;
+	const detail = readStream(failure, "stderr") ?? readStream(failure, "stdout");
+	const message = detail === undefined ? `${command} failed` : `${command} failed: ${detail}`;
+	return new Error(message, { cause: err });
 }
 
 // cspell:words PATHEXT
@@ -196,35 +153,30 @@ function runTool(command: string, args: Array<string>, cwd: string): string {
 		: process.env;
 	const file = isWindows ? "cmd.exe" : resolvePosixShim(binDirectory, command);
 	const spawnArgs = isWindows ? buildCommandExeArgs(command, args) : args;
+	const options = {
+		cwd,
+		encoding: "utf8",
+		env: childEnvironment,
+		shell: false,
+		stdio: "pipe",
+	} satisfies cp.ExecFileSyncOptionsWithStringEncoding;
+	const windowsOptions = { ...options, windowsVerbatimArguments: true } satisfies cp.SpawnOptions;
 	try {
-		return cp.execFileSync(file, spawnArgs, {
-			cwd,
-			encoding: "utf8",
-			env: childEnvironment,
-			shell: false,
-			stdio: "pipe",
-			windowsHide: true,
-			...(isWindows ? { windowsVerbatimArguments: true } : {}),
-		});
+		return isWindows
+			? cp.execFileSync(file, spawnArgs, {
+					...windowsOptions,
+					windowsHide: true,
+				})
+			: cp.execFileSync(file, spawnArgs, {
+					...options,
+					windowsHide: true,
+				});
 	} catch (err) {
-		if (err instanceof Error && "code" in err && err.code === "ENOENT") {
-			throw new Error(`${command} was not found on PATH`);
-		}
-
-		// nx writes its branded diagnostic to stdout, not stderr, when --base
-		// references an unknown ref — fall back to stdout so users see it.
-		const stderr = readStream(err, "stderr");
-		const detail =
-			stderr !== undefined && stderr.length > 0 ? stderr : readStream(err, "stdout");
-		const message =
-			detail !== undefined && detail.length > 0
-				? `${command} failed: ${detail}`
-				: `${command} failed`;
-		throw new Error(message, { cause: err });
+		throw toToolError(command, err);
 	}
 }
 
-function parseJson(stdout: string, command: string): unknown {
+function parseJson(stdout: string, command: string): JSONValue {
 	try {
 		return JSON.parse(stdout);
 	} catch (err) {
@@ -243,6 +195,31 @@ function parseTurboOutput(stdout: string): Array<TurboPackage> {
 	return validated.packages.items.map((item) => ({ name: item.name, relativePath: item.path }));
 }
 
+function resolveTurboAffected(workspaceRoot: string, ref: string): Array<PackageInfo> {
+	// `--filter=...[<ref>]` = packages changed since <ref> plus their
+	// dependents. That's exactly the set the user asked for.
+	//
+	// Don't pass `--affected` alongside it. `--affected` doesn't take a
+	// ref — it auto-detects a base (GITHUB_BASE_REF, then merge-base with
+	// main) and intersects with the filter. If the auto-detected base
+	// differs from <ref> (common on CI where GITHUB_BASE_REF is set), the
+	// intersection silently narrows the result. Some turbo versions
+	// (e.g. 2.8.x) also reject the combination outright. The filter alone
+	// is the precise expression of intent and works on every 2.x.
+	const stdout = runTool("turbo", ["ls", `--filter=...[${ref}]`, "--output=json"], workspaceRoot);
+	// turbo names projects by `package.json#name` by convention, so the
+	// name needs no further resolution — just anchor the directory. Filter
+	// before mapping so dropped packages don't pay for an extra alloc.
+	return parseTurboOutput(stdout)
+		.filter((item) => hasJestConfig(path.join(workspaceRoot, item.relativePath)))
+		.map((item) => {
+			return {
+				name: item.name,
+				packageDirectory: path.join(workspaceRoot, item.relativePath),
+			};
+		});
+}
+
 function parseNxOutput(stdout: string): Array<string> {
 	const validated = nxShowProjectsOutputSchema(parseJson(stdout, "nx"));
 	if (validated instanceof type.errors) {
@@ -258,7 +235,7 @@ function parseNxOutput(stdout: string): Array<string> {
 // locate is a real inconsistency the user needs to see, not silently drop.
 function nxProjectRoot(workspaceRoot: string, name: string): string {
 	const errorContext = `nx show project ${JSON.stringify(name)}`;
-	let parsed: unknown;
+	let parsed: JSONValue;
 	try {
 		const stdout = runTool("nx", ["show", "project", name, "--json"], workspaceRoot);
 		parsed = parseJson(stdout, "nx");
@@ -275,4 +252,29 @@ function nxProjectRoot(workspaceRoot: string, name: string): string {
 	}
 
 	return validated.root;
+}
+
+function resolveNxAffected(workspaceRoot: string, ref: string): Array<PackageInfo> {
+	// nx project names live in a separate namespace from `package.json.name`,
+	// so we can't map them via pnpm-workspace.yaml without false-green-ing
+	// affected projects whose two names diverge. Ask nx itself for each
+	// project's root via `nx show project --json`, then read the real
+	// `package.json#name` there (falling back to the nx name when no
+	// package.json exists). Mirrors the turbo path, which gets `path` and the
+	// package name for free from `turbo ls`.
+	const affected = parseNxOutput(
+		runTool("nx", ["show", "projects", "--affected", `--base=${ref}`, "--json"], workspaceRoot),
+	);
+	return affected.flatMap((nxName) => {
+		const packageDirectory = path.join(workspaceRoot, nxProjectRoot(workspaceRoot, nxName));
+		if (!hasJestConfig(packageDirectory)) {
+			return [];
+		}
+
+		// Fall back to the nx name (not the directory basename, as
+		// `inferPackageName` does): a Luau-only nx project may have no
+		// package.json, and the nx name is its only stable identifier.
+		const name = readPackageJsonName(path.join(packageDirectory, "package.json")) ?? nxName;
+		return [{ name, packageDirectory }];
+	});
 }

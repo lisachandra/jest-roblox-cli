@@ -1,5 +1,7 @@
 import { createFakeHttpClient, type FakeHttpClient } from "@bedrock-rbx/ocale/testing";
+import { fromAny } from "@total-typescript/shoehorn";
 
+import { type } from "arktype";
 import { describe, expect, it } from "vitest";
 
 import { ProgressMap } from "./progress-map.ts";
@@ -8,20 +10,30 @@ interface Tally {
 	tested: number;
 }
 
+interface SortedMapItemBody {
+	id: string;
+	etag: string;
+	expireTime: string;
+	path: string;
+	value: unknown;
+}
+
+const tallySchema = type({ tested: "number" });
+
 function makeMap(
 	httpClient: FakeHttpClient,
 	overrides: { decode?: (value: unknown) => Tally } = {},
 ): ProgressMap<Tally> {
 	return new ProgressMap<Tally>({
 		apiKey: "test-key",
-		decode: overrides.decode ?? ((value) => value as Tally),
+		decode: overrides.decode ?? ((value) => fromAny(value)),
 		httpClient,
 		mapId: "run-1",
 		universeId: "123",
 	});
 }
 
-function validItemBody(id: string, value: unknown): Record<string, unknown> {
+function validItemBody(id: string, value: Tally): SortedMapItemBody {
 	return {
 		id,
 		etag: "etag-1",
@@ -47,7 +59,7 @@ describe(ProgressMap, () => {
 		});
 
 		const map = makeMap(http);
-		const tallies = await map.readAll();
+		const tallies = await map.readAllAsync();
 
 		expect(tallies).toStrictEqual([{ tested: 3 }, { tested: 5 }]);
 		expect(http.requests[0]!.request.url).toContain(
@@ -69,7 +81,7 @@ describe(ProgressMap, () => {
 		});
 
 		const map = makeMap(http);
-		const tallies = await map.readAll();
+		const tallies = await map.readAllAsync();
 
 		expect(tallies).toStrictEqual([{ tested: 1 }, { tested: 2 }]);
 		expect(http.requests).toHaveLength(2);
@@ -86,9 +98,9 @@ describe(ProgressMap, () => {
 		});
 
 		const map = makeMap(http, {
-			decode: (value) => ({ tested: (value as Tally).tested * 10 }),
+			decode: (value) => ({ tested: tallySchema.assert(value).tested * 10 }),
 		});
-		const tallies = await map.readAll();
+		const tallies = await map.readAllAsync();
 
 		expect(tallies).toStrictEqual([{ tested: 70 }]);
 	});
@@ -101,7 +113,7 @@ describe(ProgressMap, () => {
 
 		const map = makeMap(http);
 
-		await expect(map.readAll()).rejects.toThrow(/Forbidden/);
+		await expect(map.readAllAsync()).rejects.toThrow(/Forbidden/);
 	});
 
 	describe("construction", () => {
@@ -110,7 +122,7 @@ describe(ProgressMap, () => {
 
 			const map = new ProgressMap<Tally>({
 				apiKey: "test-key",
-				decode: (value) => value as Tally,
+				decode: (value) => fromAny(value),
 				mapId: "run-1",
 				universeId: "123",
 			});
@@ -121,13 +133,13 @@ describe(ProgressMap, () => {
 		it("should accept an injected sleep function", () => {
 			expect.assertions(1);
 
-			async function sleep(): Promise<void> {}
+			async function sleepAsync(): Promise<void> {}
 
 			const map = new ProgressMap<Tally>({
 				apiKey: "test-key",
-				decode: (value) => value as Tally,
+				decode: (value) => fromAny(value),
 				mapId: "run-1",
-				sleep,
+				sleep: sleepAsync,
 				universeId: "123",
 			});
 
@@ -143,12 +155,12 @@ describe(ProgressMap, () => {
 			const map = new ProgressMap<Tally>({
 				apiKey: "test-key",
 				baseUrl: "http://127.0.0.1:4010",
-				decode: (value) => value as Tally,
+				decode: (value) => fromAny(value),
 				httpClient: http,
 				mapId: "run-1",
 				universeId: "123",
 			});
-			await map.readAll();
+			await map.readAllAsync();
 
 			expect(http.requests[0]!.config.baseUrl).toBe("http://127.0.0.1:4010");
 		});

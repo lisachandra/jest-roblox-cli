@@ -3,15 +3,28 @@ import { fromAny } from "@total-typescript/shoehorn";
 import { type } from "arktype";
 import { vol } from "memfs";
 import * as crypto from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import process from "node:process";
 import type { Except } from "type-fest";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { writeAgedFile } from "../../test/mocks/aged-file.ts";
+import { movableClockCollector, tickingClockCollector } from "../../test/mocks/movable-clock.ts";
+import type { ResolvedProjectConfig } from "../config/projects.ts";
 import type { ResolvedConfig } from "../config/schema.ts";
 import { DEFAULT_CONFIG } from "../config/schema.ts";
+import { createStubBake, generateProjectStubs } from "../config/stubs.ts";
 import type { RojoProject } from "../types/rojo.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import { normalizeWindowsPath, toPosixRoot } from "../utils/normalize-windows-path.ts";
+import type { BuildManifestProject } from "./build-manifest.ts";
+import { BUILD_MANIFEST_VERSION } from "./build-manifest.ts";
+import {
+	createCopyIgnoreMatcher,
+	discoverRootFiles,
+	hashCopyIgnorePatterns,
+} from "./discover-files.ts";
+import { createInstrumentUniverse } from "./instrument-universe.ts";
 import { INSTRUMENTER_VERSION } from "./instrumenter.ts";
 import type {
 	CoverageManifest,
@@ -19,17 +32,29 @@ import type {
 	NonInstrumentedFileRecord,
 } from "./manifest.ts";
 import { MANIFEST_VERSION, manifestSchema } from "./manifest.ts";
-import { collectLuauRootsFromRojo, prepareCoverage, resolveLuauRoots } from "./prepare.ts";
-import { computeRojoInputsHash } from "./rojo-inputs.ts";
-import { discoverInstrumentableFiles } from "./shadow-root.ts";
+import type { PrepareCoverageResult } from "./prepare.ts";
+import {
+	collectLuauRootsFromRojo,
+	prepareCoverageAsync,
+	resolveLuauRoots,
+	toCoverageArtifacts,
+} from "./prepare.ts";
+import { computeRojoInputsHashAsync } from "./rojo-inputs.ts";
+import type { ShadowBake, ShadowLayout } from "./spine.ts";
+import { prepareWorkspaceCoverage } from "./workspace-prepare.ts";
 
 vi.mock(import("node:fs"), async () => {
 	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, cpSync: memfs.vol.cpSync.bind(memfs.vol), default: memfs.fs });
+	return fromAny({ ...memfs.fs, default: memfs.fs });
 });
 vi.mock(import("./instrumenter"));
 vi.mock(import("../utils/rojo-builder"));
 vi.mock(import("get-tsconfig"));
+
+const DEFAULT_COPY_IGNORE_HASH = hashCopyIgnorePatterns(DEFAULT_CONFIG.coverageCopyIgnorePatterns);
+
+const COVERED_FILE = "out-tsc/test/init.luau";
+const UNCOVERED_FILE = "out-tsc/test/ui/button.luau";
 
 const ROJO_PROJECT = {
 	name: "test",
@@ -41,22 +66,36 @@ const ROJO_PROJECT = {
 	},
 };
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function isoNow(): string {
 	const now = new Date();
 	return now.toISOString();
 }
 
-function readRojoProjectJson(text: string): Record<string, unknown> {
-	const parsed = JSON.parse(text);
-	if (!isPlainObject(parsed)) {
+function readRojoProjectJson(filePath: string): JSONValue {
+	const parsed = JSON.parse(vol.readFileSync(filePath, "utf-8").toString());
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error("Expected rojo project to be a JSON object");
 	}
 
 	return parsed;
+}
+
+/**
+ * Walks a nested plain-object tree by key, so a test can reach into a parsed
+ * rojo project without asserting a shape onto it. Lives at module scope — the
+ * per-key guard would otherwise be a conditional inside a test body.
+ */
+function readNestedProperty(source: JSONValue, ...keys: Array<string>): JSONValue | undefined {
+	let current: JSONValue | undefined = source;
+	for (const key of keys) {
+		if (current === null || typeof current !== "object" || Array.isArray(current)) {
+			throw new Error(`Expected an object while reading "${keys.join(".")}"`);
+		}
+
+		current = current[key];
+	}
+
+	return current;
 }
 
 function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
@@ -68,11 +107,10 @@ function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
 	};
 }
 
-async function setupMocks(options: { outDir?: string } = {}) {
+async function setupMocksAsync({ outDir }: { outDir?: string } = {}) {
 	onTestFinished(() => {
 		vol.reset();
 	});
-	const { outDir } = options;
 
 	const { getTsconfig } = await import("get-tsconfig");
 	vi.mocked(getTsconfig).mockReturnValue(
@@ -87,26 +125,33 @@ async function setupMocks(options: { outDir?: string } = {}) {
 	const { instrumentRoot } = await import("./instrumenter");
 	vi.mocked(instrumentRoot).mockReturnValue({});
 
-	const { buildWithRojo } = await import("../utils/rojo-builder");
+	const { buildWithRojoAsync } = await import("../utils/rojo-builder");
 	// Simulate rojo producing the `.rbxl` so the post-build hashing in
-	// prepareCoverage finds an artifact to read.
-	vi.mocked(buildWithRojo).mockImplementation((_projectPath, outputPath) => {
+	// prepareCoverageAsync finds an artifact to read.
+	vi.mocked(buildWithRojoAsync).mockImplementation(async (_projectPath, outputPath) => {
 		vol.writeFileSync(outputPath, "RBXL");
 	});
 
-	return { buildWithRojo, instrumentRoot };
+	return { buildWithRojoAsync, instrumentRoot };
 }
 
-function seedFilesystem(options: { luauRoot?: string; rojoProject?: string } = {}) {
-	const { luauRoot = "out-tsc/test", rojoProject = "/project/default.project.json" } = options;
+function seedFilesystem({
+	luauRoot = "out-tsc/test",
+	rojoProject = "/project/default.project.json",
+}: { luauRoot?: string; rojoProject?: string } = {}) {
 	vol.mkdirSync("/project", { recursive: true });
 	vol.mkdirSync(luauRoot, { recursive: true });
 	vol.writeFileSync(`${luauRoot}/init.luau`, "local x = 1");
 	vol.writeFileSync(rojoProject, JSON.stringify(ROJO_PROJECT));
 }
 
+/** A bake that owns nothing, for a test that only cares what the hook does. */
+function makeBake(run: ShadowBake["run"]): ShadowBake {
+	return { isBakeOwned: () => false, run };
+}
+
 function readCoverageManifestFile(filePath: string): CoverageManifest {
-	const parsed = manifestSchema(JSON.parse(vol.readFileSync(filePath, "utf-8") as string));
+	const parsed = manifestSchema(JSON.parse(vol.readFileSync(filePath, "utf-8").toString()));
 	if (parsed instanceof type.errors) {
 		throw new Error(parsed.summary);
 	}
@@ -114,16 +159,16 @@ function readCoverageManifestFile(filePath: string): CoverageManifest {
 	return parsed;
 }
 
-describe(prepareCoverage, () => {
+describe(prepareCoverageAsync, () => {
 	describe("when resolving luauRoots", () => {
 		it("should use config.luauRoots when provided", async () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).toHaveBeenCalledWith(
 				expect.objectContaining({ luauRoot: "out-tsc/test" }),
@@ -134,10 +179,10 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem({ luauRoot: "out" });
-			const { instrumentRoot } = await setupMocks({ outDir: "out" });
+			const { instrumentRoot } = await setupMocksAsync({ outDir: "out" });
 			const config = makeConfig();
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).toHaveBeenCalledWith(
 				expect.objectContaining({ luauRoot: "out" }),
@@ -148,20 +193,58 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem({ luauRoot: "/abs/out" });
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["/abs/out"] });
 
-			expect(() => prepareCoverage(config)).toThrow(/luauRoots must be relative paths/);
+			await expect(prepareCoverageAsync(config)).rejects.toThrowWithMessage(
+				Error,
+				"luauRoots must be relative paths, got absolute path. " +
+					"Set a relative outDir in tsconfig or relative luauRoots in config.",
+			);
+		});
+
+		// `path.isAbsolute` answers for the host it runs on, so a drive-letter
+		// root reads as a plain relative filename on Linux: the same config
+		// throws on a developer's Windows machine and instruments a root
+		// outside the package in CI.
+		it("should throw for a drive-letter root on any host", async () => {
+			expect.assertions(1);
+
+			seedFilesystem({ luauRoot: "D:/abs/out" });
+			await setupMocksAsync();
+			const config = makeConfig({ luauRoots: ["D:/abs/out"] });
+
+			await expect(prepareCoverageAsync(config)).rejects.toThrowWithMessage(
+				Error,
+				"luauRoots must be relative paths, got absolute path. " +
+					"Set a relative outDir in tsconfig or relative luauRoots in config.",
+			);
+		});
+
+		it("should throw for a file-system root", async () => {
+			expect.assertions(1);
+
+			seedFilesystem({ luauRoot: "/" });
+			await setupMocksAsync();
+			const config = makeConfig({ luauRoots: ["/"] });
+
+			await expect(prepareCoverageAsync(config)).rejects.toThrowWithMessage(
+				Error,
+				"luauRoots must be relative paths, got absolute path. " +
+					"Set a relative outDir in tsconfig or relative luauRoots in config.",
+			);
 		});
 
 		it("should throw when luauRoots is not provided and tsconfig has no outDir", async () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(() => prepareCoverage(config)).toThrow(/Could not determine luauRoots/);
+			await expect(prepareCoverageAsync(config)).rejects.toThrow(
+				/Could not determine luauRoots/,
+			);
 		});
 
 		it("should fall back to tsconfig outDir when Rojo project has invalid schema", async () => {
@@ -172,10 +255,10 @@ describe(prepareCoverage, () => {
 			// resolveLuauRootsWithRojo silently falls through to the tsconfig
 			// outDir path.
 			vol.writeFileSync("/project/default.project.json", JSON.stringify({ invalid: true }));
-			await setupMocks({ outDir: "out" });
+			await setupMocksAsync({ outDir: "out" });
 			const config = makeConfig();
 
-			expect(resolveLuauRoots(config)).toStrictEqual(["out"]);
+			expect(resolveLuauRoots(config)).toStrictEqual(["out"].map(toPosixRoot));
 		});
 	});
 
@@ -187,27 +270,156 @@ describe(prepareCoverage, () => {
 			vol.mkdirSync(".jest-roblox/coverage/stale", { recursive: true });
 			vol.writeFileSync(".jest-roblox/coverage/stale/old.txt", "stale");
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(vol.existsSync(".jest-roblox/coverage/stale/old.txt")).toBeFalse();
 			expect(vol.existsSync(".jest-roblox/coverage")).toBeTrue();
 		});
 
-		it("should copy each root tree to the shadow directory", async () => {
+		it("should mirror every file the instrumenter never emits", async () => {
+			expect.assertions(2);
+
+			seedFilesystem();
+			// The instrumenter writes the prod `.luau` twins itself. Everything
+			// it never emits — spec/test/snap luau and every non-luau rojo file
+			// — reaches the shadow through the mirror sync instead.
+			vol.writeFileSync("out-tsc/test/init.spec.luau", "-- spec");
+			vol.writeFileSync("out-tsc/test/init.meta.json", "{}");
+			await setupMocksAsync();
+			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
+
+			await prepareCoverageAsync(config);
+
+			expect(
+				vol.readFileSync(".jest-roblox/coverage/out-tsc/test/init.spec.luau", "utf-8"),
+			).toBe("-- spec");
+			expect(
+				vol.readFileSync(".jest-roblox/coverage/out-tsc/test/init.meta.json", "utf-8"),
+			).toBe("{}");
+		});
+
+		it("should mirror an empty source directory on a cold run", async () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			// The one class of shadow entry no file write can bring along. rojo
+			// mounts an empty directory as a Folder, so a shadow that skips it
+			// builds a place missing an Instance the runtime can look up.
+			vol.mkdirSync("out-tsc/test/empty", { recursive: true });
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			expect(vol.readFileSync(".jest-roblox/coverage/out-tsc/test/init.luau", "utf-8")).toBe(
-				"local x = 1",
+			expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/empty")).toBeTrue();
+		});
+
+		it("should honour the ignore list when luauRoots carries a trailing slash", async () => {
+			expect.assertions(2);
+
+			seedFilesystem();
+			vol.writeFileSync("out-tsc/test/init.spec.luau", "-- spec");
+			vol.writeFileSync("out-tsc/test/init.d.ts", "export {};");
+			await setupMocksAsync();
+
+			// Each walk slices its results against the root it was handed, so a
+			// separator left on the end lands the slice a character in and every
+			// relative path comes out mangled.
+			const config = makeConfig({ luauRoots: ["out-tsc/test/"] });
+
+			await prepareCoverageAsync(config);
+
+			expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.spec.luau")).toBeTrue();
+			expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.d.ts")).toBeFalse();
+		});
+
+		it("should record a trailing-slash root under one canonical spelling", async () => {
+			expect.assertions(2);
+
+			seedFilesystem();
+			vol.writeFileSync("out-tsc/test/init.spec.luau", "-- spec");
+			await setupMocksAsync();
+
+			const config = makeConfig({ luauRoots: ["out-tsc/test/"] });
+
+			// Every reader downstream of this list tests the root as a prefix:
+			// the rojo-inputs hash skips a mount only on `${root}/`, and the
+			// next run compares the recorded roots against its own. A separator
+			// left on the end matches neither.
+			const result = await prepareCoverageAsync(config);
+
+			expect(result.manifest.luauRoots).toStrictEqual(["out-tsc/test"]);
+			expect(
+				result.manifest.nonInstrumentedFiles["out-tsc/test/init.spec.luau"]!.shadowPath,
+			).toBe(".jest-roblox/coverage/out-tsc/test/init.spec.luau");
+		});
+
+		it("should leave declaration artifacts out of the shadow directory", async () => {
+			expect.assertions(2);
+
+			seedFilesystem();
+			// One fixture per default. `.luau.map` earns its own: every reader
+			// of a source map opens the one in `outDir`, so the shadow copy is
+			// dead weight — but nothing else here would notice it being copied.
+			vol.writeFileSync("out-tsc/test/init.d.ts", "export {};");
+			vol.writeFileSync("out-tsc/test/init.d.ts.map", "{}");
+			vol.writeFileSync("out-tsc/test/init.luau.map", "{}");
+			await setupMocksAsync();
+			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
+
+			const result = await prepareCoverageAsync(config);
+
+			const ignored = [
+				"out-tsc/test/init.d.ts",
+				"out-tsc/test/init.d.ts.map",
+				"out-tsc/test/init.luau.map",
+			];
+
+			expect(
+				ignored.filter((relativePath) => {
+					return vol.existsSync(`.jest-roblox/coverage/${relativePath}`);
+				}),
+			).toStrictEqual([]);
+			expect(Object.keys(result.manifest.nonInstrumentedFiles)).not.toIncludeAnyMembers(
+				ignored,
 			);
+		});
+
+		it("should keep an ignored directory out of the shadow on a cold run", async () => {
+			expect.assertions(1);
+
+			seedFilesystem();
+			vol.mkdirSync("out-tsc/test/vendor", { recursive: true });
+			vol.writeFileSync("out-tsc/test/vendor/dep.meta.json", "{}");
+			await setupMocksAsync();
+			const config = makeConfig({
+				coverageCopyIgnorePatterns: ["vendor", "vendor/**"],
+				luauRoots: ["out-tsc/test"],
+			});
+
+			await prepareCoverageAsync(config);
+
+			expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/vendor")).toBeFalse();
+		});
+
+		it("should mirror declaration artifacts when the ignore list is emptied", async () => {
+			expect.assertions(2);
+
+			seedFilesystem();
+			vol.writeFileSync("out-tsc/test/init.d.ts", "export {};");
+			await setupMocksAsync();
+			const config = makeConfig({
+				coverageCopyIgnorePatterns: [],
+				luauRoots: ["out-tsc/test"],
+			});
+
+			const result = await prepareCoverageAsync(config);
+
+			expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.d.ts")).toBeTrue();
+			expect(result.manifest.nonInstrumentedFiles).toHaveProperty("out-tsc/test/init.d.ts");
 		});
 	});
 
@@ -216,13 +428,13 @@ describe(prepareCoverage, () => {
 			expect.assertions(2);
 
 			seedFilesystem();
-			const { buildWithRojo } = await setupMocks();
+			const { buildWithRojoAsync } = await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(vol.existsSync(".jest-roblox/coverage/default.project.json")).toBeTrue();
-			expect(buildWithRojo).toHaveBeenCalledWith(
+			expect(buildWithRojoAsync).toHaveBeenCalledWith(
 				expect.stringContaining(path.join(".jest-roblox", "coverage")),
 				expect.stringContaining("game.rbxl"),
 			);
@@ -232,13 +444,13 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem({ rojoProject: "/custom.project.json" });
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({
 				luauRoots: ["out-tsc/test"],
 				rojoProject: "/custom.project.json",
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(vol.existsSync(".jest-roblox/coverage/custom.project.json")).toBeTrue();
 		});
@@ -247,10 +459,10 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(vol.existsSync(".jest-roblox/coverage/default.project.json")).toBeTrue();
 		});
@@ -259,10 +471,10 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem({ rojoProject: "/project/game.project.json" });
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(vol.existsSync(".jest-roblox/coverage/game.project.json")).toBeTrue();
 		});
@@ -272,10 +484,10 @@ describe(prepareCoverage, () => {
 
 			seedFilesystem();
 			vol.writeFileSync("/project/default.project.json", JSON.stringify({ invalid: true }));
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			expect(() => prepareCoverage(config)).toThrow(/Rojo project must have/);
+			await expect(prepareCoverageAsync(config)).rejects.toThrow(/Invalid Rojo project/);
 		});
 
 		it("should throw when no Rojo project is found", async () => {
@@ -283,10 +495,10 @@ describe(prepareCoverage, () => {
 
 			vol.mkdirSync("/project", { recursive: true });
 			vol.mkdirSync("out-tsc/test", { recursive: true });
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			expect(() => prepareCoverage(config)).toThrow(/No Rojo project found/);
+			await expect(prepareCoverageAsync(config)).rejects.toThrow(/No Rojo project found/);
 		});
 	});
 
@@ -295,22 +507,27 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			const written = readRojoProjectJson(
-				vol.readFileSync(".jest-roblox/coverage/default.project.json", "utf-8") as string,
-			);
-			const tree = written["tree"] as Record<string, Record<string, Record<string, unknown>>>;
+			const written = readRojoProjectJson(".jest-roblox/coverage/default.project.json");
 
-			expect(tree["ServerScriptService"]!["$properties"]!["LoadStringEnabled"]).toBeTrue();
+			expect(
+				readNestedProperty(
+					written,
+					"tree",
+					"ServerScriptService",
+					"$properties",
+					"LoadStringEnabled",
+				),
+			).toBeTrue();
 		});
 	});
 
 	describe("when computing $path entries for the rewritten project", () => {
-		it("should absolutize $path entries so the rewritten project resolves regardless of its disk location", async () => {
+		it("should express $path entries relative to the rewritten project's own directory", async () => {
 			expect.assertions(2);
 
 			const projectWithExternal = {
@@ -331,23 +548,24 @@ describe(prepareCoverage, () => {
 			vol.writeFileSync("out-tsc/test/init.luau", "local x = 1");
 			vol.writeFileSync("default.project.json", JSON.stringify(projectWithExternal));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"], rootDir: "." });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			const written = readRojoProjectJson(
-				vol.readFileSync(".jest-roblox/coverage/default.project.json", "utf-8") as string,
-			);
-			const tree = written["tree"] as Record<string, Record<string, string>>;
+			const written = readRojoProjectJson(".jest-roblox/coverage/default.project.json");
 
-			// Matching path: absolute path inside the shadow dir.
-			expect(tree["ReplicatedStorage"]!["$path"]).toBe(
-				normalizeWindowsPath(path.resolve(".jest-roblox/coverage/out-tsc/test/client")),
+			// Paths are written relative to the project file's own directory —
+			// rojo matches globIgnorePaths against the path as expressed, so an
+			// absolute one would leave every ignore pattern inert.
+			//
+			// Matching path: the shadow dir, a sibling of the project file.
+			expect(readNestedProperty(written, "tree", "ReplicatedStorage", "$path")).toBe(
+				"out-tsc/test/client",
 			);
-			// Non-matching path: absolute path to the original source dir.
-			expect(tree["ServerScriptService"]!["$path"]).toBe(
-				normalizeWindowsPath(path.resolve("include")),
+			// Non-matching path: the original source dir, two levels up.
+			expect(readNestedProperty(written, "tree", "ServerScriptService", "$path")).toBe(
+				"../../include",
 			);
 		});
 	});
@@ -372,26 +590,22 @@ describe(prepareCoverage, () => {
 			vol.writeFileSync("out/init.luau", "local x = 1");
 			vol.writeFileSync("config/dev.project.json", JSON.stringify(project));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({
 				luauRoots: ["out"],
 				rojoProject: "config/dev.project.json",
 				rootDir: ".",
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			const parsed = readRojoProjectJson(
-				vol.readFileSync(".jest-roblox/coverage/dev.project.json", "utf-8") as string,
-			);
-			const tree = parsed["tree"] as Record<string, Record<string, string>>;
+			const parsed = readRojoProjectJson(".jest-roblox/coverage/dev.project.json");
 
 			// $path "../out" resolves against "config" → absolute "out";
 			// luauRoot "out" resolves against rootDir "." → absolute "out";
-			// match → redirect to shadow dir.
-			expect(tree["ReplicatedStorage"]!["$path"]).toBe(
-				normalizeWindowsPath(path.resolve(".jest-roblox/coverage/out")),
-			);
+			// match → redirect to the shadow dir, written relative to the
+			// project file that now sits beside it.
+			expect(readNestedProperty(parsed, "tree", "ReplicatedStorage", "$path")).toBe("out");
 		});
 	});
 
@@ -427,28 +641,23 @@ describe(prepareCoverage, () => {
 			);
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(defaultProject));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({
 				luauRoots: ["src"],
 				rojoProject: "/project/development.project.json",
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			const written = readRojoProjectJson(
-				vol.readFileSync(
-					".jest-roblox/coverage/development.project.json",
-					"utf-8",
-				) as string,
-			);
-			const tree = written["tree"] as Record<string, Record<string, Record<string, string>>>;
+			const written = readRojoProjectJson(".jest-roblox/coverage/development.project.json");
 
 			// The nested $path: "default.project.json" is resolved to $path:
-			// "src", absolutized, then redirected to the instrumented shadow
-			// dir since "src" matches the configured luauRoot.
-			expect(tree["ReplicatedStorage"]!["uuid-generator"]!["$path"]).toBe(
-				normalizeWindowsPath(path.resolve(".jest-roblox/coverage/src")),
-			);
+			// "src", then redirected to the instrumented shadow dir since "src"
+			// matches the configured luauRoot — and written relative to the
+			// project file that now sits beside that shadow dir.
+			expect(
+				readNestedProperty(written, "tree", "ReplicatedStorage", "uuid-generator", "$path"),
+			).toBe("src");
 		});
 	});
 
@@ -457,10 +666,10 @@ describe(prepareCoverage, () => {
 			expect.assertions(2);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(result.manifest.luauRoots).toStrictEqual(["out-tsc/test"]);
 			expect(result.placeFile).toContain("game.rbxl");
@@ -472,24 +681,45 @@ describe(prepareCoverage, () => {
 			expect.assertions(3);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(result.buildId).toMatch(/^[0-9a-f-]{36}$/);
 			expect(result.coveragePlace.hash).toMatch(/^[a-f0-9]{64}$/);
 			expect(result.rebuilt).toBeTrue();
 		});
 
+		it("should report the place build apart from the instrumentation", async () => {
+			expect.assertions(2);
+
+			seedFilesystem();
+			const { buildWithRojoAsync } = await setupMocksAsync();
+			// Synchronous work, so the clock has to move from inside the build
+			// for the two phases to be told apart at all.
+			const clock = movableClockCollector(1_000);
+			vi.mocked(buildWithRojoAsync).mockImplementation(async (_projectPath, outputPath) => {
+				clock.advance(250);
+				vol.writeFileSync(outputPath, "RBXL");
+			});
+			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
+
+			const result = await prepareCoverageAsync(config, { timing: clock.timing });
+
+			expect(result.stagingMs).toBe(250);
+			// Only the instrumentation: the run reports it as coverage.
+			expect(result.instrumentMs).toBe(0);
+		});
+
 		it("should share the buildId with the coverage manifest it wrote", async () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			const coverage = readCoverageManifestFile(
 				".jest-roblox/coverage/coverage-manifest.json",
@@ -502,7 +732,7 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockImplementation((options) => {
 				return {
 					[`${options.luauRoot}/init.luau`]: {
@@ -520,19 +750,19 @@ describe(prepareCoverage, () => {
 			});
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
-			expect(result.files["out-tsc/test/init.luau"]?.sourceHash).toBe("deadbeef");
+			expect(result.files["out-tsc/test/init.luau"]!.sourceHash).toBe("deadbeef");
 		});
 
 		it("should not write a build manifest (the entry point owns emission)", async () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(vol.existsSync(".jest-roblox/coverage/build-manifest.json")).toBeFalse();
 		});
@@ -541,14 +771,225 @@ describe(prepareCoverage, () => {
 			expect.assertions(2);
 
 			seedFilesystem();
-			const { buildWithRojo } = await setupMocks();
-			vi.mocked(buildWithRojo).mockImplementation(() => {
+			const { buildWithRojoAsync } = await setupMocksAsync();
+			vi.mocked(buildWithRojoAsync).mockImplementation(async () => {
 				throw new Error("rojo build failed");
 			});
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			expect(() => prepareCoverage(config)).toThrow(/rojo build failed/);
+			await expect(prepareCoverageAsync(config)).rejects.toThrow(/rojo build failed/);
 			expect(vol.existsSync(".jest-roblox/coverage/coverage-manifest.json")).toBeFalse();
+		});
+	});
+
+	describe("when narrowing to the coverage universe", () => {
+		async function seedTwoFilesAsync() {
+			seedFilesystem();
+			vol.mkdirSync("out-tsc/test/ui", { recursive: true });
+			vol.writeFileSync(UNCOVERED_FILE, "local y = 2");
+			return setupMocksAsync();
+		}
+
+		function narrowedConfig(): ResolvedConfig {
+			return makeConfig({
+				collectCoverageFrom: [COVERED_FILE],
+				luauRoots: ["out-tsc/test"],
+			});
+		}
+
+		it("should hold an out-of-universe file back from the instrumenter", async () => {
+			expect.assertions(1);
+
+			const { instrumentRoot } = await seedTwoFilesAsync();
+
+			await prepareCoverageAsync(narrowedConfig());
+
+			expect(vi.mocked(instrumentRoot).mock.calls[0]![0].skipFiles).toStrictEqual(
+				new Set(["ui/button.luau"]),
+			);
+		});
+
+		it("should mirror an out-of-universe file into the shadow instead", async () => {
+			expect.assertions(2);
+
+			await seedTwoFilesAsync();
+
+			const result = await prepareCoverageAsync(narrowedConfig());
+
+			// Still in the place, just without probes — the runtime has to be
+			// able to require it, the report just never asks about it.
+			expect(result.manifest.nonInstrumentedFiles).toHaveProperty(UNCOVERED_FILE);
+			expect(vol.existsSync(`.jest-roblox/coverage/${UNCOVERED_FILE}`)).toBeTrue();
+		});
+
+		/**
+		 * Two mounted roots where the universe reaches only the first. Written
+		 * from `rootDir: "."` so the rewritten project's `$path` entries are
+		 * comparable: a redirected mount is a sibling of the project file, an
+		 * untouched one is two levels up.
+		 */
+		async function seedTwoRootsAsync() {
+			vol.mkdirSync("out-tsc/test", { recursive: true });
+			vol.writeFileSync(COVERED_FILE, "local x = 1");
+			vol.mkdirSync("out-tsc/vendor", { recursive: true });
+			vol.writeFileSync("out-tsc/vendor/dep.luau", "local d = 1");
+			vol.writeFileSync(
+				"default.project.json",
+				JSON.stringify({
+					name: "test",
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { $path: "out-tsc/test" },
+						ServerScriptService: { $path: "out-tsc/vendor" },
+					},
+				}),
+			);
+
+			return setupMocksAsync();
+		}
+
+		function twoRootConfig(): ResolvedConfig {
+			return makeConfig({
+				collectCoverageFrom: [COVERED_FILE],
+				luauRoots: ["out-tsc/test", "out-tsc/vendor"],
+				rootDir: ".",
+			});
+		}
+
+		it("should leave a root the universe never touches out of the shadow", async () => {
+			expect.assertions(2);
+
+			const { instrumentRoot } = await seedTwoRootsAsync();
+
+			await prepareCoverageAsync(twoRootConfig());
+
+			expect(instrumentRoot).not.toHaveBeenCalledWith(
+				expect.objectContaining({ luauRoot: "out-tsc/vendor" }),
+			);
+			expect(vol.existsSync(".jest-roblox/coverage/out-tsc/vendor")).toBeFalse();
+		});
+
+		it("should keep a root with no shadow mounted on the source it already served", async () => {
+			expect.assertions(2);
+
+			await seedTwoRootsAsync();
+
+			await prepareCoverageAsync(twoRootConfig());
+
+			const written = readRojoProjectJson(".jest-roblox/coverage/default.project.json");
+
+			// The redirected root is a sibling of the rewritten project file.
+			expect(readNestedProperty(written, "tree", "ReplicatedStorage", "$path")).toBe(
+				"out-tsc/test",
+			);
+			// The untouched one still points at the original tree, which serves
+			// exactly the bytes its shadow would have.
+			expect(readNestedProperty(written, "tree", "ServerScriptService", "$path")).toBe(
+				"../../out-tsc/vendor",
+			);
+		});
+
+		it("should reuse the place when nothing under either root changed", async () => {
+			expect.assertions(1);
+
+			await seedTwoRootsAsync();
+
+			await prepareCoverageAsync(twoRootConfig());
+
+			// The control for the test below: a second run over an untouched
+			// tree must reuse, or "rebuilt" proves nothing there.
+			const second = await prepareCoverageAsync(twoRootConfig());
+
+			expect(second.rebuilt).toBeFalse();
+		});
+
+		it("should rebuild when a file changes in a root the universe never touches", async () => {
+			expect.assertions(1);
+
+			await seedTwoRootsAsync();
+
+			await prepareCoverageAsync(twoRootConfig());
+			// The place mounts this root's source directly, so its bytes are in
+			// the built place — but no shadow record covers them, and the rojo
+			// inputs hash skips whatever the shadow is supposed to be watching.
+			// Something has to notice, or the run serves a stale place.
+			vol.writeFileSync("out-tsc/vendor/dep.luau", "local d = 2");
+
+			const second = await prepareCoverageAsync(twoRootConfig());
+
+			expect(second.rebuilt).toBeTrue();
+		});
+
+		it("should keep the shadow when the ignore list is what emptied the root", async () => {
+			expect.assertions(2);
+
+			await seedTwoFilesAsync();
+
+			// The universe reaches `init.luau` and the ignore list takes it, so
+			// the root ends up with nothing to probe for a reason the mount
+			// cannot serve: dropping the shadow here would mount the source and
+			// put the excluded module straight back into the place.
+			const result = await prepareCoverageAsync(
+				makeConfig({
+					collectCoverageFrom: [COVERED_FILE],
+					coverageCopyIgnorePatterns: ["init.luau"],
+					luauRoots: ["out-tsc/test"],
+				}),
+			);
+
+			expect(vol.existsSync(`.jest-roblox/coverage/${COVERED_FILE}`)).toBeFalse();
+			expect(result.manifest.nonInstrumentedFiles).toHaveProperty(UNCOVERED_FILE);
+		});
+
+		it("should instrument the whole root when nothing narrows it", async () => {
+			expect.assertions(2);
+
+			const { instrumentRoot } = await seedTwoFilesAsync();
+
+			const result = await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+			// Nothing to hold back, and nothing carried forward on a cold run.
+			expect(vi.mocked(instrumentRoot).mock.calls[0]![0].skipFiles).toBeUndefined();
+			expect(result.manifest.coverageUniverseHash).toBeUndefined();
+		});
+
+		it("should record the universe digest in the manifest", async () => {
+			expect.assertions(1);
+
+			await seedTwoFilesAsync();
+
+			const result = await prepareCoverageAsync(narrowedConfig());
+
+			expect(result.manifest.coverageUniverseHash).toMatch(/^[a-f0-9]{64}$/);
+		});
+
+		it("should rebuild cold when the coverage globs changed since the last run", async () => {
+			expect.assertions(1);
+
+			const { instrumentRoot } = await seedTwoFilesAsync();
+			vol.mkdirSync(".jest-roblox/coverage", { recursive: true });
+			vol.writeFileSync(
+				".jest-roblox/coverage/coverage-manifest.json",
+				JSON.stringify({
+					buildId: "prev-build-id",
+					coverageUniverseHash: "a-different-universe",
+					files: {},
+					generatedAt: isoNow(),
+					instrumenterVersion: INSTRUMENTER_VERSION,
+					luauRoots: ["out-tsc/test"],
+					nonInstrumentedFiles: {},
+					shadowDir: ".jest-roblox/coverage",
+					version: MANIFEST_VERSION,
+				}),
+			);
+
+			await prepareCoverageAsync(narrowedConfig());
+
+			// The previous shadow was wiped, so the skip list carries no
+			// previously-instrumented file forward — only the exclusions.
+			expect(vi.mocked(instrumentRoot).mock.calls[0]![0].skipFiles).toStrictEqual(
+				new Set(["ui/button.luau"]),
+			);
 		});
 	});
 
@@ -579,31 +1020,35 @@ describe(prepareCoverage, () => {
 			vol.mkdirSync(".jest-roblox/coverage", { recursive: true });
 			vol.writeFileSync(
 				".jest-roblox/coverage/coverage-manifest.json",
-				JSON.stringify({ buildId: "prev-build-id", ...manifest }),
+				// The digest of the config these scenarios run under. Without it
+				// every incremental case would gate itself onto the cold path.
+				JSON.stringify({
+					buildId: "prev-build-id",
+					copyIgnoreHash: DEFAULT_COPY_IGNORE_HASH,
+					...manifest,
+				}),
 			);
 		}
 
-		function seedIncrementalScenario(
-			options: {
-				fileContents?: Record<string, string>;
-				previousFiles?: Record<string, InstrumentedFileRecord>;
-				previousInstrumenterVersion?: number;
-				previousNonInstrumentedFiles?: Record<string, NonInstrumentedFileRecord>;
-				previousPlaceFilePath?: string;
-			} = {},
-		) {
-			const {
-				fileContents = { "out-tsc/test/init.luau": "local x = 1" },
-				previousFiles = {
-					"out-tsc/test/init.luau": makeFileRecord({
-						key: "out-tsc/test/init.luau",
-					}),
-				},
-				previousInstrumenterVersion = INSTRUMENTER_VERSION,
-				previousNonInstrumentedFiles = {},
-				previousPlaceFilePath = ".jest-roblox/coverage/game.rbxl",
-			} = options;
-
+		async function seedIncrementalScenarioAsync({
+			copyIgnoreHash = DEFAULT_COPY_IGNORE_HASH,
+			fileContents = { "out-tsc/test/init.luau": "local x = 1" },
+			previousFiles = {
+				"out-tsc/test/init.luau": makeFileRecord({
+					key: "out-tsc/test/init.luau",
+				}),
+			},
+			previousInstrumenterVersion = INSTRUMENTER_VERSION,
+			previousNonInstrumentedFiles = {},
+			previousPlaceFilePath = ".jest-roblox/coverage/game.rbxl",
+		}: {
+			copyIgnoreHash?: string;
+			fileContents?: Record<string, string>;
+			previousFiles?: Record<string, InstrumentedFileRecord>;
+			previousInstrumenterVersion?: number;
+			previousNonInstrumentedFiles?: Record<string, NonInstrumentedFileRecord>;
+			previousPlaceFilePath?: string;
+		} = {}) {
 			seedFilesystem();
 
 			// Seed source files with specified content
@@ -639,13 +1084,15 @@ describe(prepareCoverage, () => {
 			}
 
 			seedPreviousManifest({
+				copyIgnoreHash,
 				files: previousFiles,
 				generatedAt: isoNow(),
 				instrumenterVersion: previousInstrumenterVersion,
 				luauRoots: ["out-tsc/test"],
 				nonInstrumentedFiles: previousNonInstrumentedFiles,
 				placeFilePath: previousPlaceFilePath,
-				rojoInputsHash: computeRojoInputsHash({
+				rojoInputsHash: await computeRojoInputsHashAsync({
+					digestCacheFile: "/project/.jest-roblox/expected-digests",
 					luauRoots: ["out-tsc/test"],
 					rojoProjectPath: "/project/default.project.json",
 					rootDirectory: "/project",
@@ -659,7 +1106,7 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockImplementation((options) => {
 				return {
 					[`${options.luauRoot}/init.luau`]: makeFileRecord({
@@ -669,7 +1116,7 @@ describe(prepareCoverage, () => {
 			});
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			const record = Object.values(result.manifest.files)[0];
 
@@ -680,10 +1127,10 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(result.manifest.instrumenterVersion).toBe(INSTRUMENTER_VERSION);
 		});
@@ -692,10 +1139,10 @@ describe(prepareCoverage, () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(result.manifest.placeFilePath).toContain("game.rbxl");
 		});
@@ -703,13 +1150,13 @@ describe(prepareCoverage, () => {
 		it("should carry forward records for unchanged files without calling instrumentRoot", async () => {
 			expect.assertions(2);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			// Full cache hit — instrumentRoot skipped entirely
 			expect(instrumentRoot).not.toHaveBeenCalled();
@@ -720,7 +1167,7 @@ describe(prepareCoverage, () => {
 		it("should re-instrument files whose source hash changed", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			const updatedRecord = makeFileRecord({
 				key: "out-tsc/test/init.luau",
 				sourceHash: sha256("local x = 2"),
@@ -729,13 +1176,13 @@ describe(prepareCoverage, () => {
 				"out-tsc/test/init.luau": updatedRecord,
 			});
 
-			seedIncrementalScenario({
+			await seedIncrementalScenarioAsync({
 				fileContents: { "out-tsc/test/init.luau": "local x = 2" },
 			});
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).toHaveBeenCalledWith(
 				expect.objectContaining({
@@ -747,20 +1194,20 @@ describe(prepareCoverage, () => {
 		it("should instrument new files not in previous manifest", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({
 				"out-tsc/test/new.luau": makeFileRecord({
 					key: "out-tsc/test/new.luau",
 				}),
 			});
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 			// Add a new source file
 			vol.writeFileSync("out-tsc/test/new.luau", "local y = 1");
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			// init.luau is unchanged → skipped; new.luau is new → not skipped
 			expect(instrumentRoot).toHaveBeenCalledWith(
@@ -779,10 +1226,10 @@ describe(prepareCoverage, () => {
 				instrumentedLuauPath: ".jest-roblox/coverage/out-tsc/test/deleted.luau",
 			});
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({});
 
-			seedIncrementalScenario({
+			await seedIncrementalScenarioAsync({
 				fileContents: {
 					"out-tsc/test/deleted.luau": "local y = 1",
 					"out-tsc/test/init.luau": "local x = 1",
@@ -799,7 +1246,7 @@ describe(prepareCoverage, () => {
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(result.manifest.files["out-tsc/test/deleted.luau"]).toBeUndefined();
 			expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/deleted.luau")).toBeFalse();
@@ -814,10 +1261,10 @@ describe(prepareCoverage, () => {
 				instrumentedLuauPath: ".jest-roblox/coverage/out-tsc/test/deleted.luau",
 			});
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({});
 
-			seedIncrementalScenario({
+			await seedIncrementalScenarioAsync({
 				fileContents: {
 					"out-tsc/test/deleted.luau": "local y = 1",
 					"out-tsc/test/init.luau": "local x = 1",
@@ -836,7 +1283,7 @@ describe(prepareCoverage, () => {
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(result.manifest.files["out-tsc/test/deleted.luau"]).toBeUndefined();
 		});
@@ -844,42 +1291,42 @@ describe(prepareCoverage, () => {
 		it("should skip rojo build and instrumentRoot when no files changed", async () => {
 			expect.assertions(3);
 
-			const { buildWithRojo, instrumentRoot } = await setupMocks();
+			const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).not.toHaveBeenCalled();
-			expect(buildWithRojo).not.toHaveBeenCalled();
+			expect(buildWithRojoAsync).not.toHaveBeenCalled();
 			expect(result.placeFile).toBe(".jest-roblox/coverage/game.rbxl");
 		});
 
 		it("should rebuild when no files changed but the prior place is missing on disk", async () => {
 			expect.assertions(1);
 
-			const { buildWithRojo } = await setupMocks();
+			const { buildWithRojoAsync } = await setupMocksAsync();
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 			// Simulate an interrupted prior build: the manifest still points at a
 			// place file that is no longer on disk.
 			vol.unlinkSync(".jest-roblox/coverage/game.rbxl");
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			expect(buildWithRojo).toHaveBeenCalledOnce();
+			expect(buildWithRojoAsync).toHaveBeenCalledOnce();
 		});
 
 		it("should rebuild when no files changed but the prior place hash drifted", async () => {
 			expect.assertions(1);
 
-			const { buildWithRojo } = await setupMocks();
+			const { buildWithRojoAsync } = await setupMocksAsync();
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 			// A prior build manifest records a coverage-place hash that no longer
 			// matches the bytes on disk (corruption / partial write).
 			vol.writeFileSync(
@@ -893,23 +1340,23 @@ describe(prepareCoverage, () => {
 					files: {},
 					generatedAt: isoNow(),
 					projects: [],
-					version: 1,
+					version: BUILD_MANIFEST_VERSION,
 				}),
 			);
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			expect(buildWithRojo).toHaveBeenCalledOnce();
+			expect(buildWithRojoAsync).toHaveBeenCalledOnce();
 		});
 
 		it("should reuse the prior place when the build manifest validates", async () => {
 			expect.assertions(1);
 
-			const { buildWithRojo } = await setupMocks();
+			const { buildWithRojoAsync } = await setupMocksAsync();
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 			// A valid prior build manifest: the recorded coverage-place hash
 			// matches the bytes still on disk, so the place is reused without a
 			// rebuild.
@@ -924,30 +1371,63 @@ describe(prepareCoverage, () => {
 					files: {},
 					generatedAt: isoNow(),
 					projects: [],
-					version: 1,
+					version: BUILD_MANIFEST_VERSION,
 				}),
 			);
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			expect(buildWithRojo).not.toHaveBeenCalled();
+			expect(buildWithRojoAsync).not.toHaveBeenCalled();
+		});
+
+		it("should report the reuse gate as staging when nothing is rebuilt", async () => {
+			expect.assertions(2);
+
+			const { buildWithRojoAsync } = await setupMocksAsync();
+
+			await seedIncrementalScenarioAsync();
+			vol.writeFileSync(
+				".jest-roblox/coverage/build-manifest.json",
+				JSON.stringify({
+					buildId: "prev-build-id",
+					coveragePlace: {
+						hash: sha256("RBXL"),
+						path: ".jest-roblox/coverage/game.rbxl",
+					},
+					files: {},
+					generatedAt: isoNow(),
+					projects: [],
+					version: BUILD_MANIFEST_VERSION,
+				}),
+			);
+
+			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
+			// The gate re-hashes the cached place to decide, so a reused place
+			// still costs host time. Moving the clock per reading is what makes
+			// that cost visible in a synchronous call.
+			const result = await prepareCoverageAsync(config, {
+				timing: tickingClockCollector(1_000, 5),
+			});
+
+			expect(buildWithRojoAsync).not.toHaveBeenCalled();
+			expect(result.stagingMs).toBeGreaterThan(0);
 		});
 
 		it("should call instrumentRoot when a new file appears on disk", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 
 			// Add a new file that wasn't in the previous manifest
 			vol.writeFileSync("out-tsc/test/new-module.luau", "local y = 2");
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).toHaveBeenCalledOnce();
 		});
@@ -955,9 +1435,9 @@ describe(prepareCoverage, () => {
 		it("should call instrumentRoot when a file is deleted", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 
-			seedIncrementalScenario({
+			await seedIncrementalScenarioAsync({
 				fileContents: {
 					"out-tsc/test/a.luau": "local a = 1",
 					"out-tsc/test/b.luau": "local b = 1",
@@ -979,7 +1459,7 @@ describe(prepareCoverage, () => {
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).toHaveBeenCalledOnce();
 		});
@@ -987,7 +1467,7 @@ describe(prepareCoverage, () => {
 		it("should still rebuild rojo when only non-instrumented file changed", async () => {
 			expect.assertions(2);
 
-			const { buildWithRojo, instrumentRoot } = await setupMocks();
+			const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
 
 			const specRecord: NonInstrumentedFileRecord = {
 				shadowPath: ".jest-roblox/coverage/out-tsc/test/init.spec.luau",
@@ -995,7 +1475,7 @@ describe(prepareCoverage, () => {
 				sourcePath: "out-tsc/test/init.spec.luau",
 			};
 
-			seedIncrementalScenario({
+			await seedIncrementalScenarioAsync({
 				previousNonInstrumentedFiles: { "out-tsc/test/init.spec.luau": specRecord },
 			});
 
@@ -1004,25 +1484,25 @@ describe(prepareCoverage, () => {
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).not.toHaveBeenCalled();
-			expect(buildWithRojo).toHaveBeenCalledOnce();
+			expect(buildWithRojoAsync).toHaveBeenCalledOnce();
 		});
 
 		it("should wipe and re-instrument all when cache is disabled", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 
 			const config = makeConfig({
 				coverageCache: false,
 				luauRoots: ["out-tsc/test"],
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			const callArgs = vi.mocked(instrumentRoot).mock.calls[0]![0];
 
@@ -1032,10 +1512,10 @@ describe(prepareCoverage, () => {
 		it("should wipe shadow directory when cache is disabled", async () => {
 			expect.assertions(2);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({});
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 			vol.writeFileSync(".jest-roblox/coverage/stale.txt", "stale");
 
 			const config = makeConfig({
@@ -1043,7 +1523,7 @@ describe(prepareCoverage, () => {
 				luauRoots: ["out-tsc/test"],
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(vol.existsSync(".jest-roblox/coverage/stale.txt")).toBeFalse();
 			expect(vol.existsSync(".jest-roblox/coverage")).toBeTrue();
@@ -1052,11 +1532,11 @@ describe(prepareCoverage, () => {
 		it("should handle luauRoots change between runs", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({});
 
 			// Previous manifest only has out-tsc/test
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 
 			// Seed filesystem for the new additional root
 			vol.mkdirSync("packages/core/out", { recursive: true });
@@ -1067,7 +1547,7 @@ describe(prepareCoverage, () => {
 				luauRoots: ["out-tsc/test", "packages/core/out"],
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			// Existing root: full cache hit — instrumentRoot not called for it
 			// New root: no previous records, so instrumentRoot called
@@ -1080,9 +1560,10 @@ describe(prepareCoverage, () => {
 		});
 
 		it("should fall back to full instrumentation when manifest JSON is malformed", async () => {
-			expect.assertions(1);
+			expect.assertions(2);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
+			const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
 			seedFilesystem();
 			vol.mkdirSync(".jest-roblox/coverage", { recursive: true });
@@ -1090,25 +1571,30 @@ describe(prepareCoverage, () => {
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			const callArgs = vi.mocked(instrumentRoot).mock.calls[0]![0];
 
 			expect(callArgs.skipFiles).toBeUndefined();
+			// The discard says which fault it found: an unreadable cache and a
+			// cache that parsed but failed the schema are different problems.
+			expect(stderr).toHaveBeenCalledWith(
+				"Warning: Previous coverage manifest is malformed JSON (cache discarded)\n",
+			);
 		});
 
 		it("should re-instrument all when instrumenterVersion differs", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 
-			seedIncrementalScenario({
+			await seedIncrementalScenarioAsync({
 				previousInstrumenterVersion: INSTRUMENTER_VERSION - 1,
 			});
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			const callArgs = vi.mocked(instrumentRoot).mock.calls[0]![0];
 
@@ -1116,9 +1602,10 @@ describe(prepareCoverage, () => {
 		});
 
 		it("should re-instrument all when manifest file record lacks sourceHash", async () => {
-			expect.assertions(1);
+			expect.assertions(2);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
+			const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
 			seedFilesystem();
 			vol.mkdirSync("out-tsc/test", { recursive: true });
@@ -1142,17 +1629,24 @@ describe(prepareCoverage, () => {
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			const callArgs = vi.mocked(instrumentRoot).mock.calls[0]![0];
 
 			expect(callArgs.skipFiles).toBeUndefined();
+			// A cache that parsed but failed the schema says which field it
+			// tripped on, so the discard can be told from an unreadable file.
+			expect(stderr).toHaveBeenCalledWith(
+				expect.stringContaining(
+					"Warning: Previous coverage manifest is invalid (cache discarded): ",
+				),
+			);
 		});
 
 		it("should handle incremental mode across multiple luauRoots", async () => {
 			expect.assertions(1);
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({});
 
 			// Seed multi-root scenario
@@ -1207,44 +1701,42 @@ describe(prepareCoverage, () => {
 				luauRoots: ["packages/core/out", "packages/utils/out"],
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			// Both roots fully cached — instrumentRoot not called
 			expect(instrumentRoot).not.toHaveBeenCalled();
 		});
 
-		it("should force rebuild when beforeBuild returns true on incremental run", async () => {
+		it("should force rebuild when the bake reports a write on an incremental run", async () => {
 			expect.assertions(1);
 
-			const { buildWithRojo, instrumentRoot } = await setupMocks();
+			const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({});
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
-			const beforeBuild = vi.fn<(shadowDirectory: string) => boolean>().mockReturnValue(true);
+			const run = vi.fn<ShadowBake["run"]>().mockReturnValue(true);
 
-			prepareCoverage(config, beforeBuild);
+			await prepareCoverageAsync(config, { bake: makeBake(run) });
 
-			expect(buildWithRojo).toHaveBeenCalledWith(expect.any(String), expect.any(String));
+			expect(buildWithRojoAsync).toHaveBeenCalledWith(expect.any(String), expect.any(String));
 		});
 
-		it("should not force rebuild when beforeBuild returns false on incremental run", async () => {
+		it("should not force rebuild when the bake writes nothing on an incremental run", async () => {
 			expect.assertions(1);
 
-			const { buildWithRojo, instrumentRoot } = await setupMocks();
+			const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
 			vi.mocked(instrumentRoot).mockReturnValue({});
 
-			seedIncrementalScenario();
+			await seedIncrementalScenarioAsync();
 
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
-			const beforeBuild = vi
-				.fn<(shadowDirectory: string) => boolean>()
-				.mockReturnValue(false);
+			const run = vi.fn<ShadowBake["run"]>().mockReturnValue(false);
 
-			prepareCoverage(config, beforeBuild);
+			await prepareCoverageAsync(config, { bake: makeBake(run) });
 
-			expect(buildWithRojo).not.toHaveBeenCalled();
+			expect(buildWithRojoAsync).not.toHaveBeenCalled();
 		});
 
 		describe("when tracking non-luauRoot rojo inputs", () => {
@@ -1257,7 +1749,7 @@ describe(prepareCoverage, () => {
 				},
 			};
 
-			function seedIncludeScenario(includeContent: string): void {
+			async function seedIncludeScenarioAsync(includeContent: string): Promise<void> {
 				seedFilesystem();
 				vol.writeFileSync("/project/default.project.json", JSON.stringify(includeProject));
 				vol.mkdirSync("/project/include", { recursive: true });
@@ -1276,7 +1768,8 @@ describe(prepareCoverage, () => {
 					luauRoots: ["out-tsc/test"],
 					nonInstrumentedFiles: {},
 					placeFilePath: ".jest-roblox/coverage/game.rbxl",
-					rojoInputsHash: computeRojoInputsHash({
+					rojoInputsHash: await computeRojoInputsHashAsync({
+						digestCacheFile: "/project/.jest-roblox/expected-digests",
 						luauRoots: ["out-tsc/test"],
 						rojoProjectPath: "/project/default.project.json",
 						rootDirectory: "/project",
@@ -1298,7 +1791,7 @@ describe(prepareCoverage, () => {
 						files: {},
 						generatedAt: isoNow(),
 						projects: [],
-						version: 1,
+						version: BUILD_MANIFEST_VERSION,
 					}),
 				);
 			}
@@ -1306,30 +1799,30 @@ describe(prepareCoverage, () => {
 			it("should rebuild when a non-luauRoot mount's file changes", async () => {
 				expect.assertions(1);
 
-				const { buildWithRojo } = await setupMocks();
-				seedIncludeScenario("-- v1");
+				const { buildWithRojoAsync } = await setupMocksAsync();
+				await seedIncludeScenarioAsync("-- v1");
 				vol.writeFileSync("/project/include/RuntimeLib.lua", "-- v2");
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
-				expect(buildWithRojo).toHaveBeenCalledOnce();
+				expect(buildWithRojoAsync).toHaveBeenCalledOnce();
 			});
 
 			it("should reuse the place and log when rojo inputs are unchanged", async () => {
 				expect.assertions(2);
 
-				const { buildWithRojo } = await setupMocks();
+				const { buildWithRojoAsync } = await setupMocksAsync();
 				const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-				seedIncludeScenario("-- v1");
+				await seedIncludeScenarioAsync("-- v1");
 				seedValidBuildManifest();
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
-				expect(buildWithRojo).not.toHaveBeenCalled();
+				expect(buildWithRojoAsync).not.toHaveBeenCalled();
 				expect(stderr).toHaveBeenCalledWith(
 					expect.stringContaining("Reusing cached coverage place"),
 				);
@@ -1338,9 +1831,9 @@ describe(prepareCoverage, () => {
 			it("should warn and skip the inputs check when they cannot be hashed", async () => {
 				expect.assertions(2);
 
-				const { buildWithRojo } = await setupMocks();
+				const { buildWithRojoAsync } = await setupMocksAsync();
 				const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-				seedIncludeScenario("-- v1");
+				await seedIncludeScenarioAsync("-- v1");
 				seedValidBuildManifest();
 				// config.luauRoots is set, so resolveLuauRootsWithRojo skips
 				// parsing and the run reaches the inputs hash with a
@@ -1351,9 +1844,9 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
-				expect(buildWithRojo).not.toHaveBeenCalled();
+				expect(buildWithRojoAsync).not.toHaveBeenCalled();
 				expect(stderr).toHaveBeenCalledWith(
 					expect.stringContaining("could not hash rojo build inputs"),
 				);
@@ -1366,10 +1859,10 @@ describe(prepareCoverage, () => {
 
 				seedFilesystem();
 				vol.writeFileSync("out-tsc/test/init.spec.luau", "-- test code");
-				await setupMocks();
+				await setupMocksAsync();
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
 				expect(
 					vol.readFileSync(".jest-roblox/coverage/out-tsc/test/init.spec.luau", "utf-8"),
@@ -1385,10 +1878,10 @@ describe(prepareCoverage, () => {
 					sourcePath: "out-tsc/test/init.spec.luau",
 				};
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario({
+				await seedIncrementalScenarioAsync({
 					fileContents: {
 						"out-tsc/test/init.luau": "local x = 1",
 						"out-tsc/test/init.spec.luau": "-- new test",
@@ -1400,7 +1893,7 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
 				expect(
 					vol.readFileSync(".jest-roblox/coverage/out-tsc/test/init.spec.luau", "utf-8"),
@@ -1417,10 +1910,10 @@ describe(prepareCoverage, () => {
 					sourcePath: "out-tsc/test/init.spec.luau",
 				};
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario({
+				await seedIncrementalScenarioAsync({
 					fileContents: {
 						"out-tsc/test/init.luau": "local x = 1",
 						"out-tsc/test/init.spec.luau": specContent,
@@ -1432,10 +1925,10 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				const result = prepareCoverage(config);
+				const result = await prepareCoverageAsync(config);
 
 				expect(
-					result.manifest.nonInstrumentedFiles["out-tsc/test/init.spec.luau"]?.sourceHash,
+					result.manifest.nonInstrumentedFiles["out-tsc/test/init.spec.luau"]!.sourceHash,
 				).toBe(sha256(specContent));
 			});
 
@@ -1448,10 +1941,10 @@ describe(prepareCoverage, () => {
 					sourcePath: "out-tsc/test/deleted.spec.luau",
 				};
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario({
+				await seedIncrementalScenarioAsync({
 					previousNonInstrumentedFiles: {
 						"out-tsc/test/deleted.spec.luau": specRecord,
 					},
@@ -1461,7 +1954,7 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				const result = prepareCoverage(config);
+				const result = await prepareCoverageAsync(config);
 
 				expect(
 					result.manifest.nonInstrumentedFiles["out-tsc/test/deleted.spec.luau"],
@@ -1471,13 +1964,123 @@ describe(prepareCoverage, () => {
 				).toBeFalse();
 			});
 
+			it("should replace a shadow file whose source turned into a directory", async () => {
+				expect.assertions(2);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync({
+					fileContents: {
+						"out-tsc/test/data/value.json": "{}",
+						"out-tsc/test/init.luau": "local x = 1",
+					},
+				});
+				// What the last run left where this run has to put a directory.
+				// The reconcile cannot clear it: it runs after the mirror, and
+				// it only drops entries whose source is gone — this one's source
+				// is still there, just a directory now.
+				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/data", "-- stale file");
+
+				const result = await prepareCoverageAsync(
+					makeConfig({ luauRoots: ["out-tsc/test"] }),
+				);
+
+				expect(
+					vol.readFileSync(".jest-roblox/coverage/out-tsc/test/data/value.json", "utf-8"),
+				).toBe("{}");
+				expect(result.rebuilt).toBeTrue();
+			});
+
+			it("should replace a shadow directory whose source turned into a file", async () => {
+				expect.assertions(2);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync({
+					fileContents: {
+						"out-tsc/test/data.json": "{}",
+						"out-tsc/test/init.luau": "local x = 1",
+					},
+				});
+				// The mirror image of the case above, seeded non-empty: the
+				// whole subtree has to go, not just the entry on the path.
+				vol.mkdirSync(".jest-roblox/coverage/out-tsc/test/data.json", {
+					recursive: true,
+				});
+				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/data.json/value.json", "{}");
+
+				const result = await prepareCoverageAsync(
+					makeConfig({ luauRoots: ["out-tsc/test"] }),
+				);
+
+				expect(
+					vol.readFileSync(".jest-roblox/coverage/out-tsc/test/data.json", "utf-8"),
+				).toBe("{}");
+				expect(result.rebuilt).toBeTrue();
+			});
+
+			// Both carry-forwards ask whether the output they would keep is
+			// still there, and `existsSync` says yes to a directory. An
+			// interrupted run that changed a source's kind leaves exactly that,
+			// and carrying the record forward would hand rojo a Folder under
+			// the name a file should have — silently, since nothing throws.
+			it("should re-copy when the recorded shadow path became a directory", async () => {
+				expect.assertions(1);
+
+				const specContent = "-- spec";
+				const specRecord: NonInstrumentedFileRecord = {
+					shadowPath: ".jest-roblox/coverage/out-tsc/test/init.spec.luau",
+					sourceHash: sha256(specContent),
+					sourcePath: "out-tsc/test/init.spec.luau",
+				};
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync({
+					fileContents: {
+						"out-tsc/test/init.luau": "local x = 1",
+						"out-tsc/test/init.spec.luau": specContent,
+					},
+					previousNonInstrumentedFiles: {
+						"out-tsc/test/init.spec.luau": specRecord,
+					},
+				});
+				vol.rmSync(specRecord.shadowPath);
+				vol.mkdirSync(specRecord.shadowPath, { recursive: true });
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(vol.readFileSync(specRecord.shadowPath, "utf-8")).toBe(specContent);
+			});
+
+			it("should re-instrument when the recorded twin became a directory", async () => {
+				expect.assertions(1);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+				const twin = ".jest-roblox/coverage/out-tsc/test/init.luau";
+				vol.rmSync(twin);
+				vol.mkdirSync(twin, { recursive: true });
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(instrumentRoot).toHaveBeenCalledWith(
+					expect.objectContaining({ skipFiles: new Set() }),
+				);
+			});
+
 			it("should remove orphaned non-luau files from the shadow when source is deleted", async () => {
 				expect.assertions(1);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario();
+				await seedIncrementalScenarioAsync();
 				// A meta file a prior cold run copied in, whose source was later
 				// deleted. It is neither instrumented nor a spec/test/snap file,
 				// so only reconciling the shadow against source can drop it.
@@ -1486,7 +2089,7 @@ describe(prepareCoverage, () => {
 					'{"className":"Folder"}',
 				);
 
-				prepareCoverage(makeConfig({ luauRoots: ["out-tsc/test"] }));
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
 
 				expect(
 					vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.meta.json"),
@@ -1496,17 +2099,19 @@ describe(prepareCoverage, () => {
 			it("should keep and sync non-luau files whose source still exists", async () => {
 				expect.assertions(2);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario({
+				await seedIncrementalScenarioAsync({
 					fileContents: {
 						"out-tsc/test/init.luau": "local x = 1",
 						"out-tsc/test/init.meta.json": '{"className":"Folder"}',
 					},
 				});
 
-				const result = prepareCoverage(makeConfig({ luauRoots: ["out-tsc/test"] }));
+				const result = await prepareCoverageAsync(
+					makeConfig({ luauRoots: ["out-tsc/test"] }),
+				);
 
 				expect(
 					vol.readFileSync(".jest-roblox/coverage/out-tsc/test/init.meta.json", "utf-8"),
@@ -1516,16 +2121,124 @@ describe(prepareCoverage, () => {
 				).toBeDefined();
 			});
 
+			// The three failure shapes a warm run takes when the copy-ignore
+			// list moves under it: a carried-forward record for a file the
+			// reconcile just deleted, an orphan cov-map keeping that file in
+			// the report at 0%, and — the hard one — a new file lost entirely
+			// because `instrumentable.size` cancelled against a newly-ignored
+			// one and faked a full cache hit. All three are the same bug: the
+			// warm path reasons from counts a manifest the old list wrote.
+			it("should rebuild cold when the copy-ignore list changed since the manifest", async () => {
+				expect.assertions(2);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+
+				const result = await prepareCoverageAsync(
+					makeConfig({
+						coverageCopyIgnorePatterns: ["init.luau"],
+						luauRoots: ["out-tsc/test"],
+					}),
+				);
+
+				// Warm, the previous record would be carried forward for a file
+				// the reconcile then deletes — and the report would zero-fill it
+				// against a place that no longer loads it.
+				expect(result.manifest.files).not.toHaveProperty("out-tsc/test/init.luau");
+				// Warm, `instrumentable.size === previousCount` can cancel a
+				// newly-ignored file against a newly-added one and short-circuit
+				// into a full cache hit, which never instruments at all.
+				expect(instrumentRoot).toHaveBeenCalledOnce();
+			});
+
+			it("should reuse the cache when the copy-ignore list only reorders", async () => {
+				expect.assertions(1);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+
+				// The matcher ORs the list, so the order cannot change what is
+				// ignored — and a digest that moved anyway would spend a cold
+				// rebuild on a no-op config edit.
+				await prepareCoverageAsync(
+					makeConfig({
+						coverageCopyIgnorePatterns: [
+							...DEFAULT_CONFIG.coverageCopyIgnorePatterns,
+						].toReversed(),
+						luauRoots: ["out-tsc/test"],
+					}),
+				);
+
+				expect(instrumentRoot).not.toHaveBeenCalled();
+			});
+
+			it("should keep a cov-map sidecar a user JSON pattern would match", async () => {
+				expect.assertions(1);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync({
+					copyIgnoreHash: hashCopyIgnorePatterns(["**/*.json"]),
+				});
+				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/init.cov-map.json", "{}");
+
+				// The sidecar is instrumenter output, not a copy, so the list
+				// has no say over it. Deleting it would leave the manifest
+				// record pointing at a missing map, and the report drops that
+				// module without saying so.
+				await prepareCoverageAsync(
+					makeConfig({
+						coverageCopyIgnorePatterns: ["**/*.json"],
+						luauRoots: ["out-tsc/test"],
+					}),
+				);
+
+				expect(
+					vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.cov-map.json"),
+				).toBeTrue();
+			});
+
+			it("should remove declaration artifacts an earlier run copied in", async () => {
+				expect.assertions(2);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync({
+					fileContents: {
+						"out-tsc/test/init.d.ts": "export {};",
+						"out-tsc/test/init.d.ts.map": "{}",
+						"out-tsc/test/init.luau": "local x = 1",
+					},
+				});
+				// Copied in by a cold run that predates the exclusion. Both
+				// sources still exist, so only the artifact rule can drop them.
+				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/init.d.ts", "export {};");
+				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/init.d.ts.map", "{}");
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.d.ts")).toBeFalse();
+				expect(
+					vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.d.ts.map"),
+				).toBeFalse();
+			});
+
 			it("should remove an orphaned cov-map sidecar when its base source is gone", async () => {
 				expect.assertions(1);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario();
+				await seedIncrementalScenarioAsync();
 				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/gone.cov-map.json", "{}");
 
-				prepareCoverage(makeConfig({ luauRoots: ["out-tsc/test"] }));
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
 
 				expect(
 					vol.existsSync(".jest-roblox/coverage/out-tsc/test/gone.cov-map.json"),
@@ -1535,42 +2248,201 @@ describe(prepareCoverage, () => {
 			it("should keep a cov-map sidecar whose base source still exists", async () => {
 				expect.assertions(1);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario();
+				await seedIncrementalScenarioAsync();
 				// init.luau source is seeded by default; its sidecar must
 				// survive.
 				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/init.cov-map.json", "{}");
 
-				prepareCoverage(makeConfig({ luauRoots: ["out-tsc/test"] }));
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
 
 				expect(
 					vol.existsSync(".jest-roblox/coverage/out-tsc/test/init.cov-map.json"),
 				).toBeTrue();
 			});
 
+			it("should remove an orphaned shadow directory when its source directory is gone", async () => {
+				expect.assertions(2);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				// The `foo/index.ts` -> `foo.ts` rename, which turns a source
+				// directory into a sibling file. Unlinking the orphaned
+				// `init.luau` alone leaves an empty `dir/`, and rojo still mounts
+				// that as a Folder named `dir` beside the ModuleScript
+				// `dir.luau`.
+				await seedIncrementalScenarioAsync({
+					fileContents: {
+						"out-tsc/test/dir.luau": "local x = 1",
+						"out-tsc/test/init.luau": "local x = 1",
+					},
+				});
+				vol.mkdirSync(".jest-roblox/coverage/out-tsc/test/dir", { recursive: true });
+				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/dir/init.luau", "-- stale");
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(
+					vol.existsSync(".jest-roblox/coverage/out-tsc/test/dir/init.luau"),
+				).toBeFalse();
+				expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/dir")).toBeFalse();
+			});
+
+			it("should collapse a nested orphaned shadow directory tree in one pass", async () => {
+				expect.assertions(1);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+				// `a` is only empty once `a/b/c` and `a/b` are gone, so the prune
+				// has to run bottom-up to reach it in this run rather than the
+				// third one.
+				vol.mkdirSync(".jest-roblox/coverage/out-tsc/test/a/b/c", { recursive: true });
+				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/a/b/c/gone.luau", "-- stale");
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/a")).toBeFalse();
+			});
+
+			it("should rebuild when an empty source directory appears on a warm run", async () => {
+				expect.assertions(2);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+				// No file write reaches a directory with nothing in it, so the
+				// mirror is the only thing that can notice one appeared — and
+				// rojo builds a Folder for it, so the place has to be rebuilt.
+				vol.mkdirSync("out-tsc/test/empty", { recursive: true });
+
+				const result = await prepareCoverageAsync(
+					makeConfig({ luauRoots: ["out-tsc/test"] }),
+				);
+
+				expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/empty")).toBeTrue();
+				expect(result.rebuilt).toBeTrue();
+			});
+
+			it("should keep an empty shadow directory whose source directory still exists", async () => {
+				expect.assertions(1);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+				// A cold run mirrors empty source directories, and rojo mounts
+				// each as a Folder. A warm run must agree, so an empty shadow
+				// directory survives for as long as its source directory does.
+				vol.mkdirSync("out-tsc/test/empty", { recursive: true });
+				vol.mkdirSync(".jest-roblox/coverage/out-tsc/test/empty", { recursive: true });
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/empty")).toBeTrue();
+			});
+
+			it("should keep a skipped directory while its parent source survives", async () => {
+				expect.assertions(1);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				// The walk never descends into `node_modules`, so it cannot judge
+				// whether that subtree is orphaned. While the parent source is
+				// there, neither is orphaned.
+				await seedIncrementalScenarioAsync({
+					fileContents: {
+						"out-tsc/test/init.luau": "local x = 1",
+						"out-tsc/test/vendor/keep.luau": "local x = 1",
+					},
+				});
+				vol.mkdirSync(".jest-roblox/coverage/out-tsc/test/vendor/node_modules", {
+					recursive: true,
+				});
+				vol.writeFileSync(
+					".jest-roblox/coverage/out-tsc/test/vendor/node_modules/dep.luau",
+					"-- vendored",
+				);
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(
+					vol.existsSync(
+						".jest-roblox/coverage/out-tsc/test/vendor/node_modules/dep.luau",
+					),
+				).toBeTrue();
+			});
+
+			it("should remove a skipped directory once its parent source is gone", async () => {
+				expect.assertions(1);
+
+				const { instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+				// Nothing under an orphaned parent can be anything but orphaned,
+				// so the skip must not veto the parent’s removal — otherwise a
+				// stale `vendor/` survives beside a fresh `vendor.luau`.
+				vol.mkdirSync(".jest-roblox/coverage/out-tsc/test/vendor/node_modules", {
+					recursive: true,
+				});
+				vol.writeFileSync(
+					".jest-roblox/coverage/out-tsc/test/vendor/node_modules/dep.luau",
+					"-- vendored",
+				);
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(vol.existsSync(".jest-roblox/coverage/out-tsc/test/vendor")).toBeFalse();
+			});
+
+			it("should force a rebuild when an orphaned shadow directory is removed", async () => {
+				expect.assertions(1);
+
+				const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
+				vi.mocked(instrumentRoot).mockReturnValue({});
+
+				await seedIncrementalScenarioAsync();
+				vol.mkdirSync(".jest-roblox/coverage/out-tsc/test/gone", { recursive: true });
+
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
+
+				expect(buildWithRojoAsync).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.any(String),
+				);
+			});
+
 			it("should force a rebuild when an orphaned non-luau file is removed", async () => {
 				expect.assertions(1);
 
-				const { buildWithRojo, instrumentRoot } = await setupMocks();
+				const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario();
+				await seedIncrementalScenarioAsync();
 				vol.writeFileSync(".jest-roblox/coverage/out-tsc/test/init.meta.json", "{}");
 
-				prepareCoverage(makeConfig({ luauRoots: ["out-tsc/test"] }));
+				await prepareCoverageAsync(makeConfig({ luauRoots: ["out-tsc/test"] }));
 
-				expect(buildWithRojo).toHaveBeenCalledWith(expect.any(String), expect.any(String));
+				expect(buildWithRojoAsync).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.any(String),
+				);
 			});
 
 			it("should force a cold rebuild when a luauRoot is dropped from the set", async () => {
 				expect.assertions(2);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario();
+				await seedIncrementalScenarioAsync();
 				// The prior run also covered a second root, now gone from config.
 				// The per-root reconcile never walks it, so the set-change guard
 				// must cold-rebuild to purge its orphaned shadow subtree.
@@ -1581,7 +2453,9 @@ describe(prepareCoverage, () => {
 				vol.mkdirSync(".jest-roblox/coverage/out-tsc/extra", { recursive: true });
 				vol.writeFileSync(".jest-roblox/coverage/out-tsc/extra/stale.luau", "-- stale");
 
-				const result = prepareCoverage(makeConfig({ luauRoots: ["out-tsc/test"] }));
+				const result = await prepareCoverageAsync(
+					makeConfig({ luauRoots: ["out-tsc/test"] }),
+				);
 
 				expect(result.rebuilt).toBeTrue();
 				expect(
@@ -1598,10 +2472,10 @@ describe(prepareCoverage, () => {
 					sourcePath: "out-tsc/test/init.spec.luau",
 				};
 
-				const { buildWithRojo, instrumentRoot } = await setupMocks();
+				const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario({
+				await seedIncrementalScenarioAsync({
 					fileContents: {
 						"out-tsc/test/init.luau": "local x = 1",
 						"out-tsc/test/init.spec.luau": "-- new test",
@@ -1613,9 +2487,12 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
-				expect(buildWithRojo).toHaveBeenCalledWith(expect.any(String), expect.any(String));
+				expect(buildWithRojoAsync).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.any(String),
+				);
 			});
 
 			it("should track non-instrumented files in manifest", async () => {
@@ -1623,21 +2500,21 @@ describe(prepareCoverage, () => {
 
 				seedFilesystem();
 				vol.writeFileSync("out-tsc/test/init.spec.luau", "-- test code");
-				await setupMocks();
+				await setupMocksAsync();
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				const result = prepareCoverage(config);
+				const result = await prepareCoverageAsync(config);
 
 				const record = result.manifest.nonInstrumentedFiles["out-tsc/test/init.spec.luau"];
 
 				expect(record).toBeDefined();
-				expect(record?.sourceHash).toBe(sha256("-- test code"));
+				expect(record!.sourceHash).toBe(sha256("-- test code"));
 			});
 
 			it("should force cold rebuild when previous manifest lacks nonInstrumentedFiles", async () => {
 				expect.assertions(1);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 
 				seedFilesystem();
 				vol.mkdirSync("out-tsc/test", { recursive: true });
@@ -1664,7 +2541,7 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
 				// Should NOT use incremental (no skipFiles)
 				const callArgs = vi.mocked(instrumentRoot).mock.calls[0]![0];
@@ -1681,10 +2558,10 @@ describe(prepareCoverage, () => {
 					sourcePath: "out-tsc/test/gone.spec.luau",
 				};
 
-				const { buildWithRojo, instrumentRoot } = await setupMocks();
+				const { buildWithRojoAsync, instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
-				seedIncrementalScenario({
+				await seedIncrementalScenarioAsync({
 					previousNonInstrumentedFiles: {
 						"out-tsc/test/gone.spec.luau": specRecord,
 					},
@@ -1696,12 +2573,12 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				prepareCoverage(config);
+				await prepareCoverageAsync(config);
 
 				expect(
 					vol.existsSync(".jest-roblox/coverage/out-tsc/test/gone.spec.luau"),
 				).toBeFalse();
-				expect(buildWithRojo).not.toHaveBeenCalled();
+				expect(buildWithRojoAsync).not.toHaveBeenCalled();
 			});
 
 			it("should discover spec files in subdirectories", async () => {
@@ -1710,10 +2587,10 @@ describe(prepareCoverage, () => {
 				seedFilesystem();
 				vol.mkdirSync("out-tsc/test/sub", { recursive: true });
 				vol.writeFileSync("out-tsc/test/sub/deep.spec.luau", "-- deep test");
-				await setupMocks();
+				await setupMocksAsync();
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				const result = prepareCoverage(config);
+				const result = await prepareCoverageAsync(config);
 
 				expect(
 					result.manifest.nonInstrumentedFiles["out-tsc/test/sub/deep.spec.luau"],
@@ -1723,7 +2600,7 @@ describe(prepareCoverage, () => {
 			it("should not prune non-instrumented files from other roots", async () => {
 				expect.assertions(1);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
 				// Multi-root: previous manifest has a spec in packages/core/out
@@ -1788,7 +2665,7 @@ describe(prepareCoverage, () => {
 					luauRoots: ["packages/core/out", "packages/utils/out"],
 				});
 
-				const result = prepareCoverage(config);
+				const result = await prepareCoverageAsync(config);
 
 				// Core spec should still be tracked (not pruned by utils root
 				// processing)
@@ -1805,10 +2682,10 @@ describe(prepareCoverage, () => {
 				vol.writeFileSync("out-tsc/test/node_modules/mod.spec.luau", "-- ignored");
 				vol.mkdirSync("out-tsc/test/.hidden", { recursive: true });
 				vol.writeFileSync("out-tsc/test/.hidden/secret.spec.luau", "-- ignored");
-				await setupMocks();
+				await setupMocksAsync();
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				const result = prepareCoverage(config);
+				const result = await prepareCoverageAsync(config);
 
 				expect(
 					result.manifest.nonInstrumentedFiles["out-tsc/test/node_modules/mod.spec.luau"],
@@ -1821,12 +2698,12 @@ describe(prepareCoverage, () => {
 			it("should handle file rename across categories (source to spec)", async () => {
 				expect.assertions(2);
 
-				const { instrumentRoot } = await setupMocks();
+				const { instrumentRoot } = await setupMocksAsync();
 				vi.mocked(instrumentRoot).mockReturnValue({});
 
 				// Previous manifest has init.luau as instrumented source
 				// Now the file has been renamed to init.spec.luau
-				seedIncrementalScenario({
+				await seedIncrementalScenarioAsync({
 					fileContents: {
 						"out-tsc/test/helper.spec.luau": "-- was a source file",
 						"out-tsc/test/init.luau": "local x = 1",
@@ -1835,7 +2712,7 @@ describe(prepareCoverage, () => {
 
 				const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-				const result = prepareCoverage(config);
+				const result = await prepareCoverageAsync(config);
 
 				// New spec file should be tracked as non-instrumented
 				expect(
@@ -1848,33 +2725,57 @@ describe(prepareCoverage, () => {
 		});
 	});
 
-	describe("when beforeBuild callback is provided", () => {
-		it("should call beforeBuild with shadow directory path", async () => {
+	describe("when a bake is provided", () => {
+		it("should run the bake against the shadow layout", async () => {
 			expect.assertions(2);
 
 			seedFilesystem();
-			const { buildWithRojo } = await setupMocks();
+			const { buildWithRojoAsync } = await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
-			const beforeBuild = vi
-				.fn<(shadowDirectory: string) => boolean>()
-				.mockReturnValue(false);
+			const run = vi.fn<ShadowBake["run"]>().mockReturnValue(false);
 
-			prepareCoverage(config, beforeBuild);
+			await prepareCoverageAsync(config, { bake: makeBake(run) });
 
-			expect(beforeBuild).toHaveBeenCalledWith(".jest-roblox/coverage");
-			expect(buildWithRojo).toHaveBeenCalledWith(expect.any(String), expect.any(String));
+			expect(run).toHaveBeenCalledWith(
+				expect.objectContaining({ root: ".jest-roblox/coverage" }),
+			);
+			expect(buildWithRojoAsync).toHaveBeenCalledWith(expect.any(String), expect.any(String));
+		});
+
+		it("should report the callback as staging rather than as coverage", async () => {
+			expect.assertions(2);
+
+			seedFilesystem();
+			await setupMocksAsync();
+			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
+			// The hook is the stub bake, which a non-coverage run pays too.
+			// Frozen clock apart from the hook, so whatever it costs is the whole
+			// difference between the two phases.
+			const clock = movableClockCollector(1_000);
+			const run = vi.fn<ShadowBake["run"]>(() => {
+				clock.advance(90);
+				return false;
+			});
+
+			const result = await prepareCoverageAsync(config, {
+				bake: makeBake(run),
+				timing: clock.timing,
+			});
+
+			expect(result.instrumentMs).toBe(0);
+			expect(result.stagingMs).toBe(90);
 		});
 
 		it("should skip callback when not provided", async () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			const { buildWithRojo } = await setupMocks();
+			const { buildWithRojoAsync } = await setupMocksAsync();
 			const config = makeConfig({ luauRoots: ["out-tsc/test"] });
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
-			expect(buildWithRojo).toHaveBeenCalledWith(expect.any(String), expect.any(String));
+			expect(buildWithRojoAsync).toHaveBeenCalledWith(expect.any(String), expect.any(String));
 		});
 	});
 
@@ -1889,12 +2790,12 @@ describe(prepareCoverage, () => {
 			vol.writeFileSync("packages/test-utils/out/init.luau", "local b = 2");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(ROJO_PROJECT));
 
-			const { instrumentRoot } = await setupMocks();
+			const { instrumentRoot } = await setupMocksAsync();
 			const config = makeConfig({
 				luauRoots: ["packages/core/out", "packages/test-utils/out"],
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(instrumentRoot).toHaveBeenCalledWith(
 				expect.objectContaining({ luauRoot: "packages/core/out" }),
@@ -1904,29 +2805,29 @@ describe(prepareCoverage, () => {
 			);
 		});
 
-		it("should copy each root to its own shadow directory", async () => {
+		it("should mirror each root into its own shadow directory", async () => {
 			expect.assertions(2);
 
 			vol.mkdirSync("/project", { recursive: true });
 			vol.mkdirSync("packages/core/out", { recursive: true });
 			vol.mkdirSync("packages/test-utils/out", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "local a = 1");
-			vol.writeFileSync("packages/test-utils/out/init.luau", "local b = 2");
+			vol.writeFileSync("packages/core/out/init.spec.luau", "local a = 1");
+			vol.writeFileSync("packages/test-utils/out/init.spec.luau", "local b = 2");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(ROJO_PROJECT));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({
 				luauRoots: ["packages/core/out", "packages/test-utils/out"],
 			});
 
-			prepareCoverage(config);
+			await prepareCoverageAsync(config);
 
 			expect(
-				vol.readFileSync(".jest-roblox/coverage/packages/core/out/init.luau", "utf-8"),
+				vol.readFileSync(".jest-roblox/coverage/packages/core/out/init.spec.luau", "utf-8"),
 			).toBe("local a = 1");
 			expect(
 				vol.readFileSync(
-					".jest-roblox/coverage/packages/test-utils/out/init.luau",
+					".jest-roblox/coverage/packages/test-utils/out/init.spec.luau",
 					"utf-8",
 				),
 			).toBe("local b = 2");
@@ -1942,12 +2843,12 @@ describe(prepareCoverage, () => {
 			vol.writeFileSync("packages/test-utils/out/init.luau", "local b = 2");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(ROJO_PROJECT));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({
 				luauRoots: ["packages/core/out", "packages/test-utils/out"],
 			});
 
-			const result = prepareCoverage(config);
+			const result = await prepareCoverageAsync(config);
 
 			expect(result.manifest.luauRoots).toStrictEqual([
 				"packages/core/out",
@@ -1958,19 +2859,34 @@ describe(prepareCoverage, () => {
 });
 
 describe(resolveLuauRoots, () => {
+	/** The roots as plain strings, so an assertion can name literals. */
+	function rootsOf(config: ResolvedConfig): Array<string> {
+		return resolveLuauRoots(config);
+	}
+
 	describe("when config.luauRoots is provided", () => {
 		it("should return the explicit array", async () => {
 			expect.assertions(1);
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({
 				luauRoots: ["packages/core/out", "packages/test-utils/out"],
 			});
 
-			expect(resolveLuauRoots(config)).toStrictEqual([
-				"packages/core/out",
-				"packages/test-utils/out",
-			]);
+			expect(rootsOf(config)).toStrictEqual(["packages/core/out", "packages/test-utils/out"]);
+		});
+
+		// Canonical is not the same as unique: left as two entries, one
+		// directory is instrumented and mirrored into the same shadow twice.
+		// Workspace mode dedupes in `discoverFromLuauRoots`; single and multi
+		// mode arrive here.
+		it("should reduce two spellings of one root to one entry", async () => {
+			expect.assertions(1);
+
+			await setupMocksAsync();
+			const config = makeConfig({ luauRoots: ["out", "out/./", "./out"] });
+
+			expect(rootsOf(config)).toStrictEqual(["out"]);
 		});
 	});
 
@@ -1992,18 +2908,45 @@ describe(resolveLuauRoots, () => {
 			};
 
 			vol.mkdirSync("/project", { recursive: true });
-			vol.mkdirSync("packages/core/out", { recursive: true });
-			vol.mkdirSync("packages/test-utils/out", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "");
-			vol.writeFileSync("packages/test-utils/out/init.luau", "");
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.mkdirSync("/project/packages/test-utils/out", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+			vol.writeFileSync("/project/packages/test-utils/out/init.luau", "");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(multiRootProject));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			const roots = resolveLuauRoots(config);
+			const roots = rootsOf(config);
 
 			expect(roots).toStrictEqual(["packages/core/out", "packages/test-utils/out"]);
+		});
+
+		it("should auto-detect when luauRoots is an empty array", async () => {
+			expect.assertions(1);
+
+			const project = {
+				name: "test",
+				tree: {
+					$className: "DataModel",
+					ReplicatedStorage: {
+						$path: "packages/core/out",
+					},
+				},
+			};
+
+			vol.mkdirSync("/project", { recursive: true });
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+			vol.writeFileSync("/project/default.project.json", JSON.stringify(project));
+
+			await setupMocksAsync();
+			// An empty array names no roots, which is not the same as choosing
+			// them: the run walks the rojo project rather than instrumenting
+			// nothing.
+			const config = makeConfig({ luauRoots: [] });
+
+			expect(rootsOf(config)).toStrictEqual(["packages/core/out"]);
 		});
 
 		it("should skip $path entries that do not exist on disk", async () => {
@@ -2023,14 +2966,14 @@ describe(resolveLuauRoots, () => {
 			};
 
 			vol.mkdirSync("/project", { recursive: true });
-			vol.mkdirSync("packages/core/out", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "");
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(projectWithMissing));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(resolveLuauRoots(config)).toStrictEqual(["packages/core/out"]);
+			expect(rootsOf(config)).toStrictEqual(["packages/core/out"]);
 		});
 
 		it("should skip $path entries that contain no .luau files", async () => {
@@ -2050,16 +2993,16 @@ describe(resolveLuauRoots, () => {
 			};
 
 			vol.mkdirSync("/project", { recursive: true });
-			vol.mkdirSync("packages/core/out", { recursive: true });
-			vol.mkdirSync("packages/empty/out", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "");
-			vol.writeFileSync("packages/empty/out/readme.txt", "no luau here");
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.mkdirSync("/project/packages/empty/out", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+			vol.writeFileSync("/project/packages/empty/out/readme.txt", "no luau here");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(projectWithEmpty));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(resolveLuauRoots(config)).toStrictEqual(["packages/core/out"]);
+			expect(rootsOf(config)).toStrictEqual(["packages/core/out"]);
 		});
 
 		it("should resolve nested .project.json refs before collecting roots", async () => {
@@ -2083,15 +3026,15 @@ describe(resolveLuauRoots, () => {
 			};
 
 			vol.mkdirSync("/project", { recursive: true });
-			vol.mkdirSync("src/Client/Systems", { recursive: true });
-			vol.writeFileSync("src/Client/Systems/FriendsController.luau", "");
+			vol.mkdirSync("/project/src/Client/Systems", { recursive: true });
+			vol.writeFileSync("/project/src/Client/Systems/FriendsController.luau", "");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(parentProject));
 			vol.writeFileSync("/project/client.project.json", JSON.stringify(clientProject));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(resolveLuauRoots(config)).toStrictEqual(["src/Client/Systems"]);
+			expect(rootsOf(config)).toStrictEqual(["src/Client/Systems"]);
 		});
 
 		it("should apply coveragePathIgnorePatterns to filter roots", async () => {
@@ -2111,13 +3054,13 @@ describe(resolveLuauRoots, () => {
 			};
 
 			vol.mkdirSync("/project", { recursive: true });
-			vol.mkdirSync("packages/core/out", { recursive: true });
-			vol.mkdirSync("rojo-sync/rbxts", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "");
-			vol.writeFileSync("rojo-sync/rbxts/init.luau", "");
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.mkdirSync("/project/rojo-sync/rbxts", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+			vol.writeFileSync("/project/rojo-sync/rbxts/init.luau", "");
 			vol.writeFileSync("/project/default.project.json", JSON.stringify(projectWithSync));
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig({
 				coveragePathIgnorePatterns: [
 					...DEFAULT_CONFIG.coveragePathIgnorePatterns,
@@ -2125,7 +3068,7 @@ describe(resolveLuauRoots, () => {
 				],
 			});
 
-			expect(resolveLuauRoots(config)).toStrictEqual(["packages/core/out"]);
+			expect(rootsOf(config)).toStrictEqual(["packages/core/out"]);
 		});
 	});
 
@@ -2136,13 +3079,10 @@ describe(resolveLuauRoots, () => {
 			vol.mkdirSync("/project", { recursive: true });
 			vol.writeFileSync("/project/default.project.json", "{ not valid json");
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(() => resolveLuauRoots(config)).toThrowWithMessage(
-				Error,
-				/Malformed Rojo project JSON/,
-			);
+			expect(() => rootsOf(config)).toThrowWithMessage(Error, /Malformed Rojo project JSON/);
 		});
 	});
 
@@ -2151,25 +3091,40 @@ describe(resolveLuauRoots, () => {
 			expect.assertions(1);
 
 			seedFilesystem();
-			await setupMocks({ outDir: "out-tsc/test" });
+			await setupMocksAsync({ outDir: "out-tsc/test" });
 			const config = makeConfig();
 
-			expect(resolveLuauRoots(config)).toStrictEqual(["out-tsc/test"]);
+			expect(rootsOf(config)).toStrictEqual(["out-tsc/test"]);
+		});
+
+		it("should normalize a tsconfig outDir written with a ./ prefix", async () => {
+			expect.assertions(1);
+
+			seedFilesystem();
+			await setupMocksAsync({ outDir: "./out" });
+			const config = makeConfig();
+
+			expect(rootsOf(config)).toStrictEqual(["out"]);
 		});
 
 		it("should fall through to tsconfig when no Rojo project exists", async () => {
 			expect.assertions(1);
 
 			vol.mkdirSync("/project", { recursive: true });
-			await setupMocks({ outDir: "out" });
+			await setupMocksAsync({ outDir: "out" });
 			const config = makeConfig();
 
-			expect(resolveLuauRoots(config)).toStrictEqual(["out"]);
+			expect(rootsOf(config)).toStrictEqual(["out"]);
 		});
 	});
 });
 
 describe(collectLuauRootsFromRojo, () => {
+	// Every case here sites the project at `rootDir`, which is the common
+	// shape: the frame a root is written in and the frame a `$path` resolves
+	// in are then the same directory.
+	const rojoDirectory = "/project";
+
 	describe("when collecting paths from nested tree nodes", () => {
 		it("should find $path values in deeply nested nodes", async () => {
 			expect.assertions(1);
@@ -2189,15 +3144,15 @@ describe(collectLuauRootsFromRojo, () => {
 				},
 			};
 
-			vol.mkdirSync("packages/core/out", { recursive: true });
-			vol.mkdirSync("packages/test-utils/out", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "");
-			vol.writeFileSync("packages/test-utils/out/init.luau", "");
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.mkdirSync("/project/packages/test-utils/out", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+			vol.writeFileSync("/project/packages/test-utils/out/init.luau", "");
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(collectLuauRootsFromRojo(project, config)).toStrictEqual([
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory }, config)).toStrictEqual([
 				"packages/core/out",
 				"packages/test-utils/out",
 			]);
@@ -2223,19 +3178,21 @@ describe(collectLuauRootsFromRojo, () => {
 				},
 			};
 
-			vol.mkdirSync("packages/core/out", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "");
-			vol.writeFileSync("packages/core/jest.config.luau", "return {}");
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+			vol.writeFileSync("/project/packages/core/jest.config.luau", "return {}");
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(collectLuauRootsFromRojo(project, config)).toStrictEqual(["packages/core/out"]);
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory }, config)).toStrictEqual([
+				"packages/core/out",
+			]);
 		});
 	});
 
 	describe("when .luau files are in subdirectories", () => {
-		it("should detect .luau files recursively", async () => {
+		it("should detect .luau files nested beside a non-luau sibling", async () => {
 			expect.assertions(1);
 
 			const project: RojoProject = {
@@ -2248,13 +3205,18 @@ describe(collectLuauRootsFromRojo, () => {
 				},
 			};
 
-			vol.mkdirSync("packages/core/out/nested", { recursive: true });
-			vol.writeFileSync("packages/core/out/nested/module.luau", "");
+			vol.mkdirSync("/project/packages/core/out/nested", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/nested/module.luau", "");
+			// A loose non-luau file beside the tree: one entry that is not luau
+			// does not cost the mount its coverage.
+			vol.writeFileSync("/project/packages/core/out/readme.txt", "");
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(collectLuauRootsFromRojo(project, config)).toStrictEqual(["packages/core/out"]);
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory }, config)).toStrictEqual([
+				"packages/core/out",
+			]);
 		});
 	});
 
@@ -2275,27 +3237,271 @@ describe(collectLuauRootsFromRojo, () => {
 				},
 			};
 
-			vol.mkdirSync("packages/core/out", { recursive: true });
-			vol.mkdirSync("node_modules/@rbxts", { recursive: true });
-			vol.writeFileSync("packages/core/out/init.luau", "");
-			vol.writeFileSync("node_modules/@rbxts/init.luau", "");
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.mkdirSync("/project/node_modules/@rbxts", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+			vol.writeFileSync("/project/node_modules/@rbxts/init.luau", "");
 
-			await setupMocks();
+			await setupMocksAsync();
 			const config = makeConfig();
 
-			expect(collectLuauRootsFromRojo(project, config)).toStrictEqual(["packages/core/out"]);
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory }, config)).toStrictEqual([
+				"packages/core/out",
+			]);
+		});
+	});
+
+	// The mount is judged on where it lands, not on how it is spelled: the
+	// shadow mirrors a tree under `rootDir` and the manifest keys the report
+	// reads are written from there, so a mount elsewhere in the rojo tree has
+	// no root to be — however it is written.
+	describe("when a $path is resolved against rootDir", () => {
+		it.for([
+			{
+				mount: "/project/vendor/out",
+				roots: ["vendor/out", "packages/core/out"],
+				shape: "an absolute mount inside rootDir",
+			},
+			{
+				mount: "/external/out",
+				roots: ["packages/core/out"],
+				shape: "an absolute mount outside rootDir",
+			},
+			{
+				mount: "../outside/out",
+				roots: ["packages/core/out"],
+				shape: "a relative mount that escapes rootDir",
+			},
+			{ mount: ".", roots: ["packages/core/out"], shape: "a mount naming rootDir itself" },
+		])("should answer $roots for $shape", async ({ mount, roots }) => {
+			expect.assertions(1);
+
+			const project: RojoProject = {
+				name: "test",
+				tree: {
+					$className: "DataModel",
+					Mounted: {
+						$path: mount,
+					},
+					ReplicatedStorage: {
+						$path: "packages/core/out",
+					},
+				},
+			};
+
+			// Seeded wherever the mount lands, so each row turns on where the
+			// directory is rather than on whether it is there at all.
+			for (const directory of [
+				"/project/packages/core/out",
+				path.resolve(rojoDirectory, mount),
+			]) {
+				vol.mkdirSync(directory, { recursive: true });
+				vol.writeFileSync(`${directory}/init.luau`, "");
+			}
+
+			await setupMocksAsync();
+			const config = makeConfig();
+
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory }, config)).toStrictEqual(
+				roots,
+			);
+		});
+
+		it("should keep a mount when the rojo directory is relative", async () => {
+			expect.assertions(1);
+
+			const project: RojoProject = {
+				name: "test",
+				tree: {
+					$className: "DataModel",
+					ReplicatedStorage: { $path: "out" },
+				},
+			};
+
+			// Rooted at the invocation directory, which is what `rootDir` is in a
+			// real single-mode run.
+			vol.mkdirSync(path.join(process.cwd(), "out"), { recursive: true });
+			vol.writeFileSync(path.join(process.cwd(), "out/init.luau"), "");
+
+			await setupMocksAsync();
+			// `path.dirname("default.project.json")` is `"."`, which is what a
+			// project named relative to the cwd hands down. A mount joined onto
+			// that is relative too, and nothing relative is ever inside the
+			// absolute frame — so the project would report no roots at all and
+			// fall back to the tsconfig `outDir`.
+			const config = makeConfig({ rootDir: process.cwd() });
+
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory: "." }, config)).toStrictEqual(
+				["out"],
+			);
+		});
+
+		it("should keep a mount when rootDir is a filesystem root", async () => {
+			expect.assertions(1);
+
+			const project: RojoProject = {
+				name: "test",
+				tree: {
+					$className: "DataModel",
+					ReplicatedStorage: {
+						$path: "out",
+					},
+				},
+			};
+
+			vol.mkdirSync("/out", { recursive: true });
+			vol.writeFileSync("/out/init.luau", "");
+
+			await setupMocksAsync();
+			// The one frame that carries a trailing separator, so a containment
+			// test reading it verbatim weighs every child against `//` and keeps
+			// none. Written as the volume writes it: the frame and the rojo
+			// directory name one directory, and only a host-dependent read of
+			// "absolute" could make `/` and `C:/` meet.
+			const config = makeConfig({ rootDir: "/" });
+
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory: "/" }, config)).toStrictEqual(
+				["out"],
+			);
+		});
+
+		it("should state a subdirectory project's mount in the rootDir frame", async () => {
+			expect.assertions(1);
+
+			const project: RojoProject = {
+				name: "test",
+				tree: {
+					$className: "DataModel",
+					ReplicatedStorage: {
+						$path: "out",
+					},
+				},
+			};
+
+			vol.mkdirSync("/project/sub/out", { recursive: true });
+			vol.writeFileSync("/project/sub/out/init.luau", "");
+
+			await setupMocksAsync();
+			const config = makeConfig();
+
+			// The only layout where the two frames are different directories:
+			// rojo reads `out` against the project beside it, and the root is
+			// written from `rootDir`, so the same mount is `sub/out` there.
+			expect(
+				collectLuauRootsFromRojo({ project, rojoDirectory: "/project/sub" }, config),
+			).toStrictEqual(["sub/out"]);
+		});
+
+		it("should take one root for a $path mounted twice", async () => {
+			expect.assertions(1);
+
+			const project: RojoProject = {
+				name: "test",
+				tree: {
+					$className: "DataModel",
+					ReplicatedStorage: {
+						$path: "packages/core/out",
+					},
+					ServerScriptService: {
+						$path: "packages/core/out",
+					},
+				},
+			};
+
+			vol.mkdirSync("/project/packages/core/out", { recursive: true });
+			vol.writeFileSync("/project/packages/core/out/init.luau", "");
+
+			await setupMocksAsync();
+			const config = makeConfig();
+
+			expect(collectLuauRootsFromRojo({ project, rojoDirectory }, config)).toStrictEqual([
+				"packages/core/out",
+			]);
 		});
 	});
 });
 
-describe(discoverInstrumentableFiles, () => {
+/**
+ * Both modes take a rojo `$path` as a coverage root exactly when it lands
+ * inside their frame — see `MountFrame` for why the two frames are one thing.
+ * Each layout here answers containment one way and the narrower "is the
+ * `$path` absolute" the other, so a mode asking the narrow question fails
+ * against the mode that does not.
+ */
+describe("cross-mode $path containment", () => {
+	const packageDirectory = normalizeWindowsPath(path.resolve("/pkg"));
+	const packageProject = `${packageDirectory}/test.project.json`;
+
+	function seedPackage(mount: string): RojoProject {
+		const project: RojoProject = {
+			name: "test",
+			tree: {
+				$className: "DataModel",
+				ReplicatedStorage: {
+					$path: mount,
+				},
+			},
+		};
+
+		// The outside directory is seeded in the invocation directory's frame
+		// too. A mode that probed the cwd would find it there and keep it, so
+		// seeding both frames is what makes the escaping row fail such a mode
+		// rather than pass on a missing directory.
+		for (const directory of [
+			`${packageDirectory}/out`,
+			"/outside/out",
+			path.resolve("../outside/out"),
+		]) {
+			vol.mkdirSync(directory, { recursive: true });
+			vol.writeFileSync(`${directory}/init.luau`, "local x = 1");
+		}
+
+		vol.writeFileSync(packageProject, JSON.stringify(project));
+
+		return project;
+	}
+
+	it.for([
+		{ mount: `${packageDirectory}/out`, roots: ["out"], shape: "an absolute mount inside" },
+		{ mount: "../outside/out", roots: [], shape: "a relative mount outside" },
+	])("should answer the same for $shape the frame", async ({ mount, roots }) => {
+		expect.assertions(1);
+
+		const project = seedPackage(mount);
+		await setupMocksAsync();
+
+		const single = collectLuauRootsFromRojo(
+			{ project, rojoDirectory: packageDirectory },
+			makeConfig({ rootDir: packageDirectory }),
+		);
+		const [workspace] = prepareWorkspaceCoverage({
+			packages: [
+				{
+					name: "pkg",
+					packageDirectory,
+					rojoProjectPath: packageProject,
+				},
+			],
+			workspaceRoot: packageDirectory,
+		});
+
+		// One assertion, so a failure prints both answers: what is under test
+		// is that they agree, not what either one says on its own.
+		expect({
+			single,
+			workspace: workspace!.coverageRoots.map((root) => root.luauRoot),
+		}).toStrictEqual({ single: roots, workspace: roots.map(toPosixRoot) });
+	});
+});
+
+describe(discoverRootFiles, () => {
 	function setup() {
 		onTestFinished(() => {
 			vol.reset();
 		});
 	}
 
-	it("should discover .luau files", () => {
+	it("should discover .luau files", async () => {
 		expect.assertions(1);
 
 		setup();
@@ -2303,12 +3509,61 @@ describe(discoverInstrumentableFiles, () => {
 		vol.writeFileSync("out/init.luau", "");
 		vol.writeFileSync("out/shared/player.luau", "");
 
-		const result = discoverInstrumentableFiles("out");
+		const result = discoverRootFiles(toPosixRoot("out")).instrumentable;
 
 		expect(result).toStrictEqual(new Set(["init.luau", "shared/player.luau"]));
 	});
 
-	it("should exclude spec, test, and snap files", () => {
+	// A root reaches the walk however the config spelled it, and every spelling
+	// here names the same directory. A walk that states each file by slicing
+	// the root's own length off the front offsets every name instead, which
+	// surfaces far from the config as an ENOENT on a file that never existed.
+	it.for(["out/../out", "out/.", "out//", "out/./"])(
+		"should name walked files the same for a root spelled %s",
+		async (luauRoot) => {
+			expect.assertions(1);
+
+			setup();
+			vol.mkdirSync("out/shared", { recursive: true });
+			vol.writeFileSync("out/init.luau", "");
+			vol.writeFileSync("out/shared/player.luau", "");
+
+			const result = discoverRootFiles(toPosixRoot(luauRoot)).instrumentable;
+
+			expect(result).toStrictEqual(new Set(["init.luau", "shared/player.luau"]));
+		},
+	);
+
+	// A file-system root is the one root that already ends in a separator, so
+	// a walk that writes its own doubles it. Reachable in workspace mode,
+	// where roots are absolute and no check refuses this one.
+	it("should walk a file-system root without doubling the separator", async () => {
+		expect.assertions(1);
+
+		setup();
+		vol.mkdirSync("/shared", { recursive: true });
+		vol.writeFileSync("/init.luau", "");
+		vol.writeFileSync("/shared/player.luau", "");
+
+		const result = discoverRootFiles(toPosixRoot("/")).instrumentable;
+
+		expect(result).toStrictEqual(new Set(["init.luau", "shared/player.luau"]));
+	});
+
+	it("should name walked files relative to a root spelled as the current directory", async () => {
+		expect.assertions(1);
+
+		setup();
+		vol.mkdirSync("shared", { recursive: true });
+		vol.writeFileSync("init.luau", "");
+		vol.writeFileSync("shared/player.luau", "");
+
+		const result = discoverRootFiles(toPosixRoot(".")).instrumentable;
+
+		expect(result).toStrictEqual(new Set(["init.luau", "shared/player.luau"]));
+	});
+
+	it("should exclude spec, test, and snap files", async () => {
 		expect.assertions(1);
 
 		setup();
@@ -2321,12 +3576,12 @@ describe(discoverInstrumentableFiles, () => {
 		vol.writeFileSync("out/init.test.lua", "");
 		vol.writeFileSync("out/init.snap.lua", "");
 
-		const result = discoverInstrumentableFiles("out");
+		const result = discoverRootFiles(toPosixRoot("out")).instrumentable;
 
 		expect(result).toStrictEqual(new Set(["init.luau"]));
 	});
 
-	it("should skip node_modules and dot directories", () => {
+	it("should skip node_modules and dot directories", async () => {
 		expect.assertions(1);
 
 		setup();
@@ -2337,31 +3592,557 @@ describe(discoverInstrumentableFiles, () => {
 		vol.writeFileSync("out/.hidden/secret.luau", "");
 		vol.writeFileSync("out/.jest-roblox/coverage/cached.luau", "");
 
-		const result = discoverInstrumentableFiles("out");
+		const result = discoverRootFiles(toPosixRoot("out")).instrumentable;
 
 		expect(result).toStrictEqual(new Set());
 	});
 
-	it("should include .lua files", () => {
+	it("should include .lua files", async () => {
 		expect.assertions(1);
 
 		setup();
 		vol.mkdirSync("out", { recursive: true });
 		vol.writeFileSync("out/init.lua", "");
 
-		const result = discoverInstrumentableFiles("out");
+		const result = discoverRootFiles(toPosixRoot("out")).instrumentable;
 
 		expect(result).toStrictEqual(new Set(["init.lua"]));
 	});
 
-	it("should return empty set for empty directory", () => {
+	it("should return empty set for empty directory", async () => {
 		expect.assertions(1);
 
 		setup();
 		vol.mkdirSync("out", { recursive: true });
 
-		const result = discoverInstrumentableFiles("out");
+		const result = discoverRootFiles(toPosixRoot("out")).instrumentable;
 
 		expect(result).toStrictEqual(new Set());
+	});
+
+	it("should treat every prod file as instrumentable without a universe", async () => {
+		expect.assertions(1);
+
+		setup();
+		vol.mkdirSync("out", { recursive: true });
+		vol.writeFileSync("out/player.luau", "");
+
+		expect(discoverRootFiles(toPosixRoot("out")).excluded).toStrictEqual(new Set());
+	});
+
+	it("should leave a copy-ignored prod file out of both sets", async () => {
+		expect.assertions(2);
+
+		setup();
+		vol.mkdirSync("out/vendor", { recursive: true });
+		vol.writeFileSync("out/player.luau", "");
+		vol.writeFileSync("out/vendor/dep.luau", "");
+
+		// Neither probed nor mirrored: the instrumenter reads this same split,
+		// so a path missing here is a path nothing writes into the shadow.
+		const result = discoverRootFiles(toPosixRoot("out"), {
+			isCopyIgnored: createCopyIgnoreMatcher(["**/vendor/**", "vendor"]),
+		});
+
+		expect(result.instrumentable).toStrictEqual(new Set(["player.luau"]));
+		expect(result.excluded).toStrictEqual(new Set());
+	});
+
+	it("should split prod files by the coverage universe", async () => {
+		expect.assertions(2);
+
+		setup();
+		vol.mkdirSync("out/ecs", { recursive: true });
+		vol.mkdirSync("out/ui", { recursive: true });
+		vol.writeFileSync("out/ecs/move.luau", "");
+		vol.writeFileSync("out/ui/button.luau", "");
+
+		const universe = createInstrumentUniverse({ include: ["out/ecs/**/*.luau"] });
+		const result = discoverRootFiles(toPosixRoot("out"), { universe });
+
+		expect(result.instrumentable).toStrictEqual(new Set(["ecs/move.luau"]));
+		expect(result.excluded).toStrictEqual(new Set(["ui/button.luau"]));
+	});
+
+	// The universe names files as `path.join` writes them, which for the
+	// current directory is the bare name. A root that pastes its own `.` on
+	// the front asks about a file the universe has never heard of, so every
+	// probe silently demotes to a mirrored copy and the run reports no
+	// coverage at all.
+	it("should split prod files by the universe under a current-directory root", async () => {
+		expect.assertions(2);
+
+		setup();
+		vol.mkdirSync("ecs", { recursive: true });
+		vol.mkdirSync("ui", { recursive: true });
+		vol.writeFileSync("ecs/move.luau", "");
+		vol.writeFileSync("ui/button.luau", "");
+
+		const universe = createInstrumentUniverse({ include: ["ecs/**/*.luau"] });
+		const result = discoverRootFiles(toPosixRoot("."), { universe });
+
+		expect(result.instrumentable).toStrictEqual(new Set(["ecs/move.luau"]));
+		expect(result.excluded).toStrictEqual(new Set(["ui/button.luau"]));
+	});
+});
+
+describe(toCoverageArtifacts, () => {
+	it("should project a prepare result and the caller's projects onto one record", async () => {
+		expect.assertions(1);
+
+		const result: PrepareCoverageResult = {
+			buildId: "build-7",
+			coveragePlace: { hash: "cov-hash", path: ".jest-roblox/coverage/game.rbxl" },
+			files: { "out/init.luau": { sourceHash: "h" } },
+			instrumentMs: 0,
+			manifest: fromAny({ generatedAt: "2026-07-25T00:00:00.000Z" }),
+			placeFile: ".jest-roblox/coverage/game.rbxl",
+			rebuilt: true,
+			stagingMs: 0,
+		};
+		const projects: Array<BuildManifestProject> = [
+			{
+				displayName: "client",
+				projectDataModelPath: "ReplicatedStorage/client",
+				setupFiles: [],
+				setupFilesAfterEnv: [],
+				testMatch: ["**/*.spec"],
+			},
+		];
+
+		expect(toCoverageArtifacts(result, projects)).toStrictEqual({
+			buildId: "build-7",
+			coveragePlace: { hash: "cov-hash", path: ".jest-roblox/coverage/game.rbxl" },
+			files: { "out/init.luau": { sourceHash: "h" } },
+			generatedAt: "2026-07-25T00:00:00.000Z",
+			projects,
+			rebuilt: true,
+		});
+	});
+});
+
+describe("narrowing to the coverage universe", () => {
+	/**
+	 * A mount whose probes all sit in one subtree, with unprobed siblings
+	 * either side and a loose file the mount itself owns.
+	 */
+	function seedNarrowableRoot(): void {
+		// Rooted at the invocation directory, which is what `rootDir` is in a
+		// real single-mode run: the mount the demote rewrites has to resolve to
+		// the same directory the shadow walk reads.
+		vol.mkdirSync(process.cwd(), { recursive: true });
+		vol.writeFileSync(
+			"default.project.json",
+			JSON.stringify({
+				name: "test",
+				tree: { $className: "DataModel", ReplicatedStorage: { $path: "out" } },
+			}),
+		);
+		vol.mkdirSync("out/modules/ecs", { recursive: true });
+		vol.mkdirSync("out/client", { recursive: true });
+		vol.writeFileSync("out/modules/ecs/world.luau", "local x = 1");
+		vol.writeFileSync("out/modules/net.luau", "local x = 2");
+		vol.writeFileSync("out/client/button.luau", "local x = 3");
+		vol.writeFileSync("out/loose.luau", "local x = 4");
+	}
+
+	it("should mirror only the subtrees the universe resolves to", async () => {
+		expect.assertions(3);
+
+		seedNarrowableRoot();
+		// Asserted through a file the mirror owns: the instrumenter is mocked
+		// here, and no pass copies a root wholesale, so a probed `.luau` has
+		// nothing writing it into the shadow.
+		vol.writeFileSync("out/modules/ecs/world.spec.luau", "-- spec");
+		await setupMocksAsync();
+		const config = makeConfig({
+			collectCoverageFrom: ["**/ecs/**"],
+			luauRoots: ["out"],
+			rootDir: process.cwd(),
+		});
+
+		await prepareCoverageAsync(config);
+
+		expect(vol.existsSync(".jest-roblox/coverage/out/modules/ecs/world.spec.luau")).toBeTrue();
+		expect(vol.existsSync(".jest-roblox/coverage/out/client/button.luau")).toBeFalse();
+		expect(vol.existsSync(".jest-roblox/coverage/out/modules/net.luau")).toBeFalse();
+	});
+
+	it("should carry each demoted level's loose files onto the spine", async () => {
+		expect.assertions(2);
+
+		seedNarrowableRoot();
+		await setupMocksAsync();
+		const config = makeConfig({
+			collectCoverageFrom: ["**/ecs/**"],
+			luauRoots: ["out"],
+			rootDir: process.cwd(),
+		});
+
+		await prepareCoverageAsync(config);
+
+		expect(vol.existsSync(".jest-roblox/coverage/.spine/out/.self/loose.luau")).toBeTrue();
+		expect(
+			vol.existsSync(".jest-roblox/coverage/.spine/out/modules/.self/net.luau"),
+		).toBeTrue();
+	});
+
+	it("should refill a spine leaf a warm run recorded elsewhere", async () => {
+		expect.assertions(2);
+
+		seedNarrowableRoot();
+		const { buildWithRojoAsync } = await setupMocksAsync();
+		const config = makeConfig({
+			collectCoverageFrom: ["**/ecs/**"],
+			luauRoots: ["out"],
+			rootDir: process.cwd(),
+		});
+
+		await prepareCoverageAsync(config);
+		// Rewind the shadow to the shape the nested-spine layout left: each
+		// level's files directly under its mirror, and a manifest recording
+		// them there.
+		const mirrored = [
+			{ name: "loose.luau", level: "out" },
+			{ name: "net.luau", level: "out/modules" },
+		];
+		for (const { name, level } of mirrored) {
+			const leaf = `.jest-roblox/coverage/.spine/${level}/.self`;
+			vol.renameSync(`${leaf}/${name}`, `.jest-roblox/coverage/.spine/${level}/${name}`);
+			vol.rmdirSync(leaf);
+		}
+
+		const manifestPath = ".jest-roblox/coverage/coverage-manifest.json";
+		vol.writeFileSync(
+			manifestPath,
+			String(vol.readFileSync(manifestPath)).replaceAll("/.self/", "/"),
+		);
+
+		await prepareCoverageAsync(config);
+
+		// Carrying those records forward would leave every mounted leaf empty,
+		// so the place would build each demoted level without its own files —
+		// and, seeing no change, hand back the place that already had.
+		expect(vol.existsSync(".jest-roblox/coverage/.spine/out/.self/loose.luau")).toBeTrue();
+		expect(buildWithRojoAsync).toHaveBeenCalledTimes(2);
+	});
+
+	it("should record the narrowed roots in the manifest", async () => {
+		expect.assertions(1);
+
+		seedNarrowableRoot();
+		await setupMocksAsync();
+		const config = makeConfig({
+			collectCoverageFrom: ["**/ecs/**"],
+			luauRoots: ["out"],
+			rootDir: process.cwd(),
+		});
+
+		const result = await prepareCoverageAsync(config);
+
+		expect(result.manifest.luauRoots).toStrictEqual(["out/modules/ecs"]);
+	});
+
+	it("should leave a mount the universe never reaches out of the shadow", async () => {
+		expect.assertions(2);
+
+		seedNarrowableRoot();
+		await setupMocksAsync();
+		const config = makeConfig({
+			collectCoverageFrom: ["**/nothing-here/**"],
+			luauRoots: ["out"],
+			rootDir: process.cwd(),
+		});
+
+		const result = await prepareCoverageAsync(config);
+
+		expect(result.manifest.luauRoots).toStrictEqual([]);
+		expect(vol.existsSync(".jest-roblox/coverage/out")).toBeFalse();
+	});
+
+	it("should hand the bake the spine copy for a demoted directory", async () => {
+		expect.assertions(2);
+
+		seedNarrowableRoot();
+		await setupMocksAsync();
+		const config = makeConfig({
+			collectCoverageFrom: ["**/ecs/**"],
+			luauRoots: ["out"],
+			rootDir: process.cwd(),
+		});
+		const layouts: Array<ShadowLayout> = [];
+
+		await prepareCoverageAsync(config, {
+			bake: makeBake((layout) => {
+				layouts.push(layout);
+				return false;
+			}),
+		});
+
+		// The place mounts the spine in `out`'s place, so anything baked into
+		// the mirror would never reach it.
+		expect(layouts[0]!.mountedDirectory("out")).toBe(".jest-roblox/coverage/.spine/out/.self");
+		expect(layouts[0]!.mountedDirectory("out/modules/ecs")).toBe(
+			".jest-roblox/coverage/out/modules/ecs",
+		);
+	});
+});
+
+describe("when hashing the rojo build inputs", () => {
+	it("should not re-read an unchanged mount on the next run", async () => {
+		expect.assertions(1);
+
+		seedFilesystem();
+		vol.mkdirSync("/project/assets", { recursive: true });
+		writeAgedFile("/project/assets/model.txt", "one");
+		vol.writeFileSync(
+			"/project/default.project.json",
+			JSON.stringify({
+				name: "test",
+				tree: { $className: "DataModel", Assets: { $path: "assets" } },
+			}),
+		);
+		await setupMocksAsync();
+		const config = makeConfig({ luauRoots: ["out-tsc/test"] });
+		await prepareCoverageAsync(config);
+
+		const readFile = vi.spyOn(nodeFs.promises, "readFile");
+		await prepareCoverageAsync(config);
+
+		expect(readFile).not.toHaveBeenCalledWith("/project/assets/model.txt");
+	});
+});
+
+describe("when a run bakes generated jest.config stubs into the shadow", () => {
+	/** One rojo mount per project, by the directory each one covers. */
+	const mounts = {
+		server: "game.ServerScriptService",
+		shared: "game.ReplicatedStorage",
+	};
+
+	/** Two rojo mounts under one coverage root, neither with a user config. */
+	function seedMultiMountRoot(): void {
+		// Rooted at the invocation directory, which is what `rootDir` is in a
+		// real single-mode run: the mounts the stubs are keyed on have to
+		// resolve to the same directories the shadow walk reads.
+		vol.mkdirSync(process.cwd(), { recursive: true });
+		vol.writeFileSync(
+			"default.project.json",
+			JSON.stringify({
+				name: "test",
+				tree: {
+					$className: "DataModel",
+					ReplicatedStorage: { $path: "out/shared" },
+					ServerScriptService: { $path: "out/server" },
+				},
+			}),
+		);
+
+		for (const name of Object.keys(mounts)) {
+			vol.mkdirSync(`out/${name}`, { recursive: true });
+			vol.writeFileSync(`out/${name}/init.luau`, `local ${name} = 1`);
+		}
+	}
+
+	function makeStubProjects(
+		config: ResolvedConfig,
+		byName: Record<string, string>,
+	): Array<ResolvedProjectConfig> {
+		return Object.entries(byName).map(([name, dataModelPath]) => {
+			return fromAny({
+				config,
+				displayName: name,
+				include: [`out/${name}/**/*.spec.luau`],
+				projects: [dataModelPath],
+				rojoMounts: [{ dataModelPath, fsPath: `out/${name}` }],
+				testMatch: ["**/*.spec"],
+			});
+		});
+	}
+
+	/**
+	 * The config and the bake `stageRun` pairs it with — through the same
+	 * factory the run path uses, so the spec cannot exercise a bake shape
+	 * production no longer builds. `extraMounts` names mounts the seeded tree
+	 * holds no source directory for.
+	 */
+	function stageBake(extraMounts: Record<string, string> = {}): {
+		bake: ShadowBake;
+		config: ResolvedConfig;
+	} {
+		const config = makeConfig({ luauRoots: ["out"], rootDir: process.cwd() });
+		const projects = makeStubProjects(config, { ...mounts, ...extraMounts });
+		const cacheRoot = path.resolve(".jest-roblox/cache");
+		generateProjectStubs(projects, process.cwd(), cacheRoot);
+
+		return { bake: createStubBake(projects, cacheRoot), config };
+	}
+
+	const sharedStub = ".jest-roblox/coverage/out/shared/jest.config.luau";
+	const absentStub = ".jest-roblox/coverage/out/absent/jest.config.luau";
+
+	/**
+	 * A `rmSync` that refuses one path and passes everything else through, for
+	 * the entry a real shadow loses to a lock or a permission.
+	 */
+	function refuseRemovalOf(suffix: string): typeof nodeFs.rmSync {
+		return fromAny((target: string, options: object) => {
+			if (normalizeWindowsPath(target).endsWith(suffix)) {
+				throw new Error("EBUSY");
+			}
+
+			vol.rmSync(target, options);
+		});
+	}
+
+	it("should reuse the place on a no-change rerun", async () => {
+		expect.assertions(3);
+
+		seedMultiMountRoot();
+		const { buildWithRojoAsync } = await setupMocksAsync();
+		const { bake, config } = stageBake();
+
+		const first = await prepareCoverageAsync(config, { bake });
+		const second = await prepareCoverageAsync(config, { bake });
+
+		expect(second.rebuilt).toBeFalse();
+		expect(buildWithRojoAsync).toHaveBeenCalledOnce();
+		// A buildId that moves on an unchanged rerun is what the mutation
+		// tester reads as a fresh place, so reuse is only half the contract.
+		expect(second.buildId).toBe(first.buildId);
+	});
+
+	it("should reuse the place when a baked mount has no source directory", async () => {
+		expect.assertions(3);
+
+		seedMultiMountRoot();
+		const { buildWithRojoAsync } = await setupMocksAsync();
+		const { bake, config } = stageBake({ absent: "game.Workspace" });
+
+		const first = await prepareCoverageAsync(config, { bake });
+		const second = await prepareCoverageAsync(config, { bake });
+
+		// Nothing but the bake creates `out/absent` in the shadow, so the
+		// orphan sweep meets a directory with no source twin. Clearing it
+		// wholesale takes the stub under it too, and the bake writes both back
+		// the same run — the churn a stub the sweep spares does not have.
+		expect(second.rebuilt).toBeFalse();
+		expect(second.buildId).toBe(first.buildId);
+		expect(buildWithRojoAsync).toHaveBeenCalledOnce();
+	});
+
+	it("should clear an orphan mount directory of all but the baked stub", async () => {
+		expect.assertions(4);
+
+		seedMultiMountRoot();
+		await setupMocksAsync();
+		const { bake, config } = stageBake({ absent: "game.Workspace" });
+		await prepareCoverageAsync(config, { bake });
+
+		// What an earlier run left in the mount the bake creates: a loose file
+		// beside the stub and a directory under it, neither with a source twin
+		// and neither the bake's.
+		vol.mkdirSync(".jest-roblox/coverage/out/absent/stale", { recursive: true });
+		vol.writeFileSync(".jest-roblox/coverage/out/absent/stale/old.luau", "local old = 1");
+		vol.writeFileSync(".jest-roblox/coverage/out/absent/loose.luau", "local loose = 1");
+		const second = await prepareCoverageAsync(config, { bake });
+
+		// Sparing what the bake owns must not spare what sits beside it: a
+		// stale file rojo would still mount is what the sweep exists for, and
+		// the place has to be rebuilt around its absence.
+		expect(vol.existsSync(absentStub)).toBeTrue();
+		expect(vol.existsSync(".jest-roblox/coverage/out/absent/loose.luau")).toBeFalse();
+		expect(vol.existsSync(".jest-roblox/coverage/out/absent/stale")).toBeFalse();
+		expect(second.rebuilt).toBeTrue();
+	});
+
+	it("should rebuild when an empty leftover directory was all there was to sweep", async () => {
+		expect.assertions(3);
+
+		seedMultiMountRoot();
+		await setupMocksAsync();
+		const { bake, config } = stageBake({ absent: "game.Workspace" });
+		await prepareCoverageAsync(config, { bake });
+
+		// Rojo mounts an empty directory as a Folder, so one left in the shadow
+		// is a node in the place — a change the run has to report even though
+		// no file went with it.
+		vol.mkdirSync(".jest-roblox/coverage/out/absent/hollow", { recursive: true });
+		const second = await prepareCoverageAsync(config, { bake });
+
+		expect(second.rebuilt).toBeTrue();
+		expect(vol.existsSync(".jest-roblox/coverage/out/absent/hollow")).toBeFalse();
+		expect(vol.existsSync(absentStub)).toBeTrue();
+	});
+
+	it("should report no rebuild when a leftover directory cannot be removed", async () => {
+		expect.assertions(2);
+
+		seedMultiMountRoot();
+		await setupMocksAsync();
+		const { bake, config } = stageBake({ absent: "game.Workspace" });
+		await prepareCoverageAsync(config, { bake });
+
+		const hollow = ".jest-roblox/coverage/out/absent/hollow";
+		vol.mkdirSync(hollow, { recursive: true });
+		vi.spyOn(nodeFs, "rmSync").mockImplementation(refuseRemovalOf("out/absent/hollow"));
+		const second = await prepareCoverageAsync(config, { bake });
+
+		// An entry that survives the sweep is still in the place the last build
+		// produced, so reporting it gone would rebuild over a lie.
+		expect(second.rebuilt).toBeFalse();
+		expect(vol.existsSync(hollow)).toBeTrue();
+	});
+
+	it("should keep a baked stub nested under an orphan directory", async () => {
+		expect.assertions(3);
+
+		seedMultiMountRoot();
+		const { buildWithRojoAsync } = await setupMocksAsync();
+		// The mount is `out/absent/deep`, so the bake creates two directories
+		// with no source twin and owns something under only the deeper one.
+		const { bake, config } = stageBake({ "absent/deep": "game.Workspace" });
+
+		await prepareCoverageAsync(config, { bake });
+		const second = await prepareCoverageAsync(config, { bake });
+
+		expect(second.rebuilt).toBeFalse();
+		expect(buildWithRojoAsync).toHaveBeenCalledOnce();
+		expect(vol.existsSync(".jest-roblox/coverage/out/absent/deep/jest.config.luau")).toBeTrue();
+	});
+
+	it("should sweep an orphan mount directory on a rerun that does not bake", async () => {
+		expect.assertions(2);
+
+		seedMultiMountRoot();
+		await setupMocksAsync();
+		const { bake, config } = stageBake({ absent: "game.Workspace" });
+
+		await prepareCoverageAsync(config, { bake });
+		const hasBaked = vol.existsSync(absentStub);
+		await prepareCoverageAsync(config);
+
+		// The directory is as stale as the stub in it once nothing bakes, so
+		// sparing owned files must not spare the ones nothing owns.
+		expect(hasBaked).toBeTrue();
+		expect(vol.existsSync(".jest-roblox/coverage/out/absent")).toBeFalse();
+	});
+
+	it("should sweep the stubs on a rerun that does not bake", async () => {
+		expect.assertions(2);
+
+		seedMultiMountRoot();
+		await setupMocksAsync();
+		const { bake, config } = stageBake();
+
+		await prepareCoverageAsync(config, { bake });
+		const hasBaked = vol.existsSync(sharedStub);
+		await prepareCoverageAsync(config);
+
+		// studio-cli's plugin materializes `jest.config` at runtime, so a stub
+		// an earlier coverage run baked into the shared shadow would collide
+		// with it.
+		expect(hasBaked).toBeTrue();
+		expect(vol.existsSync(sharedStub)).toBeFalse();
 	});
 });

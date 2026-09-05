@@ -1,169 +1,103 @@
-import type { AstStatBlock } from "@isentinel/luau-ast";
-
-import * as cp from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
-import parseAstLuauSource from "../luau/parse-ast.luau";
+import { luauParser } from "../luau/parser.ts";
 import { NOOP_TIMING_COLLECTOR, type TimingCollector } from "../timing/orchestration-collector.ts";
 import { hashBuffer } from "../utils/hash.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import type { PosixRoot } from "../utils/normalize-windows-path.ts";
+import { normalizeWindowsPath, underRoot } from "../utils/normalize-windows-path.ts";
+import type { CollectorResult } from "./coverage-collector.ts";
 import { collectCoverage } from "./coverage-collector.ts";
 import { buildCoverageMap } from "./coverage-map-builder.ts";
 import { writeCoverageMap } from "./coverage-map.ts";
+import type { CopyIgnoreMatcher } from "./discover-files.ts";
+import { discoverRootFiles } from "./discover-files.ts";
 import type { CoverageManifest, InstrumentedFileRecord } from "./manifest.ts";
 import { MANIFEST_VERSION, writeManifest } from "./manifest.ts";
 import { insertProbes } from "./probe-inserter.ts";
+import { clearDirectoryAtFilePath, createShadowDirectory } from "./shadow-entry.ts";
 
-export const INSTRUMENTER_VERSION = 2;
+export const INSTRUMENTER_VERSION = 5;
 
 const LUAU_EXTENSION = /\.luau?$/;
 
-// Temp directory is never explicitly cleaned up (OS handles it).
-// Tests use the parseScript override to bypass this cache entirely.
-let cachedTemporaryDirectory: string | undefined;
-
 export interface InstrumentRootOptions {
-	/** Override the AST output directory (for testing). */
-	astOutputDirectory?: string;
-	luauRoot: string;
-	/** Override the path to parse-ast.luau (for testing). */
-	parseScript?: string;
+	/**
+	 * Paths the shadow never carries, relative to `luauRoot`. Asked here as
+	 * well as at the copy so an ignored module is never probed into existence
+	 * behind the copy's back — the standalone `instrument` subcommand, which
+	 * builds no shadow to keep in step, leaves it out.
+	 */
+	isCopyIgnored?: CopyIgnoreMatcher | undefined;
+	luauRoot: PosixRoot;
 	shadowDir: string;
-	/** Relative paths to skip (already instrumented / unchanged). */
-	skipFiles?: Set<string>;
-	/** Orchestration profiler; records `parse-ast` / `probe-insert` / `map-build`. */
-	timing?: TimingCollector;
+	/**
+	 * Relative paths the instrumenter must not parse — unchanged files whose
+	 * records the caller carries forward, plus files outside the coverage
+	 * universe. Both reach the same skip list because a file never parsed is a
+	 * file never paid for, and parsing dominates this pass. Telling them apart
+	 * is the caller's job: only the first kind has a record worth keeping.
+	 */
+	skipFiles?: Set<string> | undefined;
+	/**
+	 * Orchestration profiler. Every step of the per-file pass gets a span, not
+	 * just the interesting ones: the enclosing phase reports what its children
+	 * left unaccounted for, so a step left unnamed here shows up only as an
+	 * `(unmeasured)` remainder with nothing to point at.
+	 */
+	timing?: TimingCollector | undefined;
 }
 
 export interface InstrumentOptions extends InstrumentRootOptions {
 	manifestPath: string;
 }
 
+/** Where a twin's path is rooted, and which levels of it are already judged. */
+interface ShadowPathContext {
+	/**
+	 * Shadow directories this pass has already judged, so only the first file
+	 * under one pays for it. Scoped to one `instrumentRoot` call — one
+	 * `shadowDir` — so it cannot outlive the tree it describes.
+	 */
+	createdDirectories: Set<string>;
+	shadowDir: string;
+}
+
+/** Everything the per-file instrumentation pass captures from its root. */
+interface InstrumentFileContext extends ShadowPathContext {
+	/** The first half of every file key. */
+	luauRoot: PosixRoot;
+	timing: TimingCollector;
+}
+
 /**
  * Instrument a single luauRoot directory. Returns the files map without
  * writing a manifest — used by `prepareCoverage()` to merge multiple roots.
  */
-export function instrumentRoot(
-	options: InstrumentRootOptions,
-): Record<string, InstrumentedFileRecord> {
-	const {
-		astOutputDirectory: astOutputDirectoryOption,
-		luauRoot,
-		parseScript,
-		shadowDir,
-		skipFiles,
-	} = options;
+export function instrumentRoot(options: InstrumentRootOptions): CoverageManifest["files"] {
+	const { isCopyIgnored, luauRoot, shadowDir, skipFiles } = options;
 	const timing = options.timing ?? NOOP_TIMING_COLLECTOR;
 
-	const needsTemporaryDirectory =
-		parseScript === undefined || astOutputDirectoryOption === undefined;
-	const lazyTemporaryDirectory = needsTemporaryDirectory ? getTemporaryDirectory() : "";
-	const scriptPath = parseScript ?? path.join(lazyTemporaryDirectory, "parse-ast.luau");
-	const astOutputDirectory =
-		astOutputDirectoryOption ?? path.join(lazyTemporaryDirectory, "asts");
+	const fileList = timing.profile("discover-files", () => {
+		return [...discoverRootFiles(luauRoot, { isCopyIgnored }).instrumentable];
+	});
 
-	if (parseScript === undefined) {
-		fs.writeFileSync(scriptPath, parseAstLuauSource);
-	}
-
-	fs.mkdirSync(astOutputDirectory, { recursive: true });
-
-	// Write skip list so lute can skip parsing unchanged files
-	const luteArgs = ["run", scriptPath, "--", path.resolve(luauRoot), astOutputDirectory];
-	if (skipFiles !== undefined && skipFiles.size > 0) {
-		const skipListPath = normalizeWindowsPath(path.join(astOutputDirectory, "skip-list.json"));
-		fs.writeFileSync(skipListPath, JSON.stringify([...skipFiles]));
-		luteArgs.push(skipListPath);
-	}
-
-	// Single lute call: discovers files, parses + strips ASTs, writes per-file
-	// JSON. Skipped files are still included in the file list.
-	let fileListJson: string;
-	try {
-		fileListJson = timing.profile("parse-ast", () => {
-			return cp.execFileSync("lute", luteArgs, {
-				encoding: "utf-8",
-				// File list only (paths, not ASTs) — 1MB is plenty
-				maxBuffer: 1024 * 1024,
-				windowsHide: true,
-			});
-		});
-	} catch (err) {
-		if (err instanceof Error && "code" in err && err.code === "ENOENT") {
-			throw new Error("lute is required for instrumentation but was not found on PATH");
-		}
-
-		throw new Error("Failed to parse Luau files", { cause: err });
-	}
-
-	let parsed: JSONValue;
-	try {
-		parsed = JSON.parse(fileListJson);
-	} catch (err) {
-		throw new Error("Failed to parse file list from lute", { cause: err });
-	}
-
-	if (!isStringArray(parsed)) {
-		throw new Error("Expected file list array from lute");
-	}
-
-	const fileList: Array<string> = parsed;
-
-	const files: Record<string, InstrumentedFileRecord> = {};
-	const posixLuauRoot = normalizeWindowsPath(luauRoot);
+	const files: CoverageManifest["files"] = {};
+	const context: InstrumentFileContext = {
+		createdDirectories: new Set<string>(),
+		luauRoot,
+		shadowDir,
+		timing,
+	};
 
 	for (const relativePath of fileList) {
-		if (shouldSkipFile(relativePath, skipFiles)) {
+		if (skipFiles?.has(relativePath) === true) {
 			continue;
 		}
 
-		const astJsonPath = path.join(astOutputDirectory, `${relativePath}.json`);
-		let astJson: string;
-		try {
-			astJson = fs.readFileSync(astJsonPath, "utf-8");
-		} catch (err) {
-			throw new Error(`Failed to read AST for ${relativePath}`, { cause: err });
-		}
-
-		const ast = JSON.parse(astJson) as unknown as AstStatBlock;
-
-		const fileKey = normalizeWindowsPath(path.join(posixLuauRoot, relativePath));
-		const originalLuauPath = fileKey;
-		const instrumentedLuauPath = normalizeWindowsPath(path.join(shadowDir, relativePath));
-		const coverageMapOutputPath = path.join(
-			shadowDir,
-			relativePath.replace(LUAU_EXTENSION, ".cov-map.json"),
-		);
-		const sourceMapPath = `${originalLuauPath}.map`;
-
-		const outputDirectory = path.dirname(path.join(shadowDir, relativePath));
-		fs.mkdirSync(outputDirectory, { recursive: true });
-
-		const sourceBuffer = fs.readFileSync(path.resolve(originalLuauPath));
-		const source = sourceBuffer.toString("utf-8");
-		const collectorResult = collectCoverage(ast);
-		const instrumentedSource = timing.profile("probe-insert", () => {
-			return insertProbes(source, collectorResult, fileKey);
-		});
-		const coverageMap = timing.profile("map-build", () => buildCoverageMap(collectorResult));
-
-		fs.writeFileSync(path.join(shadowDir, relativePath), instrumentedSource);
-		writeCoverageMap(coverageMapOutputPath, coverageMap);
-
-		files[fileKey] = {
-			key: fileKey,
-			branchCount: collectorResult.branches.length,
-			coverageMapPath: normalizeWindowsPath(coverageMapOutputPath),
-			functionCount: collectorResult.functions.length,
-			instrumentedLuauPath,
-			originalLuauPath,
-			sourceHash: hashBuffer(sourceBuffer),
-			sourceMapPath,
-			statementCount: collectorResult.statements.length,
-		};
+		const record = instrumentFile(relativePath, context);
+		files[record.key] = record;
 	}
 
 	return files;
@@ -177,7 +111,6 @@ export function instrument(options: InstrumentOptions): CoverageManifest {
 	const { luauRoot, manifestPath, shadowDir } = options;
 
 	const files = instrumentRoot(options);
-	const posixLuauRoot = normalizeWindowsPath(luauRoot);
 
 	const generatedAtDate = new Date();
 	const manifest: CoverageManifest = {
@@ -185,7 +118,7 @@ export function instrument(options: InstrumentOptions): CoverageManifest {
 		files,
 		generatedAt: generatedAtDate.toISOString(),
 		instrumenterVersion: INSTRUMENTER_VERSION,
-		luauRoots: [posixLuauRoot],
+		luauRoots: [luauRoot],
 		nonInstrumentedFiles: {},
 		shadowDir: normalizeWindowsPath(shadowDir),
 		version: MANIFEST_VERSION,
@@ -196,23 +129,130 @@ export function instrument(options: InstrumentOptions): CoverageManifest {
 	return manifest;
 }
 
-function isStringArray(value: JSONValue): value is Array<string> {
-	return Array.isArray(value) && value.every((entry) => typeof entry === "string");
-}
-
-function shouldSkipFile(relativePath: string, skipFiles: Set<string> | undefined): boolean {
-	if (relativePath.endsWith(".snap.luau") || relativePath.endsWith(".snap.lua")) {
-		return true;
+/** Parse one file and collect its coverage sites, or fail naming the file. */
+function collectFileCoverage({
+	relativePath,
+	source,
+	timing,
+}: {
+	relativePath: string;
+	source: string;
+	timing: TimingCollector;
+}): CollectorResult {
+	const parsed = timing.profile("parse-ast", () => luauParser.parse(source));
+	if (!parsed.ok) {
+		throw new Error(`Failed to parse ${relativePath}: ${parsed.errors.join("; ")}`);
 	}
 
-	return skipFiles?.has(relativePath) === true;
+	return timing.profile("collect-coverage", () => collectCoverage(parsed.root, source));
 }
 
-function getTemporaryDirectory(): string {
-	if (cachedTemporaryDirectory !== undefined && fs.existsSync(cachedTemporaryDirectory)) {
-		return cachedTemporaryDirectory;
+/**
+ * `createShadowDirectory` one shadow directory unless this pass already judged
+ * it. The cache holds every level it is given, so each directory costs one
+ * `stat` per run rather than one per file written under it.
+ */
+function ensureShadowDirectory(directory: string, createdDirectories: Set<string>): void {
+	if (createdDirectories.has(directory)) {
+		return;
 	}
 
-	cachedTemporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "jest-roblox-instrument-"));
-	return cachedTemporaryDirectory;
+	createShadowDirectory(directory);
+	createdDirectories.add(directory);
+}
+
+/**
+ * Ready the path one instrumented twin is written to.
+ *
+ * The chain is walked a level at a time rather than made by one recursive
+ * `mkdirSync`, because a stale file on any level blocks the whole make and the
+ * recursive call cannot be trusted to say so. The instrumenter is the pass that
+ * has to survive that: `prepareShadowRoot` instruments before it mirrors, so
+ * the mirror walk — which judges the same levels against source — has not run.
+ *
+ * The twin's own path is cleared last, and never cached: that clash is per
+ * file, so it costs a `stat` on every file written. Cheap against the write and
+ * the atomic cov-map that follow, but not free — measure before adding another.
+ *
+ * The `.cov-map.json` sidecar beside the twin is deliberately not cleared. Only
+ * a source directory named `*.cov-map.json` can put a directory on that path,
+ * and on a tree holding one the mirror walk deletes the sidecar to make its own
+ * twin every run regardless: both writers want the path, and clearing here
+ * would trade a loud failure for a shadow that thrashes silently.
+ */
+function prepareTwinPath(
+	relativePath: string,
+	shadowFilePath: string,
+	{ createdDirectories, shadowDir }: ShadowPathContext,
+): void {
+	let directory = shadowDir;
+	ensureShadowDirectory(directory, createdDirectories);
+
+	const parent = path.dirname(relativePath);
+	if (parent !== ".") {
+		// The discovery walk keys every path with "/", whatever the platform.
+		for (const segment of parent.split("/")) {
+			directory = path.join(directory, segment);
+			ensureShadowDirectory(directory, createdDirectories);
+		}
+	}
+
+	clearDirectoryAtFilePath(shadowFilePath);
+}
+
+/**
+ * Instrument one discovered file: write its instrumented twin and `.cov-map`
+ * sidecar into the shadow dir, and return the manifest record for it.
+ */
+function instrumentFile(
+	relativePath: string,
+	{ createdDirectories, luauRoot, shadowDir, timing }: InstrumentFileContext,
+): InstrumentedFileRecord {
+	// The cross-machine join key: the same string is written to the manifest
+	// record below and baked into the instrumented preamble by `insertProbes`,
+	// so the runtime hit map lines up with the static maps byte-for-byte.
+	const fileKey = underRoot(luauRoot, relativePath);
+	const shadowFilePath = path.join(shadowDir, relativePath);
+	// LUAU_EXTENSION is end-anchored, so swapping the suffix on the joined path
+	// is the same as joining the swapped relative path.
+	const coverageMapOutputPath = shadowFilePath.replace(LUAU_EXTENSION, ".cov-map.json");
+
+	const sourceBuffer = timing.profile("read-source", () => {
+		return fs.readFileSync(path.resolve(fileKey));
+	});
+	const source = sourceBuffer.toString("utf-8");
+	const collectorResult = collectFileCoverage({ relativePath, source, timing });
+	const instrumentedSource = timing.profile("probe-insert", () => {
+		return insertProbes(source, collectorResult, fileKey);
+	});
+	const coverageMap = timing.profile("map-build", () => buildCoverageMap(collectorResult));
+
+	timing.profile("write-shadow", () => {
+		// Not `atomicWrite` like the package's other publishers: on Windows the
+		// rename it adds per covered file roughly triples the cost of the write
+		// it protects. The atomic cov-map below covers the kill window that
+		// leaves. Re-measure the `write-shadow` span under `TIMING` first.
+		prepareTwinPath(relativePath, shadowFilePath, { createdDirectories, shadowDir });
+		fs.writeFileSync(shadowFilePath, instrumentedSource);
+		// Same directory as the twin, already made above — but `atomicWrite`
+		// under here remakes it per file. Deduping that too would mean a second
+		// opt-out on a helper the package's publishers share, for microseconds;
+		// the one `writeCoverageMap` already takes buys more than that.
+		writeCoverageMap(coverageMapOutputPath, coverageMap);
+	});
+
+	return {
+		key: fileKey,
+		branchCount: collectorResult.branches.length,
+		coverageMapPath: normalizeWindowsPath(coverageMapOutputPath),
+		functionCount: collectorResult.functions.length,
+		instrumentedLuauPath: normalizeWindowsPath(shadowFilePath),
+		originalLuauPath: fileKey,
+		sourceHash: hashBuffer(sourceBuffer),
+		// The original's map, not one beside the twin in the shadow. Legal
+		// because `insertProbes` keeps the twin line-for-line aligned with the
+		// original, so one map describes both without a line shift.
+		sourceMapPath: `${fileKey}.map`,
+		statementCount: collectorResult.statements.length,
+	};
 }

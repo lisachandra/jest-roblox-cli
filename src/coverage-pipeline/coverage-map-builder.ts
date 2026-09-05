@@ -1,8 +1,16 @@
 import type { CollectorResult } from "./coverage-collector.ts";
-import type { CoverageMap, SourceLocation } from "./coverage-map.ts";
+import type { CoverageMap } from "./coverage-map.ts";
 
 export function buildCoverageMap(result: CollectorResult): CoverageMap {
-	const statementMap: Record<string, SourceLocation> = {};
+	return {
+		branchMap: buildBranchMap(result),
+		functionMap: buildFunctionMap(result),
+		statementMap: buildStatementMap(result),
+	};
+}
+
+function buildStatementMap(result: CollectorResult): CoverageMap["statementMap"] {
+	const statementMap: CoverageMap["statementMap"] = {};
 	for (const statement of result.statements) {
 		statementMap[String(statement.index)] = {
 			end: { column: statement.location.endColumn, line: statement.location.endLine },
@@ -10,7 +18,11 @@ export function buildCoverageMap(result: CollectorResult): CoverageMap {
 		};
 	}
 
-	const functionMap: Record<string, { location: SourceLocation; name: string }> = {};
+	return statementMap;
+}
+
+function buildFunctionMap(result: CollectorResult): NonNullable<CoverageMap["functionMap"]> {
+	const functionMap: NonNullable<CoverageMap["functionMap"]> = {};
 	for (const func of result.functions) {
 		functionMap[String(func.index)] = {
 			name: func.name,
@@ -21,7 +33,11 @@ export function buildCoverageMap(result: CollectorResult): CoverageMap {
 		};
 	}
 
-	const branchMap: Record<string, { locations: Array<SourceLocation>; type: string }> = {};
+	return functionMap;
+}
+
+function buildBranchMap(result: CollectorResult): NonNullable<CoverageMap["branchMap"]> {
+	const branchMap: NonNullable<CoverageMap["branchMap"]> = {};
 	for (const branch of result.branches) {
 		branchMap[String(branch.index)] = {
 			locations: branch.arms.map((arm) => {
@@ -34,5 +50,5 @@ export function buildCoverageMap(result: CollectorResult): CoverageMap {
 		};
 	}
 
-	return { branchMap, functionMap, statementMap };
+	return branchMap;
 }

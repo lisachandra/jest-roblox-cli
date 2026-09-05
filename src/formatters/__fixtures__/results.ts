@@ -159,6 +159,15 @@ export const TIMING_COVERAGE: TimingResult = {
 	uploadMs: 50,
 };
 
+export const TIMING_STAGING: TimingResult = {
+	executionMs: 150,
+	stagingMs: 400,
+	startTime: 1700000000000,
+	testsMs: 100,
+	totalMs: 650,
+	uploadMs: 50,
+};
+
 export const SNAPSHOT_FAILING_RESULT: JestResult = {
 	numFailedTests: 1,
 	numPassedTests: 1,
@@ -275,6 +284,22 @@ export const EXEC_ERROR_RESULT: JestResult = {
 			numPendingTests: 0,
 			testFilePath: "shared/react/features/windows/__tests__/unit-menu-app.test",
 			testResults: [],
+		},
+	],
+};
+
+// The same shape an exec error takes, differing only in what abandoned it —
+// which is the whole of what the formatters are asked to tell apart. It keeps
+// the exec error's own `testFilePath` on purpose: the flag is what a formatter
+// may read, and a rendering that keyed off the path would pass here wrongly.
+export const TIMED_OUT_RESULT: JestResult = {
+	...EXEC_ERROR_RESULT,
+	testResults: [
+		{
+			// eslint-disable-next-line ts/no-non-null-assertion -- one file above
+			...EXEC_ERROR_RESULT.testResults[0]!,
+			failureMessage: "Timed out after 60s, aborting tests",
+			timedOut: true,
 		},
 	],
 };
@@ -474,6 +499,39 @@ export const MINIMAL_RESULT: JestResult = {
 					title: "fails",
 				}),
 			],
+		},
+	],
+};
+
+/**
+ * A run where one file collected nothing at all — no tests, no exec error.
+ * Vitest calls such a file passed, so both reports must agree on that.
+ */
+export const EMPTY_FILE_RESULT: JestResult = {
+	numFailedTests: 0,
+	numPassedTests: 3,
+	numPendingTests: 0,
+	numTotalTests: 3,
+	startTime: 1700000000000,
+	success: true,
+	testResults: [
+		{
+			numFailingTests: 0,
+			numPassingTests: 3,
+			numPendingTests: 0,
+			testFilePath: "src/utils.spec.ts",
+			testResults: [
+				createTestCase({ fullName: "Utils add works", title: "add works" }),
+				createTestCase({ fullName: "Utils sub works", title: "sub works" }),
+				createTestCase({ fullName: "Utils mul works", title: "mul works" }),
+			],
+		},
+		{
+			numFailingTests: 0,
+			numPassingTests: 0,
+			numPendingTests: 0,
+			testFilePath: "src/empty.spec.ts",
+			testResults: [],
 		},
 	],
 };

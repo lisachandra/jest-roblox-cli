@@ -1,5 +1,6 @@
 import type { ResolvedProjectConfig } from "../config/projects.ts";
 import { extractStaticRoot } from "../config/projects.ts";
+import type { ResolvedConfig } from "../config/schema.ts";
 
 const SPEC_OR_TEST_EXTENSION = /\.(?:spec|test)(\.\w+)$/;
 
@@ -15,6 +16,61 @@ const SPEC_OR_TEST_EXTENSION = /\.(?:spec|test)(\.\w+)$/;
 export function deriveCoverageFromIncludes(
 	projects: ReadonlyArray<Pick<ResolvedProjectConfig, "include">>,
 ): Array<string> | undefined {
+	const rootsByExtension = collectRootsByExtension(projects);
+	if (rootsByExtension.size === 0) {
+		return undefined;
+	}
+
+	return buildCoveragePatterns(rootsByExtension);
+}
+
+/**
+ * The include globs this run's coverage universe is actually made of: the
+ * user's `collectCoverageFrom` when set, otherwise the set derived from the
+ * projects' own `include`.
+ *
+ * The single authority for that `??`. Instrumentation asks it before the run
+ * (to decide what earns probes) and the report asks it after (to decide what
+ * to render); resolving the fallback in only one of the two would probe files
+ * the report drops, or — worse — drop files the report expects.
+ */
+export function resolveCoverageInclude(
+	config: Pick<ResolvedConfig, "collectCoverage" | "collectCoverageFrom">,
+	projects: ReadonlyArray<Pick<ResolvedProjectConfig, "include">>,
+): Array<string> | undefined {
+	if (!config.collectCoverage) {
+		return config.collectCoverageFrom;
+	}
+
+	return config.collectCoverageFrom ?? deriveCoverageFromIncludes(projects);
+}
+
+/**
+ * Infers the source file extension from an include pattern by stripping the
+ * `.spec` or `.test` suffix. Throws when the pattern has no recognizable test
+ * extension so that misconfigured globs fail loudly.
+ */
+function inferSourceExtension(pattern: string): string {
+	const match = pattern.match(SPEC_OR_TEST_EXTENSION);
+	if (!match) {
+		throw new Error(
+			`Cannot infer source extension from include pattern "${pattern}". ` +
+				"Patterns must end with .spec.<ext> or .test.<ext> (e.g. **/*.spec.ts, **/*.test.luau).",
+		);
+	}
+
+	const [, extension] = match;
+	// eslint-disable-next-line ts/no-non-null-assertion -- capture group 1 always present when match succeeds
+	return extension!;
+}
+
+/**
+ * Groups the static root of every include pattern by the source extension that
+ * pattern implies. A pattern with no static root is skipped.
+ */
+function collectRootsByExtension(
+	projects: ReadonlyArray<Pick<ResolvedProjectConfig, "include">>,
+): Map<string, Set<string>> {
 	const rootsByExtension = new Map<string, Set<string>>();
 
 	for (const project of projects) {
@@ -31,10 +87,10 @@ export function deriveCoverageFromIncludes(
 		}
 	}
 
-	if (rootsByExtension.size === 0) {
-		return undefined;
-	}
+	return rootsByExtension;
+}
 
+function buildCoveragePatterns(rootsByExtension: Map<string, Set<string>>): Array<string> {
 	const patterns: Array<string> = [];
 
 	for (const [extension, roots] of rootsByExtension) {
@@ -57,23 +113,4 @@ export function deriveCoverageFromIncludes(
 	}
 
 	return patterns;
-}
-
-/**
- * Infers the source file extension from an include pattern by stripping the
- * `.spec` or `.test` suffix. Throws when the pattern has no recognizable test
- * extension so that misconfigured globs fail loudly.
- */
-function inferSourceExtension(pattern: string): string {
-	const match = pattern.match(SPEC_OR_TEST_EXTENSION);
-	if (!match) {
-		throw new Error(
-			`Cannot infer source extension from include pattern "${pattern}". ` +
-				"Patterns must end with .spec.<ext> or .test.<ext> (e.g. **/*.spec.ts, **/*.test.luau).",
-		);
-	}
-
-	const [, extension] = match;
-	// eslint-disable-next-line ts/no-non-null-assertion -- capture group 1 always present when match succeeds
-	return extension!;
 }

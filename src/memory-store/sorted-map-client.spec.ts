@@ -1,3 +1,4 @@
+import { OpenCloudError } from "@bedrock-rbx/ocale";
 import type {
 	CreateSortedMapItemParameters,
 	DeleteSortedMapItemParameters,
@@ -11,7 +12,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
 	decodeStreamingResult,
-	encodeStreamingResult,
 	StreamingResultClient,
 	type StreamingResultEntry,
 } from "./sorted-map-client.ts";
@@ -24,9 +24,9 @@ interface SortedMapStub {
 }
 
 interface StubBehavior {
-	createError?: { message: string };
-	deleteError?: { message: string };
-	listError?: { message: string };
+	createError?: OpenCloudError;
+	deleteError?: OpenCloudError;
+	listError?: OpenCloudError;
 	listPages?: Array<ListSortedMapItemsResult>;
 }
 
@@ -42,7 +42,7 @@ function createSortedMapStub(behavior: StubBehavior = {}): SortedMapStub {
 	const create = vi.fn<CreateFunc>(async (parameters) => {
 		createdRequests.push(parameters);
 		if (behavior.createError !== undefined) {
-			return { err: behavior.createError as never, success: false };
+			return { err: behavior.createError, success: false };
 		}
 
 		const item: SortedMapItem = {
@@ -60,7 +60,7 @@ function createSortedMapStub(behavior: StubBehavior = {}): SortedMapStub {
 	const remove = vi.fn<DeleteFunc>(async (parameters) => {
 		deletedRequests.push(parameters);
 		if (behavior.deleteError !== undefined) {
-			return { err: behavior.deleteError as never, success: false };
+			return { err: behavior.deleteError, success: false };
 		}
 
 		return { data: undefined, success: true };
@@ -69,12 +69,16 @@ function createSortedMapStub(behavior: StubBehavior = {}): SortedMapStub {
 	const list = vi.fn<ListFunc>(async (parameters) => {
 		listCalls.push(parameters);
 		if (behavior.listError !== undefined) {
-			return { err: behavior.listError as never, success: false };
+			return { err: behavior.listError, success: false };
 		}
 
 		const pages = behavior.listPages ?? [{ items: [], nextPageToken: undefined }];
 		const callIndex = listCalls.length - 1;
-		const page = pages[callIndex] ?? { items: [], nextPageToken: undefined };
+		const page = pages[callIndex];
+		if (page === undefined) {
+			throw new Error(`Unexpected sortedMaps.list call ${String(listCalls.length)}`);
+		}
+
 		return { data: page, success: true };
 	});
 
@@ -108,7 +112,7 @@ function makeItem(overrides: Partial<SortedMapItem> & { id: string }): SortedMap
 		mapId: "map-1",
 		sortKey: undefined,
 		universeId: "123",
-		value: encodeStreamingResult(makeEntry({ pkg: "x", project: "y" })),
+		value: { ...makeEntry({ pkg: "x", project: "y" }) },
 		...overrides,
 	};
 }
@@ -125,7 +129,7 @@ describe(StreamingResultClient, () => {
 				storageFactory: () => stub.storage,
 			});
 
-			await client.write(
+			await client.writeAsync(
 				makeEntry({
 					elapsedMs: 1234,
 					numFailedTests: 2,
@@ -166,22 +170,22 @@ describe(StreamingResultClient, () => {
 				ttlSeconds: 120,
 			});
 
-			await client.write(makeEntry());
+			await client.writeAsync(makeEntry());
 
-			expect(stub.createdRequests[0]?.ttl).toBe(120);
+			expect(stub.createdRequests[0]!.ttl).toBe(120);
 		});
 
 		it("should throw when sortedMaps.create returns a failure Result", async () => {
 			expect.assertions(1);
 
-			const stub = createSortedMapStub({ createError: { message: "rate limited" } });
+			const stub = createSortedMapStub({ createError: new OpenCloudError("rate limited") });
 			const client = new StreamingResultClient({
 				credentials: CREDENTIALS,
 				mapId: "m",
 				storageFactory: () => stub.storage,
 			});
 
-			await expect(client.write(makeEntry())).rejects.toThrow(
+			await expect(client.writeAsync(makeEntry())).rejects.toThrow(
 				"Failed to write streaming result: rate limited",
 			);
 		});
@@ -198,7 +202,7 @@ describe(StreamingResultClient, () => {
 				storageFactory: () => stub.storage,
 			});
 
-			const results = await client.readAll();
+			const results = await client.readAllAsync();
 
 			expect(results).toStrictEqual([]);
 		});
@@ -213,9 +217,9 @@ describe(StreamingResultClient, () => {
 				storageFactory: () => stub.storage,
 			});
 
-			await client.readAll();
+			await client.readAllAsync();
 
-			expect(stub.listCalls[0]?.maxPageSize).toBe(100);
+			expect(stub.listCalls[0]!.maxPageSize).toBe(100);
 		});
 
 		it("should decode each item's value into a StreamingResultEntry", async () => {
@@ -230,7 +234,7 @@ describe(StreamingResultClient, () => {
 			const stub = createSortedMapStub({
 				listPages: [
 					{
-						items: [makeItem({ id: "a::p", value: encodeStreamingResult(decoded) })],
+						items: [makeItem({ id: "a::p", value: { ...decoded } })],
 						nextPageToken: undefined,
 					},
 				],
@@ -241,7 +245,7 @@ describe(StreamingResultClient, () => {
 				storageFactory: () => stub.storage,
 			});
 
-			const results = await client.readAll();
+			const results = await client.readAllAsync();
 
 			expect(results).toStrictEqual([{ id: "a::p", value: decoded }]);
 		});
@@ -255,7 +259,7 @@ describe(StreamingResultClient, () => {
 						items: [
 							makeItem({
 								id: "a::p",
-								value: encodeStreamingResult(makeEntry({ pkg: "a", project: "p" })),
+								value: { ...makeEntry({ pkg: "a", project: "p" }) },
 							}),
 						],
 						nextPageToken: "page-2",
@@ -264,7 +268,7 @@ describe(StreamingResultClient, () => {
 						items: [
 							makeItem({
 								id: "b::q",
-								value: encodeStreamingResult(makeEntry({ pkg: "b", project: "q" })),
+								value: { ...makeEntry({ pkg: "b", project: "q" }) },
 							}),
 						],
 						nextPageToken: undefined,
@@ -277,23 +281,23 @@ describe(StreamingResultClient, () => {
 				storageFactory: () => stub.storage,
 			});
 
-			const results = await client.readAll();
+			const results = await client.readAllAsync();
 
 			expect(results.map((entry) => entry.id)).toStrictEqual(["a::p", "b::q"]);
-			expect(stub.listCalls[1]?.pageToken).toBe("page-2");
+			expect(stub.listCalls[1]!.pageToken).toBe("page-2");
 		});
 
 		it("should throw when sortedMaps.list returns a failure Result", async () => {
 			expect.assertions(1);
 
-			const stub = createSortedMapStub({ listError: { message: "auth failed" } });
+			const stub = createSortedMapStub({ listError: new OpenCloudError("auth failed") });
 			const client = new StreamingResultClient({
 				credentials: CREDENTIALS,
 				mapId: "m",
 				storageFactory: () => stub.storage,
 			});
 
-			await expect(client.readAll()).rejects.toThrow(
+			await expect(client.readAllAsync()).rejects.toThrow(
 				"Failed to read streaming results: auth failed",
 			);
 		});
@@ -315,7 +319,7 @@ describe(StreamingResultClient, () => {
 				storageFactory: () => stub.storage,
 			});
 
-			await expect(client.readAll()).rejects.toThrow("project must be a string");
+			await expect(client.readAllAsync()).rejects.toThrow("project must be a string");
 		});
 	});
 
@@ -330,7 +334,7 @@ describe(StreamingResultClient, () => {
 				storageFactory: () => stub.storage,
 			});
 
-			await client.delete("a::p");
+			await client.deleteAsync("a::p");
 
 			expect(stub.deletedRequests[0]).toStrictEqual({
 				itemId: "a::p",
@@ -342,14 +346,14 @@ describe(StreamingResultClient, () => {
 		it("should throw when sortedMaps.delete returns a failure Result", async () => {
 			expect.assertions(1);
 
-			const stub = createSortedMapStub({ deleteError: { message: "not found" } });
+			const stub = createSortedMapStub({ deleteError: new OpenCloudError("not found") });
 			const client = new StreamingResultClient({
 				credentials: CREDENTIALS,
 				mapId: "m",
 				storageFactory: () => stub.storage,
 			});
 
-			await expect(client.delete("a::p")).rejects.toThrow(
+			await expect(client.deleteAsync("a::p")).rejects.toThrow(
 				"Failed to delete streaming result: not found",
 			);
 		});
@@ -378,24 +382,6 @@ describe(StreamingResultClient, () => {
 
 			expect(client).toBeInstanceOf(StreamingResultClient);
 		});
-	});
-});
-
-describe(encodeStreamingResult, () => {
-	it("should round-trip a streaming entry through encode/decode unchanged", () => {
-		expect.assertions(1);
-
-		const entry = makeEntry({
-			elapsedMs: 42,
-			numFailedTests: 1,
-			numPassedTests: 7,
-			numPendingTests: 0,
-			pkg: "@halcyon/foo",
-			project: "alpha",
-			success: false,
-		});
-
-		expect(decodeStreamingResult(encodeStreamingResult(entry))).toStrictEqual(entry);
 	});
 });
 

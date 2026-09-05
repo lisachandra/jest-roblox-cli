@@ -1,5 +1,4 @@
 import { type } from "arktype";
-import assert from "node:assert";
 
 import { normalizeRawCoverage } from "../coverage-pipeline/raw-coverage.ts";
 import type { PerTestCoverageEntry, RawCoverageData } from "../coverage-pipeline/types.ts";
@@ -8,12 +7,12 @@ import type { JestResult, SnapshotSummary } from "../types/jest-result.ts";
 export type SnapshotWrites = Record<string, string>;
 
 interface ParseResult {
-	coverageData?: RawCoverageData;
-	luauTiming?: Record<string, number>;
-	perTestCoverage?: Array<PerTestCoverageEntry>;
+	coverageData?: RawCoverageData | undefined;
+	luauTiming?: Record<string, number> | undefined;
+	perTestCoverage?: Array<PerTestCoverageEntry> | undefined;
 	result: JestResult;
-	setupSeconds?: number;
-	snapshotWrites?: SnapshotWrites;
+	setupSeconds?: number | undefined;
+	snapshotWrites?: SnapshotWrites | undefined;
 }
 
 const TASK_SCRIPT_PREFIX = /^TaskScript:\d+:\s*/;
@@ -25,13 +24,31 @@ export class LuauScriptError extends Error {
 	 * (e.g. "No tests found, exiting with code 1"). Narrower than
 	 * {@link gameOutput}; see CONTEXT.md for the split.
 	 */
-	public bannerOutput?: string;
+	public bannerOutput: string | undefined;
+	/**
+	 * Whether the runner installed its stdout/stderr interception before the
+	 * run that failed. Set from the envelope's own `runner.captureInstalled`,
+	 * and read by the exec-error report so "nothing was written" reads apart
+	 * from "nobody was listening". Undefined when the runner does not say.
+	 */
+	public captureInstalled: boolean | undefined;
 	/**
 	 * The LogService.MessageOut dump for the failed run. Propagated through
 	 * the exec-error path so `--gameOutput <path>` still receives the full
 	 * log when an entry's envelope decodes to a Luau-level script failure.
 	 */
-	public gameOutput?: string;
+	public gameOutput: string | undefined;
+	/**
+	 * How far into the entry the runner got before it failed, as the Luau side
+	 * named the phase. Undefined when the runner names none.
+	 */
+	public phase: string | undefined;
+	/**
+	 * The run this failure came from was abandoned at its `projectTimeout`.
+	 * Set from the envelope's own `runner.abandon` block, and read by the
+	 * exec-error report so a timeout renders apart from a suite that threw.
+	 */
+	public timedOut: boolean | undefined;
 
 	constructor(rawMessage: string) {
 		super(rawMessage.replace(TASK_SCRIPT_PREFIX, ""));
@@ -46,9 +63,65 @@ const jestResultSchema = type({
 	startTime: "number",
 	success: "boolean",
 	testResults: "object[]",
+}).as<JestResult>();
+
+// Every envelope reaching this schema is `JSON.parse` output, so `JSONValue` is
+// the widest honest field type. Arktype has no keyword for the recursive JSON
+// union, hence the brand.
+const jsonValueSchema = type("unknown").as<JSONValue>();
+
+const jestEnvelopeSchema = type({
+	"err?": jsonValueSchema,
+	"error?": "unknown",
+	"kind?": "unknown",
+	"parent?": "unknown",
+	"results?": "unknown",
+	// Everything the Luau runner adds beside Jest's own result. Typed
+	// `unknown` here so a malformed block degrades to "no extras" in
+	// `runnerFields` rather than failing the whole envelope assertion.
+	"runner?": "unknown",
+	"snapshot?": "unknown",
+	"success?": "unknown",
+	"value?": "unknown",
 });
 
-const jestEnvelopeSchema = type("Record<string, unknown>");
+type JestEnvelope = typeof jestEnvelopeSchema.infer;
+
+const runnerFieldsSchema = type({
+	"abandon?": "unknown",
+	"captureInstalled?": "unknown",
+	"coverage?": jsonValueSchema,
+	"perTestCoverage?": "unknown",
+	"phase?": "unknown",
+	"setup?": "unknown",
+	"snapshotWrites?": "unknown",
+	"timing?": "unknown",
+});
+
+type RunnerFields = typeof runnerFieldsSchema.infer;
+
+const NO_RUNNER_FIELDS: RunnerFields = {};
+
+function runnerFields(parsed: JestEnvelope): RunnerFields {
+	const fields = runnerFieldsSchema(parsed.runner);
+	return fields instanceof type.errors ? NO_RUNNER_FIELDS : fields;
+}
+
+const unknownRecordSchema = type({ "[string]": "unknown" });
+
+// A field the runner omits means zero; a field it emits with the wrong type
+// means the block is malformed, and `extractSnapshotSummary` reports no summary
+// rather than one whose counts are inventions.
+const snapshotSummaryInputSchema = type({
+	"added?": "number",
+	"didUpdate?": "boolean",
+	"filesRemoved?": "number",
+	"matched?": "number",
+	"total?": "number",
+	"unchecked?": "number",
+	"unmatched?": "number",
+	"updated?": "number",
+});
 
 const perTestCoverageSchema = type({
 	delta: type({ "[string]": { s: "number[]" } }),
@@ -59,17 +132,17 @@ const perTestCoverageSchema = type({
 export function extractJsonFromOutput(output: string): string | undefined {
 	const lines = output.split("\n");
 	let braceCount = 0;
-	let collecting = false;
+	let isCollecting = false;
 	const jsonLines: Array<string> = [];
 
 	for (const line of lines) {
-		if (!collecting && line.trim().startsWith("{")) {
-			collecting = true;
+		if (!isCollecting && line.trimStart().startsWith("{")) {
+			isCollecting = true;
 			braceCount = 0;
 			jsonLines.length = 0;
 		}
 
-		if (!collecting) {
+		if (!isCollecting) {
 			continue;
 		}
 
@@ -85,7 +158,7 @@ export function extractJsonFromOutput(output: string): string | undefined {
 			return candidate;
 		}
 
-		collecting = false;
+		isCollecting = false;
 	}
 
 	return undefined;
@@ -134,12 +207,12 @@ function findJestJsonCandidate(output: string): string | undefined {
 const PROMISE_TRACE_HEADER = /^-- Promise\.Error\(/;
 // Accept zero-or-more spaces after the second colon so we also catch
 // `path:N:msg` from Luau `error(msg, 0)` calls that don't add a space.
-const PROMISE_TRACE_CAUSE_LINE = /:\d+:\s*(.+)$/;
+const PROMISE_TRACE_CAUSE_LINE = /:\d+:\s*(\S.*)$/;
 
 /**
- * Standalone extraction of the `_timing` field from a raw envelope entry's
- * `jestOutput`, for callers that want the Luau phase breakdown without
- * running the full `parseJestOutput` pipeline (schema validation,
+ * Standalone extraction of the `runner.timing` field from a raw envelope
+ * entry's `jestOutput`, for callers that want the Luau phase breakdown
+ * without running the full `parseJestOutput` pipeline (schema validation,
  * coverage/snapshot extraction) — namely the orchestrator surfacing it into
  * the host `TimingCollector` span tree while `backend.runTests` is still on
  * the stack. Returns undefined when no JSON candidate is found; mirrors
@@ -154,12 +227,12 @@ export function extractLuauTimingFromOutput(
 		return undefined;
 	}
 
-	return extractLuauTiming(jestEnvelopeSchema.assert(JSON.parse(candidate)));
+	return extractLuauTiming(runnerFields(jestEnvelopeSchema.assert(JSON.parse(candidate))));
 }
 
-function extractLuauTiming(parsed: Record<string, unknown>): Record<string, number> | undefined {
-	const timing = parsed["_timing"];
-	if (timing === undefined || timing === null || typeof timing !== "object") {
+function extractLuauTiming(runner: RunnerFields): Record<string, number> | undefined {
+	const timing = unknownRecordSchema(runner.timing);
+	if (timing instanceof type.errors) {
 		return undefined;
 	}
 
@@ -180,10 +253,6 @@ function looksLikePromiseTrace(text: string): boolean {
 function extractCauseFromPromiseTrace(trace: string): string | undefined {
 	for (const rawLine of trace.split("\n").reverse()) {
 		const line = rawLine.trim();
-		if (line === "") {
-			continue;
-		}
-
 		const match = PROMISE_TRACE_CAUSE_LINE.exec(line);
 		if (match !== null) {
 			return match[1];
@@ -193,20 +262,19 @@ function extractCauseFromPromiseTrace(trace: string): string | undefined {
 	return undefined;
 }
 
-function extractExecutionError(object: Record<string, unknown>): string {
-	// Traverse nested parent chain to find root error. `typeof null === "object"`
-	// in JS, so an explicit null guard is required to stop at the leaf.
+function extractExecutionError(object: JestEnvelope): string {
+	// Traverse nested parent chain to find root error, stopping at the leaf.
 	let current = object;
 	while (true) {
-		const { parent } = current;
-		if (parent === null || typeof parent !== "object") {
+		const parent = jestEnvelopeSchema(current.parent);
+		if (parent instanceof type.errors) {
 			break;
 		}
 
-		current = parent as Record<string, unknown>;
+		current = parent;
 	}
 
-	const errorValue = current["error"];
+	const errorValue = current.error;
 	if (typeof errorValue !== "string") {
 		return "Unknown error";
 	}
@@ -221,21 +289,14 @@ function extractExecutionError(object: Record<string, unknown>): string {
 	return errorValue;
 }
 
-function extractCoverageData(parsed: Record<string, unknown>): RawCoverageData | undefined {
-	return normalizeRawCoverage(parsed["_coverage"]);
+function extractCoverageData(runner: RunnerFields): RawCoverageData | undefined {
+	return normalizeRawCoverage(runner.coverage);
 }
 
-function extractPerTestCoverage(
-	parsed: Record<string, unknown>,
-): Array<PerTestCoverageEntry> | undefined {
-	const raw = parsed["_perTestCoverage"];
-	if (raw === undefined) {
-		return undefined;
-	}
-
+function extractPerTestCoverage(runner: RunnerFields): Array<PerTestCoverageEntry> | undefined {
 	// A malformed envelope (our own producer drifting) drops attribution rather
 	// than throwing — the coverage report and manifest still publish without it.
-	const validated = perTestCoverageSchema(raw);
+	const validated = perTestCoverageSchema(runner.perTestCoverage);
 	if (validated instanceof type.errors) {
 		return undefined;
 	}
@@ -243,9 +304,9 @@ function extractPerTestCoverage(
 	return validated.length > 0 ? validated : undefined;
 }
 
-function extractSnapshotWrites(parsed: Record<string, unknown>): SnapshotWrites | undefined {
-	const writes = parsed["_snapshotWrites"];
-	if (writes === undefined || writes === null || typeof writes !== "object") {
+function extractSnapshotWrites(runner: RunnerFields): SnapshotWrites | undefined {
+	const writes = unknownRecordSchema(runner.snapshotWrites);
+	if (writes instanceof type.errors) {
 		return undefined;
 	}
 
@@ -273,7 +334,7 @@ function stripPathLinePrefix(message: string): string {
 	return message.replace(PATH_LINE_PREFIX, "");
 }
 
-function stringifyError(err: unknown): string {
+function stringifyError(err: JSONValue): string {
 	if (typeof err === "string") {
 		// Defense in depth: when the Luau side encodes a Promise.Error via
 		// tostring() (e.g. luau/staging/entry.luau's per-pkg failure path) the
@@ -294,32 +355,39 @@ function stringifyError(err: unknown): string {
 		typeof err === "object" &&
 		err !== null &&
 		"message" in err &&
-		typeof err.message === "string"
+		typeof err["message"] === "string"
 	) {
-		return err.message;
+		return err["message"];
 	}
 
 	if (
 		typeof err === "object" &&
 		err !== null &&
 		"kind" in err &&
-		(err as Record<string, unknown>)["kind"] === "ExecutionError"
+		err["kind"] === "ExecutionError"
 	) {
-		return extractExecutionError(err);
+		return extractExecutionError(jestEnvelopeSchema.assert(err));
 	}
 
-	const serialized = JSON.stringify(err);
-	assert(serialized !== undefined, "JSON-parsed values are always serializable");
-	return serialized;
+	return JSON.stringify(err);
 }
 
-function unwrapResult(parsed: Record<string, unknown>): Record<string, unknown> {
-	if ("err" in parsed && parsed["success"] === false) {
-		throw new LuauScriptError(stringifyError(parsed["err"]));
+function unwrapResult(parsed: JestEnvelope, runner: RunnerFields): JestEnvelope {
+	if (parsed.err !== undefined && parsed.success === false) {
+		const error = new LuauScriptError(stringifyError(parsed.err));
+		// Read off the same `runner` block every other dimension comes from,
+		// so a runner that gives up on a run says so through the shared result
+		// seam rather than through a field of its own on the envelope entry.
+		error.timedOut = runner.abandon === "timeout" ? true : undefined;
+		error.phase =
+			typeof runner.phase === "string" && runner.phase !== "" ? runner.phase : undefined;
+		error.captureInstalled =
+			typeof runner.captureInstalled === "boolean" ? runner.captureInstalled : undefined;
+		throw error;
 	}
 
-	if ("value" in parsed && parsed["success"] === true) {
-		return parsed["value"] as Record<string, unknown>;
+	if (parsed.value !== undefined && parsed.success === true) {
+		return jestEnvelopeSchema.assert(parsed.value);
 	}
 
 	return parsed;
@@ -331,11 +399,10 @@ function validateJestResult(value: unknown): JestResult {
 		throw new Error(`Invalid Jest result: ${result.summary}`);
 	}
 
-	return result as JestResult;
+	return result;
 }
 
-function extractSetupSeconds(parsed: Record<string, unknown>): number | undefined {
-	const setup = parsed["_setup"];
+function extractSetupSeconds({ setup }: RunnerFields): number | undefined {
 	if (typeof setup !== "number") {
 		return undefined;
 	}
@@ -343,77 +410,74 @@ function extractSetupSeconds(parsed: Record<string, unknown>): number | undefine
 	return setup;
 }
 
-function numericField(source: Record<string, unknown>, key: string): number {
-	const value = source[key];
-	return typeof value === "number" ? value : 0;
-}
-
-function extractSnapshotSummary(
-	resultsObject: Record<string, unknown>,
-): SnapshotSummary | undefined {
-	const { snapshot } = resultsObject;
-	if (snapshot === undefined || snapshot === null || typeof snapshot !== "object") {
+function extractSnapshotSummary(source: JestResult): SnapshotSummary | undefined {
+	const envelope = jestEnvelopeSchema.assert(source);
+	const snapshot = snapshotSummaryInputSchema(envelope.snapshot);
+	if (snapshot instanceof type.errors) {
 		return undefined;
 	}
 
-	const source = snapshot as Record<string, unknown>;
 	const summary: SnapshotSummary = {
-		added: numericField(source, "added"),
-		matched: numericField(source, "matched"),
-		total: numericField(source, "total"),
-		unmatched: numericField(source, "unmatched"),
-		updated: numericField(source, "updated"),
+		added: snapshot.added ?? 0,
+		matched: snapshot.matched ?? 0,
+		total: snapshot.total ?? 0,
+		unmatched: snapshot.unmatched ?? 0,
+		updated: snapshot.updated ?? 0,
 	};
 
-	if (typeof source["filesRemoved"] === "number") {
-		summary.filesRemoved = source["filesRemoved"];
+	if (snapshot.filesRemoved !== undefined) {
+		summary.filesRemoved = snapshot.filesRemoved;
 	}
 
-	if (typeof source["unchecked"] === "number") {
-		summary.unchecked = source["unchecked"];
+	if (snapshot.unchecked !== undefined) {
+		summary.unchecked = snapshot.unchecked;
 	}
 
-	if (typeof source["didUpdate"] === "boolean") {
-		summary.didUpdate = source["didUpdate"];
+	if (snapshot.didUpdate !== undefined) {
+		summary.didUpdate = snapshot.didUpdate;
 	}
 
 	return summary;
 }
 
-function parseParsedOutput(parsed: Record<string, unknown>): ParseResult {
-	const coverageData = extractCoverageData(parsed);
-	const luauTiming = extractLuauTiming(parsed);
-	const perTestCoverage = extractPerTestCoverage(parsed);
-	const setupSeconds = extractSetupSeconds(parsed);
-	const snapshotWrites = extractSnapshotWrites(parsed);
-	const unwrapped = unwrapResult(parsed);
+function buildJestResult(source: unknown): JestResult {
+	const validated = validateJestResult(source);
+	const snapshot = extractSnapshotSummary(validated);
+	if (snapshot !== undefined) {
+		return { ...validated, snapshot };
+	}
 
-	if (unwrapped["kind"] === "ExecutionError") {
+	// `jestResultSchema` does not declare `snapshot`, so a block that failed to
+	// parse would otherwise ride through undeclared and reach consumers under a
+	// key typed `SnapshotSummary`. Drop it instead.
+	const { snapshot: _unparsed, ...rest } = validated;
+	return rest;
+}
+
+function parseParsedOutput(parsed: JestEnvelope): ParseResult {
+	const runner = runnerFields(parsed);
+	const coverageData = extractCoverageData(runner);
+	const luauTiming = extractLuauTiming(runner);
+	const perTestCoverage = extractPerTestCoverage(runner);
+	const setupSeconds = extractSetupSeconds(runner);
+	const snapshotWrites = extractSnapshotWrites(runner);
+	const unwrapped = unwrapResult(parsed, runner);
+
+	if (unwrapped.kind === "ExecutionError") {
 		const errorMessage = extractExecutionError(unwrapped);
 		throw new LuauScriptError(`Jest execution failed: ${errorMessage}`);
 	}
 
-	if (unwrapped["results"] !== undefined && typeof unwrapped["results"] === "object") {
-		const resultsObject = unwrapped["results"] as Record<string, unknown>;
-		const validated = validateJestResult(resultsObject);
-		const snapshot = extractSnapshotSummary(resultsObject);
-		return {
-			coverageData,
-			luauTiming,
-			perTestCoverage,
-			result: snapshot !== undefined ? { ...validated, snapshot } : validated,
-			setupSeconds,
-			snapshotWrites,
-		};
-	}
-
-	const validated = validateJestResult(unwrapped);
-	const snapshot = extractSnapshotSummary(unwrapped);
+	// The Jest result is either nested under `results` or is the envelope
+	// itself; the snapshot summary rides alongside whichever one carries it.
+	const { results } = unwrapped;
 	return {
 		coverageData,
 		luauTiming,
 		perTestCoverage,
-		result: snapshot !== undefined ? { ...validated, snapshot } : validated,
+		result: buildJestResult(
+			results !== null && typeof results === "object" ? results : unwrapped,
+		),
 		setupSeconds,
 		snapshotWrites,
 	};

@@ -1,12 +1,16 @@
 import process from "node:process";
 
 import type { SourceMapper } from "../source-mapper/index.ts";
-import type { JestResult } from "../types/jest-result.ts";
-import { hasExecError } from "../types/jest-result.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import type { ExecErrorTestFileResult, JestResult } from "../types/jest-result.ts";
+import { execErrorTitle, hasExecError } from "../types/jest-result.ts";
+import type { PosixRoot } from "../utils/normalize-windows-path.ts";
+import {
+	normalizeWindowsPath,
+	relativeToRoot,
+	toPosixRoot,
+} from "../utils/normalize-windows-path.ts";
 
 const SEPARATOR = " · ";
-const TRAILING_SLASH = /\/$/;
 
 export interface GitHubActionsFormatterOptions {
 	/**
@@ -14,14 +18,14 @@ export interface GitHubActionsFormatterOptions {
 	 *
 	 * @default true
 	 */
-	displayAnnotations?: boolean;
+	displayAnnotations?: boolean | undefined;
 	/**
 	 * Configuration for the GitHub Actions Job Summary.
 	 *
 	 * When enabled, a markdown summary of test results is written to the path
 	 * specified by `outputPath`.
 	 */
-	jobSummary?: Partial<JobSummaryOptions>;
+	jobSummary?: Partial<JobSummaryOptions> | undefined;
 }
 
 interface JobSummaryOptions {
@@ -45,13 +49,13 @@ interface JobSummaryOptions {
 		 *
 		 * @default process.env.GITHUB_SHA
 		 */
-		commitHash?: string;
+		commitHash?: string | undefined;
 		/**
 		 * The GitHub repository in `owner/repo` format.
 		 *
 		 * @default process.env.GITHUB_REPOSITORY
 		 */
-		repository?: string;
+		repository?: string | undefined;
 		/**
 		 * The absolute path to the root of the repository on disk.
 		 *
@@ -59,7 +63,7 @@ interface JobSummaryOptions {
 		 *
 		 * @default process.env.GITHUB_WORKSPACE
 		 */
-		workspacePath?: string;
+		workspacePath?: string | undefined;
 	};
 	/**
 	 * File path to write the summary to.
@@ -70,19 +74,19 @@ interface JobSummaryOptions {
 }
 
 interface GitHubAnnotation {
-	col?: number;
+	col?: number | undefined;
 	file: string;
-	line?: number;
+	line?: number | undefined;
 	message: string;
-	title?: string;
+	title?: string | undefined;
 }
 
 interface GitHubActionsOptions {
-	repository?: string;
-	serverUrl?: string;
-	sha?: string;
-	sourceMapper?: SourceMapper;
-	workspace?: string;
+	repository?: string | undefined;
+	serverUrl?: string | undefined;
+	sha?: string | undefined;
+	sourceMapper?: SourceMapper | undefined;
+	workspace?: PosixRoot | undefined;
 }
 
 export function escapeData(value: string): string {
@@ -136,11 +140,6 @@ export function collectAnnotations(
 
 export function formatAnnotations(result: JestResult, options: GitHubActionsOptions): string {
 	const annotations = collectAnnotations(result, options);
-
-	if (annotations.length === 0) {
-		return "";
-	}
-
 	return annotations.map(formatAnnotation).join("\n");
 }
 
@@ -155,7 +154,7 @@ export function formatJobSummary(result: JestResult, options: GitHubActionsOptio
 		if (hasExecError(file)) {
 			failures.push({
 				file: makeRelative(file.testFilePath, options.workspace),
-				title: "Test suite failed to run",
+				title: execErrorTitle(file),
 			});
 			continue;
 		}
@@ -183,43 +182,37 @@ export function resolveGitHubActionsOptions(
 	sourceMapper: SourceMapper | undefined,
 	environment: Record<string, string | undefined> = process.env,
 ): GitHubActionsOptions {
+	const workspacePath =
+		userOptions.jobSummary?.fileLinks?.workspacePath ?? environment["GITHUB_WORKSPACE"];
 	return {
 		repository:
 			userOptions.jobSummary?.fileLinks?.repository ?? environment["GITHUB_REPOSITORY"],
 		serverUrl: environment["GITHUB_SERVER_URL"],
 		sha: userOptions.jobSummary?.fileLinks?.commitHash ?? environment["GITHUB_SHA"],
 		sourceMapper,
-		workspace:
-			userOptions.jobSummary?.fileLinks?.workspacePath ?? environment["GITHUB_WORKSPACE"],
+		// Canonical once here rather than per annotation: the value is fixed for
+		// the whole run, and every reader of it wants the same spelling.
+		workspace: workspacePath === undefined ? undefined : toPosixRoot(workspacePath),
 	};
 }
 
-function makeRelative(filePath: string, workspace: string | undefined): string {
+function makeRelative(filePath: string, workspace: PosixRoot | undefined): string {
 	if (workspace === undefined) {
 		return filePath;
 	}
 
-	const normalized = normalizeWindowsPath(filePath);
-	const normalizedWorkspace = normalizeWindowsPath(workspace).replace(TRAILING_SLASH, "");
-
-	if (normalized.startsWith(`${normalizedWorkspace}/`)) {
-		return normalized.slice(normalizedWorkspace.length + 1);
-	}
-
-	return filePath;
+	return relativeToRoot(workspace, normalizeWindowsPath(filePath)) ?? filePath;
 }
 
 function collectExecErrorAnnotation(
 	annotations: Array<GitHubAnnotation>,
-	file: JestResult["testResults"][number],
+	file: ExecErrorTestFileResult,
 	options: GitHubActionsOptions,
 ): void {
 	annotations.push({
 		file: makeRelative(file.testFilePath, options.workspace),
-		// hasExecError guarantees failureMessage is defined
-		// eslint-disable-next-line ts/no-non-null-assertion -- hasExecError checked by caller
-		message: file.failureMessage!,
-		title: "Test suite failed to run",
+		message: file.failureMessage,
+		title: execErrorTitle(file),
 	});
 }
 
@@ -238,7 +231,7 @@ function collectTestFailureAnnotations(
 		let line: number | undefined;
 		let column: number | undefined;
 
-		if (options.sourceMapper !== undefined && firstFailure !== "") {
+		if (firstFailure !== "" && options.sourceMapper !== undefined) {
 			const mapped = options.sourceMapper.mapFailureWithLocations(firstFailure);
 			const location = mapped.locations[0];
 
@@ -285,14 +278,15 @@ function noun(count: number, singular: string, plural: string): string {
 	return count === 1 ? singular : plural;
 }
 
-function renderStats(result: JestResult): string {
+// File-level pass/fail counts plus their total. A file with an exec error
+// counts as failed even when it reported no failing tests.
+function renderFileCounts(result: JestResult): Array<string> {
 	const failedFiles = result.testResults.filter(
 		(file) => file.numFailingTests > 0 || hasExecError(file),
 	).length;
 	const passedFiles = result.testResults.filter(
 		(file) => file.numFailingTests === 0 && !hasExecError(file),
 	).length;
-	const totalFiles = failedFiles + passedFiles;
 
 	const fileInfo: Array<string> = [];
 
@@ -304,8 +298,11 @@ function renderStats(result: JestResult): string {
 		fileInfo.push(`✅ **${String(passedFiles)} ${noun(passedFiles, "pass", "passes")}**`);
 	}
 
-	fileInfo.push(`${String(totalFiles)} total`);
+	fileInfo.push(`${String(failedFiles + passedFiles)} total`);
+	return fileInfo;
+}
 
+function renderTestCounts(result: JestResult): Array<string> {
 	const testInfo: Array<string> = [];
 
 	if (result.numFailedTests > 0) {
@@ -323,11 +320,12 @@ function renderStats(result: JestResult): string {
 	// Excludes pending/todo — those appear in the "Other" row
 	const primaryTotal = result.numFailedTests + result.numPassedTests;
 	testInfo.push(`${String(primaryTotal)} total`);
+	return testInfo;
+}
 
-	let output = "### Summary\n\n";
-	output += `- **Test Files**: ${fileInfo.join(SEPARATOR)}\n`;
-	output += `- **Test Results**: ${testInfo.join(SEPARATOR)}\n`;
-
+// Pending/todo counts plus their total, or empty when neither is present — in
+// which case the caller omits the whole row.
+function renderOtherCounts(result: JestResult): Array<string> {
 	const otherInfo: Array<string> = [];
 
 	if (result.numPendingTests > 0) {
@@ -345,17 +343,31 @@ function renderStats(result: JestResult): string {
 	if (otherInfo.length > 0) {
 		const otherTotal = result.numPendingTests + (result.numTodoTests ?? 0);
 		otherInfo.push(`${String(otherTotal)} total`);
+	}
+
+	return otherInfo;
+}
+
+function renderStats(result: JestResult): string {
+	let output = "### Summary\n\n";
+	output += `- **Test Files**: ${renderFileCounts(result).join(SEPARATOR)}\n`;
+	output += `- **Test Results**: ${renderTestCounts(result).join(SEPARATOR)}\n`;
+
+	const otherInfo = renderOtherCounts(result);
+	if (otherInfo.length > 0) {
 		output += `- **Other**: ${otherInfo.join(SEPARATOR)}\n`;
 	}
 
 	return output;
 }
 
-function createFileLink(options: GitHubActionsOptions): (filePath: string) => string | undefined {
-	const { repository, serverUrl, sha } = options;
-
+function createFileLink({
+	repository,
+	serverUrl,
+	sha,
+}: GitHubActionsOptions): (filePath: string) => string | undefined {
 	if (serverUrl === undefined || repository === undefined || sha === undefined) {
-		return (_filePath: string) => {
+		return () => {
 			// No file links when env vars are missing
 		};
 	}

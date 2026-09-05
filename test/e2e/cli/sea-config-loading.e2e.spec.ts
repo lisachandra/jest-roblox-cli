@@ -1,7 +1,7 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { startFakeOpenCloudServer } from "./fake-open-cloud.ts";
+import { startFakeOpenCloudServerAsync } from "./fake-open-cloud.ts";
 import {
 	buildMixedOutput,
 	buildPassingPayload,
@@ -23,7 +23,7 @@ const NO_OPEN_CLOUD_CREDENTIALS = {
 	ROBLOX_OPEN_CLOUD_API_KEY: undefined,
 	ROBLOX_PLACE_ID: undefined,
 	ROBLOX_UNIVERSE_ID: undefined,
-} as const;
+} as const satisfies Record<string, string | undefined>;
 
 // A SEA binary can't `import()` a config off disk, and only the `.json` branch
 // of `seaImport` was ever SEA-safe, so any `.ts`/`.js` config failed before the
@@ -39,7 +39,7 @@ describe("sea config loading", () => {
 		// `@isentinel/jest-roblox` — a runtime value resolved from the sandbox's
 		// `node_modules`, exercising the import caveat end to end.
 		const sandbox = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
-		const server = await startFakeOpenCloudServer([
+		const server = await startFakeOpenCloudServerAsync([
 			{
 				jestOutput: buildMixedOutput(buildPassingPayload()),
 			},

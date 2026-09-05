@@ -1,3 +1,5 @@
+import { isRojoTreeNode } from "@isentinel/rojo-utils";
+
 import { existsSync } from "node:fs";
 
 import type { RojoProject, RojoTreeNode } from "../types/rojo.ts";
@@ -7,13 +9,14 @@ import { findMapping, replacePrefix } from "../utils/tsconfig-mapping.ts";
 const INIT_SEGMENT = /(^|\/)(init)(\.|\/)/;
 const LEADING_DOT_SLASH = /^\.\//;
 
+export interface PathResolver {
+	/** Probes disk (`.luau` then `.lua`) for paths with no tsconfig mapping. */
+	resolve(dataModelPath: string): ResolvedPath | undefined;
+}
+
 interface ResolvedPath {
 	filePath: string;
 	mapping?: TsconfigMapping;
-}
-
-interface PathResolver {
-	resolve(dataModelPath: string): ResolvedPath | undefined;
 }
 
 interface PathResolverConfig {
@@ -30,25 +33,7 @@ export function createPathResolver(
 	config?: PathResolverConfig,
 ): PathResolver {
 	const rojoMappings = new Map<string, string>();
-
-	function walkTree(tree: RojoTreeNode, prefix: string): void {
-		for (const [key, value] of Object.entries(tree)) {
-			if (key.startsWith("$") || typeof value !== "object") {
-				continue;
-			}
-
-			const dataModelPath = prefix ? `${prefix}.${key}` : key;
-			const node = value as RojoTreeNode;
-
-			if (typeof node.$path === "string") {
-				rojoMappings.set(dataModelPath, node.$path);
-			}
-
-			walkTree(node, dataModelPath);
-		}
-	}
-
-	walkTree(rojoProject.tree, "");
+	collectRojoMappings(rojoProject.tree, "", rojoMappings);
 
 	const tsconfigMappings = config?.mappings ?? [];
 	const sortedRojoMappings = [...rojoMappings].sort(([a], [b]) => b.length - a.length);
@@ -79,6 +64,22 @@ export function createPathResolver(
 			return undefined;
 		},
 	};
+}
+
+function collectRojoMappings(tree: RojoTreeNode, prefix: string, into: Map<string, string>): void {
+	for (const [key, value] of Object.entries(tree)) {
+		if (!isRojoTreeNode(value) || key.startsWith("$")) {
+			continue;
+		}
+
+		const dataModelPath = prefix ? `${prefix}.${key}` : key;
+
+		if (typeof value.$path === "string") {
+			into.set(dataModelPath, value.$path);
+		}
+
+		collectRojoMappings(value, dataModelPath, into);
+	}
 }
 
 function convertToFilePath(suffix: string): string {

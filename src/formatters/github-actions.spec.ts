@@ -4,11 +4,13 @@ import { describe, expect, it } from "vitest";
 
 import type { SourceMapper } from "../source-mapper/index.ts";
 import type { JestResult } from "../types/jest-result.ts";
+import { toPosixRoot } from "../utils/normalize-windows-path.ts";
 import {
 	EXEC_ERROR_RESULT,
 	FAILING_RESULT,
 	MIXED_RESULT,
 	PASSING_RESULT,
+	TIMED_OUT_RESULT,
 } from "./__fixtures__/results.ts";
 import {
 	collectAnnotations,
@@ -158,6 +160,23 @@ describe(collectAnnotations, () => {
 		});
 	});
 
+	it("should title a timed-out annotation after the budget", () => {
+		expect.assertions(1);
+
+		const annotations = collectAnnotations(TIMED_OUT_RESULT, {});
+
+		expect(annotations[0]).toMatchObject({ title: "Test suite timed out" });
+	});
+
+	it("should title a timed-out job-summary failure after the budget", () => {
+		expect.assertions(2);
+
+		const summary = formatJobSummary(TIMED_OUT_RESULT, {});
+
+		expect(summary).toContain("Test suite timed out");
+		expect(summary).not.toContain("Test suite failed to run");
+	});
+
 	it("should handle failed test with empty failureMessages and skip sourceMapper", () => {
 		expect.assertions(2);
 
@@ -233,7 +252,7 @@ describe(collectAnnotations, () => {
 			file: "lib/test.spec.luau",
 			line: 15,
 		});
-		expect(annotations[0]?.col).toBeUndefined();
+		expect(annotations[0]!.col).toBeUndefined();
 	});
 
 	it("should make paths relative to GITHUB_WORKSPACE", () => {
@@ -266,10 +285,50 @@ describe(collectAnnotations, () => {
 		};
 
 		const annotations = collectAnnotations(result, {
-			workspace: "/home/runner/work/project",
+			workspace: toPosixRoot("/home/runner/work/project"),
 		});
 
-		expect(annotations[0]?.file).toBe("src/test.spec.ts");
+		expect(annotations[0]!.file).toBe("src/test.spec.ts");
+	});
+
+	// The workspace is canonicalized where the options are resolved, so a
+	// trailing slash is answered once for every annotation rather than per
+	// call.
+	it("should normalize a trailing slash in GITHUB_WORKSPACE", () => {
+		expect.assertions(1);
+
+		const result: JestResult = {
+			...FAILING_RESULT,
+			testResults: [
+				{
+					...FAILING_RESULT.testResults[0]!,
+					testFilePath: "/home/runner/work/project/src/test.spec.ts",
+				},
+			],
+		};
+		const options = resolveGitHubActionsOptions({}, undefined, {
+			GITHUB_WORKSPACE: "/home/runner/work/project/",
+		});
+
+		expect(collectAnnotations(result, options)[0]!.file).toBe("src/test.spec.ts");
+	});
+
+	it("should preserve an absolute path when GITHUB_WORKSPACE is unavailable", () => {
+		expect.assertions(1);
+
+		const result: JestResult = {
+			...FAILING_RESULT,
+			testResults: [
+				{
+					...FAILING_RESULT.testResults[0]!,
+					testFilePath: "/home/runner/work/project/src/test.spec.ts",
+				},
+			],
+		};
+
+		expect(collectAnnotations(result, {})[0]!.file).toBe(
+			"/home/runner/work/project/src/test.spec.ts",
+		);
 	});
 });
 
@@ -317,7 +376,7 @@ describe(formatJobSummary, () => {
 			repository: "owner/repo",
 			serverUrl: "https://github.com",
 			sha: "abc123",
-			workspace: "/work",
+			workspace: toPosixRoot("/work"),
 		});
 
 		expect(summary).toContain("https://github.com/owner/repo/blob/abc123/src/player.spec.ts");
@@ -330,6 +389,16 @@ describe(formatJobSummary, () => {
 
 		expect(summary).toContain("Player should have health");
 		expect(summary).not.toContain("https://");
+	});
+
+	it.for([
+		{ repository: "owner/repo", serverUrl: "https://github.com" },
+		{ repository: "owner/repo", sha: "abc123" },
+		{ serverUrl: "https://github.com", sha: "abc123" },
+	])("should omit file links when any permalink field is missing", (options) => {
+		expect.assertions(1);
+
+		expect(formatJobSummary(FAILING_RESULT, options)).not.toContain("](https://");
 	});
 
 	it("should include exec-error files in failure list", () => {
@@ -373,6 +442,14 @@ describe(formatJobSummary, () => {
 		const summary = formatJobSummary(result, {});
 
 		expect(summary).toContain("1 skip · 3 todos · 4 total");
+	});
+
+	it("should omit an explicit zero todo count", () => {
+		expect.assertions(1);
+
+		expect(formatJobSummary({ ...PASSING_RESULT, numTodoTests: 0 }, {})).toBe(
+			formatJobSummary(PASSING_RESULT, {}),
+		);
 	});
 });
 
@@ -507,7 +584,7 @@ describe(resolveGitHubActionsOptions, () => {
 		expect(result.repository).toBe("owner/repo");
 		expect(result.serverUrl).toBe("https://github.com");
 		expect(result.sha).toBe("abc123");
-		expect(result.workspace).toBe("/home/runner/work");
+		expect(result.workspace).toBe(toPosixRoot("/home/runner/work"));
 	});
 
 	it("should override env vars with user options", () => {
@@ -530,7 +607,7 @@ describe(resolveGitHubActionsOptions, () => {
 		);
 
 		expect(result.repository).toBe("custom/repo");
-		expect(result.workspace).toBe("/custom/path");
+		expect(result.workspace).toBe(toPosixRoot("/custom/path"));
 	});
 
 	it("should pass through sourceMapper", () => {

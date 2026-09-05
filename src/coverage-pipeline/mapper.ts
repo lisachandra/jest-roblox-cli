@@ -4,10 +4,10 @@ import assert from "node:assert";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import type { CoverageMap, SourceLocation } from "./coverage-map.ts";
 import { readCoverageMap } from "./coverage-map.ts";
 import type { CoverageManifest } from "./manifest.ts";
+import { resolveSourcePath } from "./source-path.ts";
 import type { RawCoverageData } from "./types.ts";
 
 export interface MappedFileCoverage {
@@ -52,6 +52,13 @@ interface PendingStatement {
 	start: { column: number; line: number };
 }
 
+/**
+ * One source file's statements, grouped by start line. Coalescing compares a
+ * new statement against the entries on its own line only, which keeps the
+ * lookup off the file's few thousand statements.
+ */
+type FileStatements = Map<number, Array<PendingStatement>>;
+
 interface PendingFunction {
 	name: string;
 	hitCount: number;
@@ -77,10 +84,25 @@ interface MappedPosition {
 	source: string;
 }
 
+/** A Luau span carried back to the TypeScript source it came from. */
+interface MappedSpan {
+	end: MappedPosition;
+	start: MappedPosition;
+}
+
+interface AddOrCoalesceOptions {
+	hitCount: number;
+	pending: Map<string, FileStatements>;
+	span: MappedSpan;
+}
+
 interface FileResources {
 	coverageMap: CoverageMap;
 	sourceKey: string;
-	/** Directory containing the source map, used to resolve relative source paths. */
+	/**
+	 * Directory containing the source map, used to resolve relative source
+	 * paths.
+	 */
 	sourceMapDirectory: string;
 	traceMap: TraceMap | undefined;
 }
@@ -91,6 +113,15 @@ interface MappedArmLocations {
 		start: { column: number; line: number };
 	}>;
 	tsPath: string;
+}
+
+interface PushPendingBranchOptions {
+	armHitCounts: Array<number>;
+	/** Names the caller's own "locations are non-empty here" invariant. */
+	emptyMessage: string;
+	entry: { locations: ReadonlyArray<SourceLocation>; type: string };
+	fileBranches: Array<PendingBranch>;
+	locations: PendingBranch["locations"];
 }
 
 interface SourceMapped {
@@ -120,7 +151,7 @@ export function mapCoverageToTypeScript(
 	coverageData: RawCoverageData,
 	manifest: CoverageManifest,
 ): MappedCoverageResult {
-	const pendingStatements = new Map<string, Map<string, PendingStatement>>();
+	const pendingStatements = new Map<string, FileStatements>();
 	const pendingFunctions = new Map<string, Array<PendingFunction>>();
 	const pendingBranches = new Map<string, Array<PendingBranch>>();
 
@@ -195,24 +226,35 @@ function toIstanbulColumn(luauColumn: number): number {
 	return Math.max(0, luauColumn - 1);
 }
 
+function getOrCreate<K, V>(map: Map<K, V>, key: K, create: () => V): V {
+	let value = map.get(key);
+	if (value === undefined) {
+		value = create();
+		map.set(key, value);
+	}
+
+	return value;
+}
+
+/** Get the list entries under `key` accumulate into, creating it on demand. */
+function pendingListFor<K, T>(pending: Map<K, Array<T>>, key: K): Array<T> {
+	return getOrCreate(pending, key, () => []);
+}
+
 function passthroughFileStatements(
 	resources: FileResources,
 	fileCoverage: RawCoverageData[string],
-	pending: Map<string, Map<string, PendingStatement>>,
+	pending: Map<string, FileStatements>,
 ): void {
-	let fileStatements = pending.get(resources.sourceKey);
-	if (fileStatements === undefined) {
-		fileStatements = new Map();
-		pending.set(resources.sourceKey, fileStatements);
-	}
+	const fileStatements = getOrCreate(pending, resources.sourceKey, () => new Map());
 
 	for (const [statementId, span] of Object.entries(resources.coverageMap.statementMap)) {
-		const hitCount = fileCoverage.s[statementId] ?? 0;
-		fileStatements.set(statementId, {
+		const statement: PendingStatement = {
 			end: { column: toIstanbulColumn(span.end.column), line: span.end.line },
-			hitCount,
+			hitCount: fileCoverage.s[statementId] ?? 0,
 			start: { column: toIstanbulColumn(span.start.column), line: span.start.line },
-		});
+		};
+		pendingListFor(fileStatements, statement.start.line).push(statement);
 	}
 }
 
@@ -225,11 +267,7 @@ function passthroughFileFunctions(
 		return;
 	}
 
-	let fileFunctions = pendingFunctions.get(resources.sourceKey);
-	if (fileFunctions === undefined) {
-		fileFunctions = [];
-		pendingFunctions.set(resources.sourceKey, fileFunctions);
-	}
+	const fileFunctions = pendingListFor(pendingFunctions, resources.sourceKey);
 
 	for (const [functionId, entry] of Object.entries(resources.coverageMap.functionMap)) {
 		fileFunctions.push({
@@ -249,6 +287,42 @@ function passthroughFileFunctions(
 	}
 }
 
+function toIstanbulLocations(locations: ReadonlyArray<SourceLocation>): PendingBranch["locations"] {
+	return locations.map((location) => {
+		return {
+			end: { column: toIstanbulColumn(location.end.column), line: location.end.line },
+			start: { column: toIstanbulColumn(location.start.column), line: location.start.line },
+		};
+	});
+}
+
+/**
+ * Record one branch, spanning its arms from the first arm's start to the last
+ * arm's end. `emptyMessage` names the caller's own invariant, since the two
+ * callers reach a non-empty `locations` by different routes.
+ */
+function pushPendingBranch({
+	armHitCounts,
+	emptyMessage,
+	entry,
+	fileBranches,
+	locations,
+}: PushPendingBranchOptions): void {
+	const firstLocation = locations[0];
+	const lastLocation = locations.at(-1);
+	assert(firstLocation !== undefined && lastLocation !== undefined, emptyMessage);
+
+	fileBranches.push({
+		armHitCounts: entry.locations.map((_, index) => armHitCounts[index] ?? 0),
+		loc: {
+			end: lastLocation.end,
+			start: firstLocation.start,
+		},
+		locations,
+		type: entry.type,
+	});
+}
+
 // --- Source-mapped helpers (roblox-ts → TypeScript) ---
 
 function passthroughFileBranches(
@@ -260,43 +334,21 @@ function passthroughFileBranches(
 		return;
 	}
 
-	let fileBranches = pendingBranches.get(resources.sourceKey);
-	if (fileBranches === undefined) {
-		fileBranches = [];
-		pendingBranches.set(resources.sourceKey, fileBranches);
-	}
+	const fileBranches = pendingListFor(pendingBranches, resources.sourceKey);
 
 	for (const [branchId, entry] of Object.entries(resources.coverageMap.branchMap)) {
 		const armHitCounts = fileCoverage.b?.[branchId] ?? [];
-		const locations: PendingBranch["locations"] = entry.locations.map((location) => {
-			return {
-				end: { column: toIstanbulColumn(location.end.column), line: location.end.line },
-				start: {
-					column: toIstanbulColumn(location.start.column),
-					line: location.start.line,
-				},
-			};
-		});
-
+		const locations = toIstanbulLocations(entry.locations);
 		if (locations.length === 0) {
 			continue;
 		}
 
-		const firstLocation = locations[0];
-		const lastLocation = locations.at(-1);
-		assert(
-			firstLocation !== undefined && lastLocation !== undefined,
-			"Branch locations must not be empty after filtering",
-		);
-
-		fileBranches.push({
-			armHitCounts: entry.locations.map((_, index) => armHitCounts[index] ?? 0),
-			loc: {
-				end: lastLocation.end,
-				start: firstLocation.start,
-			},
+		pushPendingBranch({
+			armHitCounts,
+			emptyMessage: "Branch locations must not be empty after filtering",
+			entry,
+			fileBranches,
 			locations,
-			type: entry.type,
 		});
 	}
 }
@@ -308,20 +360,11 @@ function passthroughFileBranches(
  * Joining with the map directory normalizes these to cwd-relative paths.
  * Paths that are already cwd-relative (no `..` prefix) pass through unchanged.
  */
-function resolveSourcePath(source: string, sourceMapDirectory: string): string {
-	const normalized = normalizeWindowsPath(source);
-	if (!normalized.startsWith("..")) {
-		return normalized;
-	}
-
-	return path.posix.normalize(path.posix.join(sourceMapDirectory, normalized));
-}
-
 function mapStatement(
 	traceMap: TraceMap,
 	span: { end: { column: number; line: number }; start: { column: number; line: number } },
 	sourceMapDirectory: string,
-): undefined | { end: MappedPosition; start: MappedPosition } {
+): MappedSpan | undefined {
 	// Luau columns are 1-based, source maps expect 0-based
 	const mappedStart = originalPositionFor(traceMap, {
 		column: Math.max(0, span.start.column - 1),
@@ -373,41 +416,74 @@ function maxPosition(
 	return a.column >= b.column ? a : b;
 }
 
-function addOrCoalesce(
-	pending: Map<string, Map<string, PendingStatement>>,
-	start: MappedPosition,
-	end: MappedPosition,
-	hitCount: number,
-): void {
-	const tsPath = start.source;
-
-	let fileStatements = pending.get(tsPath);
-	if (fileStatements === undefined) {
-		fileStatements = new Map();
-		pending.set(tsPath, fileStatements);
+/**
+ * Finds the entry on `sameLine` that a newly mapped statement belongs to, if
+ * any.
+ *
+ * One TypeScript statement lowers to several Luau statements — a destructuring
+ * declaration becomes `local _binding = ...` plus one statement per bound name,
+ * and a nested expression is hoisted into its own temporary — each mapped to a
+ * different column of the same source line. Istanbul counts one entry per
+ * *source* statement, so keying on the exact start position alone inflates the
+ * statement total and splits the hit count across fragments that sit in
+ * different basic blocks: the outer fragment runs, an inner one does not, and
+ * the line reports as partially covered although the source statement ran.
+ *
+ * Sharing a start line is therefore the rule, qualified by one of the two spans
+ * covering several lines — that span is the enclosing statement, so the pair
+ * cannot be two single-line statements that merely share a line. The
+ * qualification is a heuristic, not a parse: distinct single-line statements
+ * sharing a line with a multi-line one do get merged. Ruling that out needs the
+ * enclosing source statement's range, which a source map does not carry — the
+ * mapped end position is the nearest preceding segment, not the statement's
+ * true end, so testing containment instead would miss real fragments.
+ */
+function findCoalescenceTarget(
+	sameLine: ReadonlyArray<PendingStatement>,
+	{ end, start }: MappedSpan,
+): PendingStatement | undefined {
+	const exact = sameLine.find((candidate) => candidate.start.column === start.column);
+	if (exact !== undefined) {
+		return exact;
 	}
 
-	// Key is per-file (partitioned by tsPath), so identical
-	// start positions in different files cannot collide
-	const coalescenceKey = `${String(start.line)}:${String(start.column)}`;
-	const existing = fileStatements.get(coalescenceKey);
+	if (end.line > start.line) {
+		return sameLine[0];
+	}
 
-	if (existing !== undefined) {
-		existing.hitCount += hitCount;
-		existing.end = maxPosition(existing.end, { column: end.column, line: end.line });
-	} else {
-		fileStatements.set(coalescenceKey, {
+	return sameLine.find((candidate) => candidate.end.line > candidate.start.line);
+}
+
+function addOrCoalesce({ hitCount, pending, span }: AddOrCoalesceOptions): void {
+	const { end, start } = span;
+	// Partitioned by tsPath, so equal positions in different source files
+	// cannot collide.
+	const fileStatements = getOrCreate(pending, start.source, () => new Map());
+	const sameLine = pendingListFor(fileStatements, start.line);
+	const existing = findCoalescenceTarget(sameLine, span);
+
+	if (existing === undefined) {
+		sameLine.push({
 			end: { column: end.column, line: end.line },
 			hitCount,
 			start: { column: start.column, line: start.line },
 		});
+		return;
+	}
+
+	existing.hitCount += hitCount;
+	existing.end = maxPosition(existing.end, { column: end.column, line: end.line });
+	// Widen leftwards only. The start line matches by construction, so this
+	// moves a column and the grouping stays valid.
+	if (start.column < existing.start.column) {
+		existing.start.column = start.column;
 	}
 }
 
 function mapFileStatements(
 	resources: SourceMapped,
 	fileCoverage: RawCoverageData[string],
-	pending: Map<string, Map<string, PendingStatement>>,
+	pending: Map<string, FileStatements>,
 ): Set<string> {
 	const resolvedTsPaths = new Set<string>();
 
@@ -420,10 +496,39 @@ function mapFileStatements(
 		}
 
 		resolvedTsPaths.add(mapped.start.source);
-		addOrCoalesce(pending, mapped.start, mapped.end, hitCount);
+		addOrCoalesce({ hitCount, pending, span: mapped });
 	}
 
 	return resolvedTsPaths;
+}
+
+/**
+ * Function location couldn't be source-mapped — fall back to the TS path
+ * inferred from successfully-mapped statements so the function still appears in
+ * % Funcs (typically uncovered). Picks the first resolved path; roblox-ts emits
+ * one .luau per .ts file so multi-source is not expected in practice.
+ */
+function addUnmappedFunction(
+	pendingFunctions: Map<string, Array<PendingFunction>>,
+	resolvedTsPaths: Set<string>,
+	name: string,
+	hitCount: number,
+): void {
+	const fallbackPath = resolvedTsPaths.values().next().value;
+	if (fallbackPath === undefined) {
+		return;
+	}
+
+	// Use line 1, column 0 — Istanbul consumers expect 1-based lines; line 0 may
+	// render oddly in HTML/lcov reporters.
+	pendingListFor(pendingFunctions, fallbackPath).push({
+		name,
+		hitCount,
+		loc: {
+			end: { column: 0, line: 1 },
+			start: { column: 0, line: 1 },
+		},
+	});
 }
 
 function mapFileFunctions(
@@ -445,49 +550,17 @@ function mapFileFunctions(
 			resources.sourceMapDirectory,
 		);
 
-		if (mapped !== undefined) {
-			const tsPath = mapped.start.source;
-			let fileFunctions = pendingFunctions.get(tsPath);
-			if (fileFunctions === undefined) {
-				fileFunctions = [];
-				pendingFunctions.set(tsPath, fileFunctions);
-			}
-
-			fileFunctions.push({
-				name: entry.name,
-				hitCount,
-				loc: {
-					end: { column: mapped.end.column, line: mapped.end.line },
-					start: { column: mapped.start.column, line: mapped.start.line },
-				},
-			});
+		if (mapped === undefined) {
+			addUnmappedFunction(pendingFunctions, resolvedTsPaths, entry.name, hitCount);
 			continue;
 		}
 
-		// Function location couldn't be source-mapped — fall back to
-		// the TS path inferred from successfully-mapped statements so
-		// the function still appears in % Funcs (typically uncovered).
-		// Picks the first resolved path; roblox-ts emits one .luau per
-		// .ts file so multi-source is not expected in practice.
-		const fallbackPath = resolvedTsPaths.values().next().value;
-		if (fallbackPath === undefined) {
-			continue;
-		}
-
-		let fileFunctions = pendingFunctions.get(fallbackPath);
-		if (fileFunctions === undefined) {
-			fileFunctions = [];
-			pendingFunctions.set(fallbackPath, fileFunctions);
-		}
-
-		// Use line 1, column 0 — Istanbul consumers expect 1-based
-		// lines; line 0 may render oddly in HTML/lcov reporters.
-		fileFunctions.push({
+		pendingListFor(pendingFunctions, mapped.start.source).push({
 			name: entry.name,
 			hitCount,
 			loc: {
-				end: { column: 0, line: 1 },
-				start: { column: 0, line: 1 },
+				end: { column: mapped.end.column, line: mapped.end.line },
+				start: { column: mapped.start.column, line: mapped.start.line },
 			},
 		});
 	}
@@ -542,8 +615,8 @@ function mapBranchArmLocations(
  */
 function hasCollapsedPhantomArm(locations: MappedArmLocations["locations"]): boolean {
 	return locations.some((arm, index) => {
-		const zeroWidth = arm.start.line === arm.end.line && arm.start.column === arm.end.column;
-		if (!zeroWidth) {
+		const isZeroWidth = arm.start.line === arm.end.line && arm.start.column === arm.end.column;
+		if (!isZeroWidth) {
 			return false;
 		}
 
@@ -585,27 +658,12 @@ function mapFileBranches(
 			continue;
 		}
 
-		let fileBranches = pendingBranches.get(result.tsPath);
-		if (fileBranches === undefined) {
-			fileBranches = [];
-			pendingBranches.set(result.tsPath, fileBranches);
-		}
-
-		const firstLocation = result.locations[0];
-		const lastLocation = result.locations.at(-1);
-		assert(
-			firstLocation !== undefined && lastLocation !== undefined,
-			"Branch locations must not be empty after successful mapping",
-		);
-
-		fileBranches.push({
-			armHitCounts: entry.locations.map((_, index) => armHitCounts[index] ?? 0),
-			loc: {
-				end: lastLocation.end,
-				start: firstLocation.start,
-			},
+		pushPendingBranch({
+			armHitCounts,
+			emptyMessage: "Branch locations must not be empty after successful mapping",
+			entry,
+			fileBranches: pendingListFor(pendingBranches, result.tsPath),
 			locations: result.locations,
-			type: entry.type,
 		});
 	}
 }
@@ -614,21 +672,23 @@ function mapFileBranches(
 
 function populateStatements(
 	file: MappedFileCoverage,
-	statementMap: Map<string, PendingStatement> | undefined,
+	fileStatements: FileStatements | undefined,
 ): void {
-	if (statementMap === undefined) {
+	if (fileStatements === undefined) {
 		return;
 	}
 
 	let index = 0;
-	for (const statement of statementMap.values()) {
-		const id = String(index);
-		file.statementMap[id] = {
-			end: statement.end,
-			start: statement.start,
-		};
-		file.s[id] = statement.hitCount;
-		index++;
+	for (const lineStatements of fileStatements.values()) {
+		for (const statement of lineStatements) {
+			const id = String(index);
+			file.statementMap[id] = {
+				end: statement.end,
+				start: statement.start,
+			};
+			file.s[id] = statement.hitCount;
+			index++;
+		}
 	}
 }
 
@@ -671,7 +731,7 @@ function populateBranches(
 }
 
 function buildResult(
-	pending: Map<string, Map<string, PendingStatement>>,
+	pending: Map<string, FileStatements>,
 	pendingFunctions: Map<string, Array<PendingFunction>>,
 	pendingBranches: Map<string, Array<PendingBranch>>,
 ): MappedCoverageResult {

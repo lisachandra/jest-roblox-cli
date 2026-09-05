@@ -1,6 +1,7 @@
 import color from "tinyrainbow";
 
 import type { StreamingResultEntry } from "../memory-store/sorted-map-client.ts";
+import { composeEntryDisplayName } from "../utils/display-name.ts";
 
 export interface ProgressLineOptions {
 	color: boolean;
@@ -8,7 +9,7 @@ export interface ProgressLineOptions {
 
 /**
  * Build a single-line per-package status string for the streaming
- * progress sink. Format: `▶ <pkg> N passed | M failed | K skipped (Xms)`.
+ * progress sink. Format: `▶ <pkg> N failed | M passed | K skipped (Xms)`.
  *
  * The line is intentionally narrow — it lands mid-task while siblings are
  * still running; the full project section (failures, snippets, summary)
@@ -18,13 +19,13 @@ export function formatStreamingProgressLine(
 	entry: StreamingResultEntry,
 	options: ProgressLineOptions,
 ): string {
-	const useColor = options.color;
+	const isColorEnabled = options.color;
 	const label = formatLabel(entry);
-	const dim = useColor ? color.dim : identity;
+	const dim = isColorEnabled ? color.dim : identity;
 	const elapsed = dim(`(${entry.elapsedMs.toString()}ms)`);
 
-	const breakdown = formatBreakdown(entry, useColor);
-	const arrow = useColor ? color.cyan("▶") : "▶";
+	const breakdown = formatBreakdown(entry, isColorEnabled);
+	const arrow = isColorEnabled ? color.cyan("▶") : "▶";
 	return `${arrow} ${label}  ${breakdown} ${elapsed}`;
 }
 
@@ -43,14 +44,14 @@ function pushPart(
 	}
 }
 
-function formatBreakdown(entry: StreamingResultEntry, useColor: boolean): string {
+function formatBreakdown(entry: StreamingResultEntry, isColorEnabled: boolean): string {
 	const parts: Array<string> = [];
-	pushPart(parts, entry.numPassedTests, "passed", useColor ? color.green : identity);
-	pushPart(parts, entry.numFailedTests, "failed", useColor ? color.red : identity);
-	pushPart(parts, entry.numPendingTests, "skipped", useColor ? color.yellow : identity);
+	pushPart(parts, entry.numFailedTests, "failed", isColorEnabled ? color.red : identity);
+	pushPart(parts, entry.numPassedTests, "passed", isColorEnabled ? color.green : identity);
+	pushPart(parts, entry.numPendingTests, "skipped", isColorEnabled ? color.yellow : identity);
 	return parts.length > 0 ? parts.join(" | ") : "0 tests";
 }
 
 function formatLabel(entry: StreamingResultEntry): string {
-	return entry.pkg === entry.project ? entry.pkg : `${entry.pkg} › ${entry.project}`;
+	return composeEntryDisplayName(entry.pkg, entry.project);
 }

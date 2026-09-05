@@ -1,47 +1,41 @@
-import { WorkQueue } from "@isentinel/roblox-runner";
+import { createJsonWorkQueueWriter, type WorkQueueWriter } from "@isentinel/roblox-runner";
 
-import { type } from "arktype";
 import { randomUUID } from "node:crypto";
 
 const DEFAULT_TTL_SECONDS = 600;
 const INVISIBILITY_BUFFER_SECONDS = 30;
-
-const queueItemSchema = type({ pkg: "string", project: "string" });
 
 export interface QueueItem {
 	pkg: string;
 	project: string;
 }
 
+export interface PreparedWorkStealing {
+	/**
+	 * Materializer-side invisibility window = perPackageTimeoutSeconds + 30.
+	 */
+	invisibilityWindowSeconds: number;
+	/** Per-run UUID-keyed queue name. */
+	queueId: string;
+	/**
+	 * TTL the items were pushed with. Travels on to the runner, which names it
+	 * again when it puts back an item it dropped over its return budget.
+	 */
+	ttlSeconds: number;
+}
+
 interface PrepareWorkStealingOptions {
 	/** Override the Open Cloud base URL (default: live Roblox endpoint). */
-	baseUrl?: string;
+	baseUrl?: string | undefined;
 	credentials: { apiKey: string; universeId: string };
 	packages: ReadonlyArray<QueueItem>;
 	perPackageTimeoutSeconds: number;
-	/** Override the WorkQueue factory (default: real WorkQueue from runner). */
-	queueFactory?: (queueId: string) => WorkQueue<QueueItem>;
+	/** Override the queue writer factory (default: real writer from runner). */
+	queueFactory?: (queueId: string) => WorkQueueWriter<QueueItem>;
 	/** TTL for queue items in seconds. Default 600 (10 min). */
 	ttlSeconds?: number;
 	/** Override the UUID generator (default: `crypto.randomUUID`). */
 	uuid?: () => string;
-}
-
-interface PreparedWorkStealing {
-	/** Materializer-side invisibility window = perPackageTimeoutSeconds + 30. */
-	invisibilityWindowSeconds: number;
-	/** Per-run UUID-keyed queue name. */
-	queueId: string;
-}
-
-/** Identity-style encoder: queue items round-trip as plain JSON objects. */
-export function encodeQueueItem(item: QueueItem): { pkg: string; project: string } {
-	return { pkg: item.pkg, project: item.project };
-}
-
-/** Validates the wire payload against the QueueItem shape; throws on mismatch. */
-export function decodeQueueItem(value: unknown): QueueItem {
-	return queueItemSchema.assert(value);
 }
 
 /**
@@ -52,26 +46,25 @@ export function decodeQueueItem(value: unknown): QueueItem {
  * execution plus a small buffer so a crashing task lets its in-flight
  * package become visible again to siblings.
  */
-export async function prepareWorkStealingQueue(
+export async function prepareWorkStealingQueueAsync(
 	options: PrepareWorkStealingOptions,
 ): Promise<PreparedWorkStealing> {
 	const queueId = (options.uuid ?? randomUUID)();
 	const ttlSeconds = options.ttlSeconds ?? DEFAULT_TTL_SECONDS;
 	const queue =
 		options.queueFactory?.(queueId) ??
-		new WorkQueue<QueueItem>({
+		createJsonWorkQueueWriter<QueueItem>({
 			apiKey: options.credentials.apiKey,
-			...(options.baseUrl !== undefined ? { baseUrl: options.baseUrl } : {}),
-			decode: decodeQueueItem,
-			encode: encodeQueueItem,
+			baseUrl: options.baseUrl,
 			queueId,
 			universeId: options.credentials.universeId,
 		});
 
-	await queue.enqueue(options.packages, { ttlMs: ttlSeconds * 1000 });
+	await queue.enqueueAsync(options.packages, { ttlMs: ttlSeconds * 1000 });
 
 	return {
 		invisibilityWindowSeconds: options.perPackageTimeoutSeconds + INVISIBILITY_BUFFER_SECONDS,
 		queueId,
+		ttlSeconds,
 	};
 }

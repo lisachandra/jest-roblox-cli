@@ -1,15 +1,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+export const PNPM_MARKER = "pnpm-workspace.yaml";
 export const TURBO_MARKER = "turbo.json";
 export const NX_MARKER = "nx.json";
 
-const MARKERS = ["pnpm-workspace.yaml", TURBO_MARKER, NX_MARKER] as const;
+const MARKERS = [PNPM_MARKER, TURBO_MARKER, NX_MARKER] as const;
 
 export function discoverWorkspaceRoot(cwd: string): string {
 	let current = path.resolve(cwd);
 	while (true) {
-		if (MARKERS.some((marker) => fs.existsSync(path.join(current, marker)))) {
+		if (hasWorkspaceMarker(current)) {
 			return current;
 		}
 
@@ -22,4 +23,8 @@ export function discoverWorkspaceRoot(cwd: string): string {
 
 		current = parent;
 	}
+}
+
+function hasWorkspaceMarker(directory: string): boolean {
+	return MARKERS.some((marker) => fs.existsSync(path.join(directory, marker)));
 }

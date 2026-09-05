@@ -1,56 +1,85 @@
-import { loadConfig as c12LoadConfig } from "c12";
+import { loadConfig as c12LoadConfig, type LoadConfigOptions } from "c12";
 import { defuFn } from "defu";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import process from "node:process";
 
+import { isAbsolutePath, normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import type { Config, ResolvedConfig } from "./schema.ts";
 import { DEFAULT_CONFIG, validateConfig } from "./schema.ts";
 
-export function applySnapshotFormatDefaults(
-	config: ResolvedConfig,
-	isLuauProject: boolean,
-): ResolvedConfig {
-	if (config.snapshotFormat?.printBasicPrototype !== undefined) {
-		return config;
-	}
-
-	return {
-		...config,
-		snapshotFormat: {
-			...config.snapshotFormat,
-			printBasicPrototype: isLuauProject,
-		},
-	};
+/**
+ * A config module as `require` hands it back. An ESM config arrives with the
+ * config under `default`; c12's `resolveModule` unwraps it, and
+ * `validateConfig` parses the result.
+ */
+interface ConfigModule {
+	readonly default?: unknown;
 }
+
+interface LoadedConfig {
+	config: Config;
+	/**
+	 * Directory of the config file c12 actually resolved — the anchor for a
+	 * declared relative `rootDir`. Falls back to the caller's `cwd` when the
+	 * load found no file at all.
+	 */
+	loadDirectory: string;
+}
+
+interface ExtendsLayerRequest {
+	/**
+	 * Absolute path of the config declaring `extends`; entries resolve against
+	 * its directory.
+	 */
+	canonicalFile: string;
+	extendList: Array<string>;
+	visited: Set<string>;
+}
+
+type MergerKey =
+	| "collectCoverageFrom"
+	| "coverageCopyIgnorePatterns"
+	| "coveragePathIgnorePatterns"
+	| "coverageReporters"
+	| "coverageThreshold"
+	| "formatters"
+	| "luauRoots"
+	| "reporters"
+	| "roots"
+	| "selectProjects"
+	| "setupFiles"
+	| "setupFilesAfterEnv"
+	| "snapshotFormat"
+	| "snapshotSerializers"
+	| "testMatch"
+	| "testPathIgnorePatterns";
+
+type MergerDefault = NonNullable<ResolvedConfig[MergerKey]>;
 
 export function resolveConfig(config: Config): ResolvedConfig {
 	validateConfig(config);
 
-	const { test, ...rest } = config;
-	const definedRest = Object.fromEntries(
-		Object.entries(rest).filter(([, value]) => value !== undefined),
-	);
-	const definedTest =
-		test === undefined
-			? {}
-			: Object.fromEntries(Object.entries(test).filter(([, value]) => value !== undefined));
+	const { gameOutput, outputFile, test, ...rest } = config;
 
 	// Flatten test: block onto resolved config so downstream consumers
 	// (executor, projects, test-script, formatters) see jest options at the
 	// top level. TODO: refactor consumers to read `config.test.*` directly.
-	const resolved: ResolvedConfig = { ...DEFAULT_CONFIG, ...definedTest, ...definedRest };
+	const resolved: ResolvedConfig = { ...DEFAULT_CONFIG, ...test, ...rest };
 
 	// `gameOutput: true` / `outputFile: true` are shorthand for the
 	// conventional `game-output.log` / `jest-output.log` under the root.
 	// Expand here so downstream consumers only ever see a path string.
-	if (config.gameOutput === true) {
-		resolved.gameOutput = path.join(resolved.rootDir, "game-output.log");
+	if (gameOutput !== undefined) {
+		resolved.gameOutput =
+			gameOutput === true ? path.join(resolved.rootDir, "game-output.log") : gameOutput;
 	}
 
-	if (config.outputFile === true) {
-		resolved.outputFile = path.join(resolved.rootDir, "jest-output.log");
+	if (outputFile !== undefined) {
+		resolved.outputFile =
+			outputFile === true ? path.join(resolved.rootDir, "jest-output.log") : outputFile;
 	}
 
 	return resolved;
@@ -70,28 +99,17 @@ export async function loadRawConfig(
 	configPath?: string,
 	cwd: string = process.cwd(),
 ): Promise<Config> {
-	let result;
-	try {
-		result = await invokeC12(configPath, cwd);
-	} catch (err) {
-		if (configPath !== undefined && isC12NotFoundError(err)) {
-			throw new Error(`Config file not found: ${configPath}`, { cause: err });
-		}
+	const { config } = await loadConfigLayers(configPath, cwd);
 
-		throw err;
-	}
-
-	const mergedConfig = await processExtends(result, new Set());
-
-	return validateConfig(resolveFunctionValues(mergedConfig));
+	return config;
 }
 
 export async function loadConfig(
 	configPath?: string,
 	cwd: string = process.cwd(),
 ): Promise<ResolvedConfig> {
-	const config = await loadRawConfig(configPath, cwd);
-	config.rootDir ??= cwd;
+	const { config, loadDirectory } = await loadConfigLayers(configPath, cwd);
+	config.rootDir = anchorRootDirectory(config.rootDir, loadDirectory, cwd);
 
 	return resolveConfig(config);
 }
@@ -118,39 +136,119 @@ function isSea(): boolean {
 // unresolvable import surfaces Node's standard module-resolution error. `.json`
 // keeps its read + parse path (a bare `require` of JSON works too, but reading
 // avoids relying on CJS JSON-module semantics).
-async function seaImport(id: string): Promise<JSONValue> {
+async function seaImport(id: string): Promise<ConfigModule | JSONValue> {
 	if (id.endsWith(".json")) {
-		const content = readFileSync(id, "utf-8");
+		const content = await readFile(id, "utf-8");
 		return JSON.parse(content);
 	}
 
-	return createRequire(id)(id) as JSONValue;
+	const requireConfig: (moduleId: string) => ConfigModule = createRequire(id);
+	return requireConfig(id);
 }
 
-// c12's merger signature and defuFn's generic signature are structurally
-// incompatible. This wrapper bridges the two with a single boundary cast.
+// defuFn wants a non-empty argument list, which a variadic array can't prove.
+// The leading `{}` supplies it and contributes nothing: defu gives the first
+// source the highest priority, so an empty one leaves the merge order intact.
 function merger(...sources: Array<Config | null | undefined>): Config {
-	return defuFn(...(sources.filter(Boolean) as [Config, ...Array<Config>]));
+	return defuFn({}, ...sources);
 }
 
 async function invokeC12(configFile: string | undefined, cwd: string) {
-	return c12LoadConfig<Config>({
+	let options: LoadConfigOptions<Config> = {
 		name: "jest",
-		configFile,
 		configFileRequired: configFile !== undefined,
 		cwd,
 		dotenv: false,
 		extend: false,
 		globalRc: false,
-		// In SEA mode, jiti's babel.cjs can't be resolved from the
-		// single-executable archive. Bypass jiti entirely by providing a
-		// custom import function.
-		import: isSea() ? seaImport : undefined,
 		merger,
 		omit$Keys: true,
 		packageJson: false,
 		rcFile: false,
-	});
+	};
+	if (configFile !== undefined) {
+		options = { ...options, configFile };
+	}
+
+	// In SEA mode, jiti's babel.cjs can't be resolved from the
+	// single-executable archive. Bypass jiti entirely by providing a
+	// custom import function.
+	return isSea()
+		? c12LoadConfig<Config>({ ...options, import: seaImport })
+		: c12LoadConfig<Config>(options);
+}
+
+/**
+ * Load the config layers, reporting the directory c12 resolved the entry file
+ * from alongside the merged result. The directory is the anchor a declared
+ * relative `rootDir` needs, and it survives only here — `processExtends` merges
+ * the layers into one object that no longer records where any of them lived.
+ */
+async function loadConfigLayers(
+	configPath: string | undefined,
+	cwd: string,
+): Promise<LoadedConfig> {
+	let result;
+	try {
+		result = await invokeC12(configPath, cwd);
+	} catch (err) {
+		if (configPath !== undefined && isC12NotFoundError(err)) {
+			throw new Error(`Config file not found: ${configPath}`, { cause: err });
+		}
+
+		throw err;
+	}
+
+	const mergedConfig = await processExtends(result, new Set());
+	const loadedFile = result.configFile;
+
+	return {
+		config: validateConfig(resolveFunctionValues(mergedConfig)),
+		// c12 reports a `configFile` even for a search that matched nothing, so
+		// the existence check is what distinguishes a real load from a miss.
+		loadDirectory:
+			loadedFile !== undefined && existsSync(loadedFile)
+				? path.dirname(path.resolve(loadedFile))
+				: cwd,
+	};
+}
+
+/**
+ * The `rootDir` every consumer anchors on, absolute. A declared relative one
+ * anchors on `loadDirectory` — the directory holding the config that declared
+ * it, which in workspace mode is the package directory. That is what makes
+ * `rootDir: "."` name the package rather than the invocation directory, whether
+ * the package config was found by search or named outright with `--config`.
+ *
+ * An absent `rootDir` still defaults to the invocation directory: a package
+ * that declares nothing is opting into the caller's frame of reference, and
+ * `--config packages/foo/jest.config.ts` from the workspace root has always
+ * meant "run foo's suite from here".
+ *
+ * Absoluteness is the cross-host question, not `path.resolve`'s: that reads
+ * `D:/repo` as a relative filename off Linux and would hang the whole config
+ * under `<cwd>/D:/repo`. An already-absolute `rootDir` is passed through in the
+ * spelling the config wrote, which is what the prefix-comparing consumers
+ * (`resolveUniverseAnchor`, `filter-projects-by-files`) expect to see.
+ */
+function anchorRootDirectory(
+	rootDirectory: string | undefined,
+	loadDirectory: string,
+	cwd: string,
+): string {
+	if (rootDirectory === undefined) {
+		// `cwd` is a caller's string too — `--workspace-root=.` reaches here
+		// verbatim — so this branch resolves rather than passing it on. It needs
+		// no cross-host guard: a `cwd` names a directory on the host doing the
+		// running, while a `rootDir` is committed and read from both.
+		return path.resolve(cwd);
+	}
+
+	if (isAbsolutePath(normalizeWindowsPath(rootDirectory))) {
+		return rootDirectory;
+	}
+
+	return path.resolve(loadDirectory, rootDirectory);
 }
 
 // `workspace.root` is relative in source; anchor it to the directory of the
@@ -185,7 +283,7 @@ async function processExtends(
 	result: Awaited<ReturnType<typeof invokeC12>>,
 	visited: Set<string>,
 ): Promise<Config> {
-	const loadedConfig: Config = result.config;
+	const loadedConfig = result.config;
 	const loadedFile = result.configFile;
 
 	if (loadedFile === undefined || !existsSync(loadedFile)) {
@@ -207,34 +305,46 @@ async function processExtends(
 	visited.add(canonicalFile);
 	try {
 		const extendList = Array.isArray(extendsValue) ? extendsValue : [extendsValue];
-		const configFileDirectory = path.dirname(canonicalFile);
-		const layers: Array<Config> = [];
-
-		for (const entry of extendList) {
-			const target = path.isAbsolute(entry)
-				? entry
-				: path.resolve(configFileDirectory, entry);
-
-			let extendedResult;
-			try {
-				extendedResult = await invokeC12(target, path.dirname(target));
-			} catch (err) {
-				throw new Error(`Failed to resolve extends "${entry}" from "${canonicalFile}".`, {
-					cause: err,
-				});
-			}
-
-			const extendedConfig = await processExtends(extendedResult, visited);
-			layers.push(extendedConfig);
-		}
-
+		const layers = await loadExtendsLayers({ canonicalFile, extendList, visited });
 		return merger(configWithoutExtends, ...layers);
 	} finally {
 		visited.delete(canonicalFile);
 	}
 }
 
-const EMPTY_ARRAY_DEFAULT_KEYS = new Set([
+/**
+ * Load each `extends` entry in declaration order, recursing so a base config
+ * may itself extend. Returned layers are lowest-priority-last, matching the
+ * order `merger` expects.
+ */
+async function loadExtendsLayers({
+	canonicalFile,
+	extendList,
+	visited,
+}: ExtendsLayerRequest): Promise<Array<Config>> {
+	const configFileDirectory = path.dirname(canonicalFile);
+	const layers: Array<Config> = [];
+
+	for (const entry of extendList) {
+		const target = path.isAbsolute(entry) ? entry : path.resolve(configFileDirectory, entry);
+
+		let extendedResult;
+		try {
+			extendedResult = await invokeC12(target, path.dirname(target));
+		} catch (err) {
+			throw new Error(`Failed to resolve extends "${entry}" from "${canonicalFile}".`, {
+				cause: err,
+			});
+		}
+
+		const extendedConfig = await processExtends(extendedResult, visited);
+		layers.push(extendedConfig);
+	}
+
+	return layers;
+}
+
+const EMPTY_ARRAY_DEFAULT_KEYS: ReadonlySet<MergerKey> = new Set<MergerKey>([
 	"collectCoverageFrom",
 	"formatters",
 	"luauRoots",
@@ -246,30 +356,31 @@ const EMPTY_ARRAY_DEFAULT_KEYS = new Set([
 	"snapshotSerializers",
 ]);
 
-const EMPTY_OBJECT_DEFAULT_KEYS = new Set(["coverageThreshold", "snapshotFormat"]);
+const EMPTY_OBJECT_DEFAULT_KEYS: ReadonlySet<MergerKey> = new Set<MergerKey>([
+	"coverageThreshold",
+	"snapshotFormat",
+]);
 
-const MERGEABLE_KEYS = new Set([
+const MERGEABLE_KEYS: ReadonlySet<string> = new Set<MergerKey>([
 	...EMPTY_ARRAY_DEFAULT_KEYS,
 	...EMPTY_OBJECT_DEFAULT_KEYS,
+	"coverageCopyIgnorePatterns",
 	"coveragePathIgnorePatterns",
 	"coverageReporters",
 	"testMatch",
 	"testPathIgnorePatterns",
 ]);
 
-function isMergerFunction(value: unknown): value is (defaults: unknown) => unknown {
+function isMergerFunction(value: unknown): value is (defaults: MergerDefault) => MergerDefault {
 	return typeof value === "function";
 }
 
-function shouldResolveMergerFunction(
-	key: string,
-	value: unknown,
-): value is (defaults: unknown) => unknown {
-	return isMergerFunction(value) && MERGEABLE_KEYS.has(key);
+function isMergerKey(key: string): key is MergerKey {
+	return MERGEABLE_KEYS.has(key);
 }
 
-function defaultForMergerKey(key: string): unknown {
-	const defaultValue = (DEFAULT_CONFIG as unknown as Record<string, unknown>)[key];
+function defaultForMergerKey(key: MergerKey): MergerDefault {
+	const defaultValue = DEFAULT_CONFIG[key];
 	if (Array.isArray(defaultValue)) {
 		return [...defaultValue];
 	}
@@ -281,26 +392,26 @@ function defaultForMergerKey(key: string): unknown {
 	return {};
 }
 
-function resolveFunctionValues(config: Config): Config {
-	const { test, ...rest } = config;
-
-	const resolvedRest: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(rest)) {
-		resolvedRest[key] = shouldResolveMergerFunction(key, value)
-			? value(defaultForMergerKey(key))
-			: value;
-	}
+function resolveFunctionValues({ test, ...rest }: Config) {
+	const resolvedRest = Object.fromEntries(
+		Object.entries(rest).map(([key, value]) => [
+			key,
+			isMergerKey(key) && isMergerFunction(value) ? value(defaultForMergerKey(key)) : value,
+		]),
+	);
 
 	if (test === undefined) {
 		return resolvedRest;
 	}
 
-	const resolvedTest: Record<string, unknown> = {};
-	for (const [innerKey, innerValue] of Object.entries(test)) {
-		resolvedTest[innerKey] = shouldResolveMergerFunction(innerKey, innerValue)
-			? innerValue(defaultForMergerKey(innerKey))
-			: innerValue;
-	}
+	const resolvedTest = Object.fromEntries(
+		Object.entries(test).map(([innerKey, innerValue]) => [
+			innerKey,
+			isMergerKey(innerKey) && isMergerFunction(innerValue)
+				? innerValue(defaultForMergerKey(innerKey))
+				: innerValue,
+		]),
+	);
 
 	return { ...resolvedRest, test: resolvedTest };
 }

@@ -1,15 +1,24 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 
 import {
 	collectPaths,
 	rebaseTreePaths,
+	resolveMountPath,
 	resolveNestedProjects,
 	resolveNestedProjectSources,
 } from "./rojo-tree.ts";
 import type { RojoTreeNode } from "./types.ts";
+
+function createTemporaryDirectory(): string {
+	const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rojo-tree-test-"));
+	onTestFinished(() => {
+		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
+	});
+	return temporaryDirectory;
+}
 
 describe(collectPaths, () => {
 	it("should collect all $path strings from a tree", () => {
@@ -186,7 +195,7 @@ describe(resolveNestedProjects, () => {
 	it("should throw with file path when nested project has malformed JSON", () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rojo-tree-test-"));
+		const temporaryDirectory = createTemporaryDirectory();
 		fs.writeFileSync(path.join(temporaryDirectory, "bad.project.json"), "not valid json {{{");
 
 		const tree: RojoTreeNode = {
@@ -196,19 +205,55 @@ describe(resolveNestedProjects, () => {
 			},
 		};
 
-		try {
-			expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow(
-				"bad.project.json",
-			);
-		} finally {
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
-		}
+		expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow("bad.project.json");
+	});
+
+	it("should throw with file path when a nested project has no tree", () => {
+		expect.assertions(1);
+
+		const temporaryDirectory = createTemporaryDirectory();
+		fs.writeFileSync(
+			path.join(temporaryDirectory, "treeless.project.json"),
+			'{ "name": "treeless" }',
+		);
+
+		const tree: RojoTreeNode = {
+			$className: "DataModel",
+			ReplicatedStorage: {
+				treeless: { $path: "treeless.project.json" },
+			},
+		};
+
+		expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow(
+			"Failed to parse nested Rojo project: treeless.project.json",
+		);
+	});
+
+	it("should throw with file path when a nested project's tree is an array", () => {
+		expect.assertions(1);
+
+		const temporaryDirectory = createTemporaryDirectory();
+		fs.writeFileSync(
+			path.join(temporaryDirectory, "array.project.json"),
+			'{ "name": "array", "tree": [] }',
+		);
+
+		const tree: RojoTreeNode = {
+			$className: "DataModel",
+			ReplicatedStorage: {
+				array: { $path: "array.project.json" },
+			},
+		};
+
+		expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow(
+			"Failed to parse nested Rojo project: array.project.json",
+		);
 	});
 
 	it("should throw when a referenced .project.json does not exist", () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rojo-tree-test-"));
+		const temporaryDirectory = createTemporaryDirectory();
 		const tree: RojoTreeNode = {
 			$className: "DataModel",
 			ReplicatedStorage: {
@@ -216,19 +261,15 @@ describe(resolveNestedProjects, () => {
 			},
 		};
 
-		try {
-			expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow(
-				"Could not read nested Rojo project: nonexistent.project.json",
-			);
-		} finally {
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
-		}
+		expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow(
+			"Could not read nested Rojo project: nonexistent.project.json",
+		);
 	});
 
 	it("should throw on circular project references", () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "rojo-tree-test-"));
+		const temporaryDirectory = createTemporaryDirectory();
 		fs.writeFileSync(
 			path.join(temporaryDirectory, "a.project.json"),
 			JSON.stringify({ name: "A", tree: { $path: "b.project.json" } }),
@@ -245,13 +286,9 @@ describe(resolveNestedProjects, () => {
 			},
 		};
 
-		try {
-			expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow(
-				"Circular project reference",
-			);
-		} finally {
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
-		}
+		expect(() => resolveNestedProjects(tree, temporaryDirectory)).toThrow(
+			"Circular project reference",
+		);
 	});
 
 	it("should leave non-string $path values unchanged", () => {
@@ -412,6 +449,147 @@ describe(resolveNestedProjects, () => {
 			},
 		});
 	});
+
+	it("should leave an absolute $path as written", () => {
+		expect.assertions(1);
+
+		const temporaryDirectory = createTemporaryDirectory();
+		const projectDirectory = path.join(temporaryDirectory, "project");
+		const externalDirectory = path.join(temporaryDirectory, "external", "out");
+
+		const tree: RojoTreeNode = {
+			$className: "DataModel",
+			ReplicatedStorage: {
+				External: { $path: externalDirectory },
+			},
+		};
+
+		const result = resolveNestedProjects(tree, projectDirectory);
+
+		expect(result).toStrictEqual({
+			$className: "DataModel",
+			ReplicatedStorage: {
+				External: { $path: externalDirectory.replaceAll("\\", "/") },
+			},
+		});
+	});
+
+	it("should leave a drive-letter $path as written on a host without drives", () => {
+		expect.assertions(1);
+
+		// `path.isAbsolute` reads this as relative on Linux, which would rebase
+		// the mount and resolve the same project file into two different trees
+		// depending on which machine read it.
+		const tree: RojoTreeNode = {
+			$className: "DataModel",
+			ReplicatedStorage: {
+				External: { $path: "Z:/external/out" },
+			},
+		};
+
+		const result = resolveNestedProjects(tree, path.join(os.tmpdir(), "project"));
+
+		expect(result).toStrictEqual({
+			$className: "DataModel",
+			ReplicatedStorage: {
+				External: { $path: "Z:/external/out" },
+			},
+		});
+	});
+
+	it("should leave a backslash-rooted $path as written on a host without drives", () => {
+		expect.assertions(1);
+
+		// A drive-relative root and a UNC share, the two roots a Windows project
+		// writes with backslashes. `path.isAbsolute` reads both as relative on
+		// Linux, which would rebase them onto the project directory.
+		const tree: RojoTreeNode = {
+			$className: "DataModel",
+			ReplicatedStorage: {
+				Drive: { $path: "\\external\\out" },
+				Share: { $path: "\\\\build-server\\share\\out" },
+			},
+		};
+
+		const result = resolveNestedProjects(tree, path.join(os.tmpdir(), "project"));
+
+		expect(result).toStrictEqual({
+			$className: "DataModel",
+			ReplicatedStorage: {
+				Drive: { $path: "/external/out" },
+				Share: { $path: "//build-server/share/out" },
+			},
+		});
+	});
+
+	it("should leave an absolute $path inside a nested project as written", () => {
+		expect.assertions(1);
+
+		const temporaryDirectory = createTemporaryDirectory();
+		const packageDirectory = path.join(temporaryDirectory, "packages", "my-pkg");
+		const externalDirectory = path.join(temporaryDirectory, "external", "out");
+		fs.mkdirSync(packageDirectory, { recursive: true });
+		fs.writeFileSync(
+			path.join(packageDirectory, "default.project.json"),
+			JSON.stringify({
+				name: "my-pkg",
+				tree: {
+					$className: "Folder",
+					Generated: { $path: externalDirectory },
+					Src: { $path: "src" },
+				},
+			}),
+		);
+
+		const tree: RojoTreeNode = {
+			$className: "DataModel",
+			ReplicatedStorage: {
+				"my-pkg": { $path: "packages/my-pkg/default.project.json" },
+			},
+		};
+
+		const result = resolveNestedProjects(tree, temporaryDirectory);
+
+		expect(result).toStrictEqual({
+			$className: "DataModel",
+			ReplicatedStorage: {
+				"my-pkg": {
+					$className: "Folder",
+					Generated: { $path: externalDirectory.replaceAll("\\", "/") },
+					Src: { $path: "packages/my-pkg/src" },
+				},
+			},
+		});
+	});
+
+	it("should inline a nested project named by an absolute $path", () => {
+		expect.assertions(1);
+
+		const temporaryDirectory = createTemporaryDirectory();
+		const projectDirectory = path.join(temporaryDirectory, "project");
+		const packageDirectory = path.join(temporaryDirectory, "pkg");
+		fs.mkdirSync(packageDirectory, { recursive: true });
+		fs.writeFileSync(
+			path.join(packageDirectory, "default.project.json"),
+			JSON.stringify({ name: "pkg", tree: { $path: "src" } }),
+		);
+
+		const tree: RojoTreeNode = {
+			$className: "DataModel",
+			ServerScriptService: {
+				pkg: { $path: packageDirectory },
+			},
+		};
+
+		const result = resolveNestedProjects(tree, projectDirectory);
+
+		expect(result).toStrictEqual({
+			$className: "DataModel",
+			ServerScriptService: {
+				pkg: { $path: "../pkg/src" },
+			},
+		});
+	});
 });
 
 describe(resolveNestedProjectSources, () => {
@@ -533,6 +711,76 @@ describe(resolveNestedProjectSources, () => {
 				pkg: { $path: "pkg/src" },
 			},
 		});
+	});
+});
+
+describe(resolveMountPath, () => {
+	it("should join a relative mount onto the base directory", () => {
+		expect.assertions(1);
+
+		expect(resolveMountPath("/repo/place", "out/client")).toBe("/repo/place/out/client");
+	});
+
+	it("should collapse traversal in a relative mount", () => {
+		expect.assertions(1);
+
+		expect(resolveMountPath("/repo/place", "../shared/out")).toBe("/repo/shared/out");
+	});
+
+	// Against a drive base, so the first row is the case `path.resolve` gets
+	// wrong: it reads a drive-less absolute mount as drive-relative on Windows
+	// and answers with the base's drive, naming a directory that does not exist.
+	it.for([
+		{ expected: "/external/out", mount: "/external/out" },
+		{ expected: "D:/external/out", mount: "D:/external/out" },
+		{ expected: "D:/external/out", mount: "D:\\external\\out" },
+		{ expected: "/external/out", mount: "\\external\\out" },
+	])("should return the absolute mount $mount unjoined", ({ expected, mount }) => {
+		expect.assertions(1);
+
+		expect(resolveMountPath("C:/repo/place", mount)).toBe(expected);
+	});
+
+	it("should return a posix path for a backslash base directory", () => {
+		expect.assertions(1);
+
+		expect(resolveMountPath("D:\\repo\\place", "out/client")).toBe("D:/repo/place/out/client");
+	});
+
+	// `join` keeps a trailing separator where `resolve` ate it. Containment
+	// tests downstream append their own `/`, so a mount ending in one sits
+	// inside nothing and holds nothing.
+	it.for([
+		{ expected: "/repo/place/out", mount: "out/" },
+		{ expected: "/repo/place", mount: "./" },
+		{ expected: "/repo/place/out/client", mount: "out/client/" },
+		{ expected: "/external/out", mount: "/external/out/" },
+		{ expected: "D:/external/out", mount: "D:\\external\\out\\" },
+	])("should drop the trailing separator on $mount", ({ expected, mount }) => {
+		expect.assertions(1);
+
+		expect(resolveMountPath("/repo/place", mount)).toBe(expected);
+	});
+
+	it.for([
+		{ label: "posix", mount: "/" },
+		{ label: "drive", mount: "D:/" },
+	])("should keep a bare $label root whole", ({ mount }) => {
+		expect.assertions(1);
+
+		// Nothing left to name if the separator goes.
+		expect(resolveMountPath("/repo/place", mount)).toBe(mount);
+	});
+
+	it("should leave a mount that contains a root a valid prefix of what it holds", () => {
+		expect.assertions(1);
+
+		// The shape every coverage containment test needs: `${mount}/` has to be
+		// the prefix of a root below it, which a trailing separator would break.
+		const mount = resolveMountPath("/repo/place", "out/");
+		const root = resolveMountPath("/repo/place", "out/client");
+
+		expect(root.startsWith(`${mount}/`)).toBeTrue();
 	});
 });
 

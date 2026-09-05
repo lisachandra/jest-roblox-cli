@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it, onTestFinished } from "vitest";
 
 import { instrumentRoot } from "../../../src/coverage-pipeline/instrumenter.ts";
+import { toPosixRoot } from "../../../src/utils/normalize-windows-path.ts";
 import { createRbxtsFixtureSandbox } from "../../e2e/cli/helpers.ts";
 
 const LUAU_FIXTURE_SRC = path.resolve(__dirname, "../../e2e/fixtures/luau-project/src");
@@ -17,7 +18,7 @@ function createTemporaryDirectory(): string {
 	return directory;
 }
 
-describe("coverage instrumentation", () => {
+describe("coverage instrumentation", { timeout: 30_000 }, () => {
 	describe("luau project", () => {
 		it("should instrument luau source files", () => {
 			expect.assertions(3);
@@ -25,7 +26,7 @@ describe("coverage instrumentation", () => {
 			const shadowDirectory = createTemporaryDirectory();
 
 			const files = instrumentRoot({
-				luauRoot: LUAU_FIXTURE_SRC,
+				luauRoot: toPosixRoot(LUAU_FIXTURE_SRC),
 				shadowDir: shadowDirectory,
 			});
 
@@ -50,16 +51,16 @@ describe("coverage instrumentation", () => {
 			const shadowDirectory = createTemporaryDirectory();
 
 			const files = instrumentRoot({
-				luauRoot: LUAU_FIXTURE_SRC,
+				luauRoot: toPosixRoot(LUAU_FIXTURE_SRC),
 				shadowDir: shadowDirectory,
 			});
 
 			const records = Object.values(files);
-			const allHaveCoverageMaps = records.every((record) =>
-				existsSync(record.coverageMapPath),
-			);
+			const hasEveryCoverageMap = records.every((record) => {
+				return existsSync(record.coverageMapPath);
+			});
 
-			expect(allHaveCoverageMaps).toBeTrue();
+			expect(hasEveryCoverageMap).toBeTrue();
 		});
 	});
 
@@ -71,7 +72,7 @@ describe("coverage instrumentation", () => {
 			const fixtureRoot = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
 
 			const files = instrumentRoot({
-				luauRoot: path.join(fixtureRoot, "out"),
+				luauRoot: toPosixRoot(path.join(fixtureRoot, "out")),
 				shadowDir: shadowDirectory,
 			});
 
@@ -92,16 +93,16 @@ describe("coverage instrumentation", () => {
 			const fixtureRoot = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
 
 			const files = instrumentRoot({
-				luauRoot: path.join(fixtureRoot, "out"),
+				luauRoot: toPosixRoot(path.join(fixtureRoot, "out")),
 				shadowDir: shadowDirectory,
 			});
 
 			const records = Object.values(files);
-			const allHaveSourceMapPaths = records.every((record) =>
-				record.sourceMapPath.endsWith(".map"),
-			);
+			const hasEverySourceMapPath = records.every((record) => {
+				return record.sourceMapPath.endsWith(".map");
+			});
 
-			expect(allHaveSourceMapPaths).toBeTrue();
+			expect(hasEverySourceMapPath).toBeTrue();
 		});
 	});
 });

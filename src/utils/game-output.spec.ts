@@ -1,9 +1,11 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, onTestFinished } from "vitest";
 
 import type { GameOutputEntry } from "../types/game-output.ts";
 import {
+	buildBatchGameOutput,
 	buildGroupedGameOutput,
 	countGroupedEntries,
 	formatGameOutputNotice,
@@ -61,7 +63,12 @@ describe(parseGameOutput, () => {
 });
 
 describe(writeGameOutput, () => {
-	const testDirectory = path.join(import.meta.dirname, "__test-output__");
+	// Under `os.tmpdir()`, not `import.meta.dirname`. Builds, typechecks, and
+	// lint runs hold handles on `src/` while the suite runs, and on Windows a
+	// recursive delete of a directory another process has open fails with
+	// EPERM — which flaked the cleanup and stranded the fixture in the source
+	// tree, where it then showed up as an untracked path.
+	const testDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "game-output-"));
 	const testFile = path.join(testDirectory, "game-output.json");
 
 	it("should write entries to file as JSON", () => {
@@ -147,6 +154,32 @@ describe(buildGroupedGameOutput, () => {
 	});
 });
 
+describe(buildBatchGameOutput, () => {
+	it("should build one batch-scoped group holding the whole run's output", () => {
+		expect.assertions(1);
+
+		const raw = JSON.stringify([{ message: "hi", messageType: 0, timestamp: 1 }]);
+
+		const groups = buildBatchGameOutput(raw);
+
+		expect(groups).toStrictEqual([
+			{
+				entries: [{ message: "hi", messageType: 0, timestamp: 1 }],
+				project: "(all projects)",
+				scope: "batch",
+			},
+		]);
+	});
+
+	it("should still name the scope when the run captured nothing", () => {
+		expect.assertions(1);
+
+		const groups = buildBatchGameOutput(undefined);
+
+		expect(groups).toStrictEqual([{ entries: [], project: "(all projects)", scope: "batch" }]);
+	});
+});
+
 describe(countGroupedEntries, () => {
 	it("should sum entry counts across groups", () => {
 		expect.assertions(1);
@@ -168,7 +201,7 @@ describe(countGroupedEntries, () => {
 });
 
 describe(writeGroupedGameOutput, () => {
-	const testDirectory = path.join(import.meta.dirname, "__test-grouped__");
+	const testDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "game-output-grouped-"));
 	const testFile = path.join(testDirectory, "game-output.log");
 
 	it("should write grouped entries to file as JSON, creating parent dirs", () => {

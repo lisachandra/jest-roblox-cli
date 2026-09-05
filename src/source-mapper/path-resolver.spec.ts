@@ -20,7 +20,32 @@ describe(createPathResolver, () => {
 
 		const resolver = createPathResolver(rojoProject);
 
-		expect(resolver.resolve("ReplicatedStorage.foo")?.filePath).toBe("out/shared/foo.luau");
+		expect(resolver.resolve("ReplicatedStorage.foo")!.filePath).toBe("out/shared/foo.luau");
+	});
+
+	it("should reject unrelated and prefix-colliding DataModel paths", () => {
+		expect.assertions(2);
+
+		const resolver = createPathResolver({
+			name: "test",
+			tree: { ReplicatedStorage: { $path: "out/shared" } },
+		});
+
+		expect(resolver.resolve("ServerStorage.foo")).toBeUndefined();
+		expect(resolver.resolve("ReplicatedStorageExtra.foo")).toBeUndefined();
+	});
+
+	it("should only combine a test suffix at the end of an instance path", () => {
+		expect.assertions(1);
+
+		const resolver = createPathResolver({
+			name: "test",
+			tree: { ReplicatedStorage: { $path: "out/shared" } },
+		});
+
+		expect(resolver.resolve("ReplicatedStorage.foo.spec.helper")!.filePath).toBe(
+			"out/shared/foo/spec/helper.luau",
+		);
 	});
 
 	it("should parse nested rojo tree", () => {
@@ -42,10 +67,10 @@ describe(createPathResolver, () => {
 
 		const resolver = createPathResolver(rojoProject);
 
-		expect(resolver.resolve("ReplicatedStorage.client.foo")?.filePath).toBe(
+		expect(resolver.resolve("ReplicatedStorage.client.foo")!.filePath).toBe(
 			"out/client/foo.luau",
 		);
-		expect(resolver.resolve("ReplicatedStorage.server.bar")?.filePath).toBe(
+		expect(resolver.resolve("ReplicatedStorage.server.bar")!.filePath).toBe(
 			"out/server/bar.luau",
 		);
 	});
@@ -66,7 +91,7 @@ describe(createPathResolver, () => {
 			mappings: [{ outDir: "out", rootDir: "src" }],
 		});
 
-		expect(resolver.resolve("ReplicatedStorage.foo")?.filePath).toBe("src/shared/foo.ts");
+		expect(resolver.resolve("ReplicatedStorage.foo")!.filePath).toBe("src/shared/foo.ts");
 	});
 
 	it("should return matched mapping for TypeScript paths", () => {
@@ -84,7 +109,7 @@ describe(createPathResolver, () => {
 		const mapping = { outDir: "out", rootDir: "src" };
 		const resolver = createPathResolver(rojoProject, { mappings: [mapping] });
 
-		expect(resolver.resolve("ReplicatedStorage.foo")?.mapping).toStrictEqual(mapping);
+		expect(resolver.resolve("ReplicatedStorage.foo")!.mapping).toStrictEqual(mapping);
 	});
 
 	it("should return undefined mapping for Luau paths", () => {
@@ -101,7 +126,7 @@ describe(createPathResolver, () => {
 
 		const resolver = createPathResolver(rojoProject);
 
-		expect(resolver.resolve("ReplicatedStorage.foo")?.mapping).toBeUndefined();
+		expect(resolver.resolve("ReplicatedStorage.foo")!.mapping).toBeUndefined();
 	});
 
 	it("should return undefined for unknown path", () => {
@@ -137,7 +162,7 @@ describe(createPathResolver, () => {
 
 		const resolver = createPathResolver(rojoProject);
 
-		expect(resolver.resolve("ReplicatedStorage.foo")?.filePath).toBe("out/shared/foo.luau");
+		expect(resolver.resolve("ReplicatedStorage.foo")!.filePath).toBe("out/shared/foo.luau");
 	});
 
 	it("should match longest prefix when keys share a common prefix", () => {
@@ -157,7 +182,7 @@ describe(createPathResolver, () => {
 			mappings: [{ outDir: "out-test", rootDir: "src" }],
 		});
 
-		expect(resolver.resolve("ReplicatedStorage.flux:tests.actions.define.spec")?.filePath).toBe(
+		expect(resolver.resolve("ReplicatedStorage.flux:tests.actions.define.spec")!.filePath).toBe(
 			"src/actions/define.spec.ts",
 		);
 	});
@@ -180,8 +205,8 @@ describe(createPathResolver, () => {
 
 		const result = resolver.resolve("ReplicatedStorage.flux:tests.src.actions.define.spec");
 
-		expect(result?.filePath).toBe("out-test/src/actions/define.spec.luau");
-		expect(result?.mapping).toBeUndefined();
+		expect(result!.filePath).toBe("out-test/src/actions/define.spec.luau");
+		expect(result!.mapping).toBeUndefined();
 	});
 
 	it("should resolve different mappings for different basePaths", () => {
@@ -204,11 +229,11 @@ describe(createPathResolver, () => {
 			],
 		});
 
-		expect(resolver.resolve("ReplicatedStorage.flux.actions.define")?.filePath).toBe(
+		expect(resolver.resolve("ReplicatedStorage.flux.actions.define")!.filePath).toBe(
 			"src/actions/define.ts",
 		);
 		expect(
-			resolver.resolve("ReplicatedStorage.flux:tests.src.actions.define.spec")?.filePath,
+			resolver.resolve("ReplicatedStorage.flux:tests.src.actions.define.spec")!.filePath,
 		).toBe("src/actions/define.spec.ts");
 	});
 
@@ -228,7 +253,7 @@ describe(createPathResolver, () => {
 			mappings: [{ outDir: "out", rootDir: "src" }],
 		});
 
-		expect(resolver.resolve("ReplicatedStorage.init.spec")?.filePath).toBe(
+		expect(resolver.resolve("ReplicatedStorage.init.spec")!.filePath).toBe(
 			"src/shared/index.spec.ts",
 		);
 	});
@@ -249,7 +274,7 @@ describe(createPathResolver, () => {
 
 		const resolver = createPathResolver(rojoProject);
 
-		expect(resolver.resolve("ReplicatedStorage.foo")?.filePath).toBe("out/shared/foo.lua");
+		expect(resolver.resolve("ReplicatedStorage.foo")!.filePath).toBe("out/shared/foo.lua");
 	});
 });
 

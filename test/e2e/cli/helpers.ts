@@ -1,17 +1,19 @@
+import { type } from "arktype";
 import { Buffer } from "node:buffer";
 import { execFile, execFileSync } from "node:child_process";
-import {
-	cpSync,
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import nodeProcess from "node:process";
 import { onTestFinished } from "vitest";
+
+import type { JestResult } from "../../../src/types/jest-result.ts";
+import { createSandboxDirectory } from "../sandbox-root.ts";
+
+export interface JestEnvelopePayload {
+	runner: { setup: number };
+	success: true;
+	value: JestResult;
+}
 
 interface ExecResult {
 	exitCode: number;
@@ -26,6 +28,17 @@ interface RunCliOptions {
 }
 
 const BIN = path.resolve(__dirname, "../../../bin/jest-roblox.js");
+const SEA_BUNDLE = path.resolve(__dirname, "../../../dist/sea/sea-entry.cjs");
+
+const mergedResultSchema = type({ testResults: type({ testFilePath: "string" }).array() });
+
+// runCli passes `encoding: "utf-8"`, so the thrown failure carries the captured
+// streams as strings — Buffer would only appear if we dropped that option.
+const execFailureSchema = type({
+	"status?": "number | null",
+	"stderr?": "string",
+	"stdout?": "string",
+});
 
 // cspell:ignore LOCALAPPDATA MSYSTEM PATHEXT PROGRAMDATA WINDIR
 const ALLOWED_ENV_VARS = [
@@ -66,11 +79,16 @@ export function runCli(args: Array<string>, cwdOrOptions?: RunCliOptions | strin
 			windowsHide: true,
 		});
 		return { exitCode: 0, stderr: "", stdout };
-	} catch (err: unknown) {
+	} catch (err) {
+		const failure = execFailureSchema(err);
+		if (failure instanceof type.errors) {
+			return { exitCode: 1, stderr: "", stdout: "" };
+		}
+
 		return {
-			exitCode: getProperty(err, "status", 1),
-			stderr: normalizeOutput(getProperty(err, "stderr", "")),
-			stdout: normalizeOutput(getProperty(err, "stdout", "")),
+			exitCode: failure.status ?? 1,
+			stderr: failure.stderr ?? "",
+			stdout: failure.stdout ?? "",
 		};
 	}
 }
@@ -79,12 +97,61 @@ export async function runCliAsync(
 	args: Array<string>,
 	cwdOrOptions?: RunCliOptions | string,
 ): Promise<ExecResult> {
+	return execNodeAsync(BIN, args, cwdOrOptions);
+}
+
+/**
+ * Drives the CJS bundle the SEA executable is built from, rather than
+ * `bin/jest-roblox.js` — which prefers `src/` and so never loads a bundle at
+ * all. Everything the binary carries has to be inside that one file: a
+ * dependency reaching for a sibling module or a data file at run time resolves
+ * beside the bundle here, and beside the executable there, and neither holds
+ * one. Running it under node reproduces that on any machine, in a second,
+ * without building a 100 MB binary first.
+ */
+export async function runSeaBundleAsync(
+	args: Array<string>,
+	cwdOrOptions?: RunCliOptions | string,
+): Promise<ExecResult> {
+	return execNodeAsync(SEA_BUNDLE, args, cwdOrOptions);
+}
+
+export function readJsonSync(filePath: string): JSONValue {
+	return JSON.parse(readFileSync(filePath, "utf-8"));
+}
+
+/**
+ * Whether rojo can be shelled out to. The specs that build a real place gate on
+ * it, because a machine without rojo should skip them rather than fail them.
+ *
+ * Rojo is the only place builder: `buildWithRojo` shells `rojo build` and
+ * throws "rojo was not found on PATH" with no fallback. Some of these specs
+ * used to gate on `rojo || lute`, which would have let a lute-only machine
+ * reach a build that could not run — lute is the coverage instrumenter and the
+ * Luau config loader, and never builds a place.
+ *
+ * Memoized because the probe sits in `it.skipIf(...)`, which every `it`
+ * evaluates at collection: 15 spawns of `rojo --version` across the suite, at
+ * roughly 200ms each on Windows, to answer one unchanging question. Vitest
+ * isolates each spec file in its own worker, so the answer is cached per file
+ * and installing rojo mid-run is still picked up by the next one.
+ */
+export function rojoOnPath(): boolean {
+	isRojoOnPath ??= probeRojo();
+	return isRojoOnPath;
+}
+
+async function execNodeAsync(
+	entry: string,
+	args: Array<string>,
+	cwdOrOptions?: RunCliOptions | string,
+): Promise<ExecResult> {
 	const options = typeof cwdOrOptions === "string" ? { cwd: cwdOrOptions } : (cwdOrOptions ?? {});
 
 	return new Promise((resolve) => {
 		execFile(
 			"node",
-			[BIN, ...withIsolatedBackendPort(args)],
+			[entry, ...withIsolatedBackendPort(args)],
 			{
 				cwd: options.cwd,
 				encoding: "utf-8",
@@ -111,16 +178,47 @@ export async function runCliAsync(
 	});
 }
 
-export function readJsonSync(filePath: string): unknown {
-	return JSON.parse(readFileSync(filePath, "utf-8"));
+let isRojoOnPath: boolean | undefined;
+
+/**
+ * The `testFilePath`s of a merged result sink (`--outputFile`), validated
+ * against the one field the type-test e2e specs read rather than asserted onto
+ * the parsed JSON.
+ */
+export function readMergedTestFilePaths(filePath: string): Array<string> {
+	const merged = mergedResultSchema.assert(readJsonSync(filePath));
+	return merged.testResults.map((file) => file.testFilePath);
 }
 
+function probeRojo(): boolean {
+	try {
+		execFileSync("rojo", ["--version"], { stdio: "pipe", windowsHide: true });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * What a previous run wrote into a fixture, rather than what the fixture is.
+ * The specs that drive the CLI at a fixture path directly (rather than at a
+ * sandbox) leave these behind, and they are gitignored, so which of them exist
+ * depends on what ran on this machine before.
+ *
+ * Copying them into a sandbox is how a spec ends up asserting on an artifact it
+ * did not produce: `.jest-roblox/cache/<mount>/jest.config.luau` is a generated
+ * stub, so a spec that checks the CLI generated one would pass against a stale
+ * copy with generation entirely broken.
+ */
+const FIXTURE_RUN_ARTIFACTS = new Set([".jest-roblox", "coverage"]);
+
 export function createFixtureSandbox(sourcePath: string): string {
-	const sandboxRoot = path.resolve(__dirname, ".tmp");
-	mkdirSync(sandboxRoot, { recursive: true });
-	const directory = mkdtempSync(path.join(sandboxRoot, "jest-roblox-cli-e2e-"));
+	const directory = createSandboxDirectory();
 	const sandboxPath = path.join(directory, path.basename(sourcePath));
-	cpSync(sourcePath, sandboxPath, { recursive: true });
+	cpSync(sourcePath, sandboxPath, {
+		filter: (source) => !FIXTURE_RUN_ARTIFACTS.has(path.basename(source)),
+		recursive: true,
+	});
 	absolutizeEscapingProjectPaths(sourcePath, sandboxPath);
 	onTestFinished(() => {
 		rmSync(directory, { force: true, recursive: true });
@@ -146,19 +244,6 @@ export function createRbxtsFixtureSandbox(sourcePath: string): string {
 	writeFileSync(path.join(outDirectory, "jest.config.luau"), RBXTS_JEST_CONFIG_LUAU);
 
 	return sandboxPath;
-}
-
-// The `auto` backend opens a WebSocket server on the configured port and waits
-// for a Studio plugin to connect. A developer's running Studio connects to the
-// fixed default port, so e2e runs flakily detect it and route to the Studio
-// backend (or hang). Binding the probe to an ephemeral port (0) — which no
-// Studio plugin knows to dial — makes `auto` deterministically fall through to
-// Open Cloud. Callers that need a real port pass their own `--port` and opt out.
-function withIsolatedBackendPort(args: Array<string>): Array<string> {
-	const declaresPort = args.some(
-		(argument) => argument === "--port" || argument.startsWith("--port="),
-	);
-	return declaresPort ? args : ["--port", "0", ...args];
 }
 
 function rewriteEscapingPaths(
@@ -205,6 +290,19 @@ function absolutizeEscapingProjectPaths(sourceDirectory: string, sandboxDirector
 
 	rewriteEscapingPaths(raw, sourceResolved, sandboxResolved);
 	writeFileSync(projectFile, `${JSON.stringify(raw, null, "\t")}\n`);
+}
+
+// The `auto` backend opens a WebSocket server on the configured port and waits
+// for a Studio plugin to connect. A developer's running Studio connects to the
+// fixed default port, so e2e runs flakily detect it and route to the Studio
+// backend (or hang). Binding the probe to an ephemeral port (0) — which no
+// Studio plugin knows to dial — makes `auto` deterministically fall through to
+// Open Cloud. Callers that need a real port pass their own `--port` and opt out.
+function withIsolatedBackendPort(args: Array<string>): Array<string> {
+	const hasPort = args.some(
+		(argument) => argument === "--port" || argument.startsWith("--port="),
+	);
+	return hasPort ? args : ["--port", "0", ...args];
 }
 
 /* eslint-disable unicorn/no-incorrect-template-string-interpolation -- Luau `{name}` interpolation syntax, not a JS placeholder; fixture text for a compiled Luau file, must stay byte-exact */
@@ -275,7 +373,7 @@ return {
  * Mixed stdout the Luau runner produces around the Jest JSON payload —
  * exercises `extractJsonFromOutput`'s log-noise stripping.
  */
-export function buildMixedOutput(payload: Record<string, unknown>): string {
+export function buildMixedOutput(payload: JestEnvelopePayload): string {
 	return [
 		"Booting fake Roblox runner",
 		JSON.stringify(payload),
@@ -284,9 +382,12 @@ export function buildMixedOutput(payload: Record<string, unknown>): string {
 }
 
 /** A minimal passing single-suite Jest payload in the runner's wire shape. */
-export function buildPassingPayload(): Record<string, unknown> {
+// eslint-disable-next-line flawless/max-lines-per-function -- Returns a cohesive single object; splitting would scatter the fields and make it harder to see the shape.
+export function buildPassingPayload(): JestEnvelopePayload {
 	return {
-		_setup: 0.1,
+		runner: {
+			setup: 0.1,
+		},
 		success: true,
 		value: {
 			numFailedTests: 0,
@@ -317,22 +418,32 @@ export function buildPassingPayload(): Record<string, unknown> {
 	};
 }
 
+/**
+ * The serialized Jest payload a `FakeOpenCloudTask` carries when the run under
+ * test only needs the task to succeed. Counts, not results — a spec asserting
+ * on pipeline shape reads `1 passed` and the server-side call record, never the
+ * suite bodies.
+ */
+export function buildPassingJestOutput(): string {
+	return JSON.stringify({
+		numFailedTests: 0,
+		numPassedTests: 1,
+		numPendingTests: 0,
+		numTotalTests: 1,
+		startTime: 0,
+		success: true,
+		testResults: [],
+	});
+}
+
 /** Env vars pointing the CLI's open-cloud backend at a fake server. */
-export function createOpenCloudEnvironment(baseUrl: string): Record<string, string> {
+export function createOpenCloudEnvironment(baseUrl: string): NonNullable<RunCliOptions["env"]> {
 	return {
 		JEST_ROBLOX_OPEN_CLOUD_BASE_URL: baseUrl,
 		ROBLOX_OPEN_CLOUD_API_KEY: "test-api-key",
 		ROBLOX_PLACE_ID: "456",
 		ROBLOX_UNIVERSE_ID: "123",
 	};
-}
-
-function getProperty<T>(error: unknown, key: string, fallback: T): T {
-	if (typeof error === "object" && error !== null && key in error) {
-		return (error as Record<string, unknown>)[key] as T;
-	}
-
-	return fallback;
 }
 
 function buildCliEnvironment(overrides?: Record<string, string | undefined>): NodeJS.ProcessEnv {
@@ -355,16 +466,4 @@ function buildCliEnvironment(overrides?: Record<string, string | undefined>): No
 	}
 
 	return environment;
-}
-
-function normalizeOutput(value: unknown): string {
-	if (typeof value === "string") {
-		return value;
-	}
-
-	if (Buffer.isBuffer(value)) {
-		return value.toString("utf-8");
-	}
-
-	return "";
 }

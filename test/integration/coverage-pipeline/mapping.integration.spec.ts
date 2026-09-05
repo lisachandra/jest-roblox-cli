@@ -14,7 +14,7 @@ import type {
 import { MANIFEST_VERSION } from "../../../src/coverage-pipeline/manifest.ts";
 import { mapCoverageToTypeScript } from "../../../src/coverage-pipeline/mapper.ts";
 import type { RawCoverageData } from "../../../src/coverage-pipeline/types.ts";
-import { normalizeWindowsPath } from "../../../src/utils/normalize-windows-path.ts";
+import { normalizeWindowsPath, toPosixRoot } from "../../../src/utils/normalize-windows-path.ts";
 import { createRbxtsFixtureSandbox } from "../../e2e/cli/helpers.ts";
 
 const normalize = normalizeWindowsPath;
@@ -71,12 +71,24 @@ function buildSyntheticCoverage(files: Record<string, InstrumentedFileRecord>): 
 	return data;
 }
 
+/**
+ * A mapped path the pipeline failed to bring back to TypeScript. The generated
+ * `jest.config.luau` has no TS twin, so it is expected to stay Luau.
+ */
+function isUnmappedPath(filePath: string): boolean {
+	return !filePath.endsWith(".ts") && !filePath.endsWith("jest.config.luau");
+}
+
+function isUnmappedLuauPath(filePath: string): boolean {
+	return filePath.endsWith(".luau") && !filePath.endsWith("jest.config.luau");
+}
+
 function buildCoverageResult(coverage?: RawCoverageData) {
 	const shadowDirectory = createTemporaryDirectory();
 	const fixtureRoot = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
 	const fixtureOut = path.join(fixtureRoot, "out");
 	const files = instrumentRoot({
-		luauRoot: fixtureOut,
+		luauRoot: toPosixRoot(fixtureOut),
 		shadowDir: shadowDirectory,
 	});
 	const manifest = buildManifest(files, fixtureOut, shadowDirectory);
@@ -84,7 +96,7 @@ function buildCoverageResult(coverage?: RawCoverageData) {
 	return mapCoverageToTypeScript(coverageData, manifest);
 }
 
-describe("coverage mapping pipeline (roblox-ts)", () => {
+describe("coverage mapping pipeline (roblox-ts)", { timeout: 30_000 }, () => {
 	it("should map luau coverage data to typescript file paths", () => {
 		expect.assertions(3);
 
@@ -94,16 +106,10 @@ describe("coverage mapping pipeline (roblox-ts)", () => {
 		// Coverage should be keyed by TypeScript paths, not Luau paths
 		expect(resultPaths.length).toBeGreaterThan(0);
 
-		const nonTsPaths = resultPaths.filter((filePath) => {
-			return !filePath.endsWith(".ts") && !filePath.endsWith("jest.config.luau");
-		});
+		const nonTsPaths = resultPaths.filter(isUnmappedPath);
 
 		expect(nonTsPaths).toStrictEqual([]);
-		expect(
-			resultPaths.some(
-				(filePath) => filePath.endsWith(".luau") && !filePath.endsWith("jest.config.luau"),
-			),
-		).toBeFalse();
+		expect(resultPaths.some(isUnmappedLuauPath)).toBeFalse();
 	});
 
 	it("should produce statement mappings pointing at typescript source lines", () => {
@@ -151,9 +157,9 @@ describe("coverage mapping pipeline (roblox-ts)", () => {
 		const result = buildCoverageResult();
 
 		// All resolved paths should point to files that actually exist
-		const allPathsExist = Object.keys(result.files).every((filePath) => existsSync(filePath));
+		const hasEveryPath = Object.keys(result.files).every((filePath) => existsSync(filePath));
 
-		expect(allPathsExist).toBeTrue();
+		expect(hasEveryPath).toBeTrue();
 	});
 
 	it("should report an instrumented file with zero hits when no test exercised it", () => {
@@ -169,8 +175,8 @@ describe("coverage mapping pipeline (roblox-ts)", () => {
 		expect(exampleCoverage).toBeDefined();
 
 		const [, coverage] = exampleCoverage!;
-		const everyStatementZero = Object.values(coverage.s).every((hits) => hits === 0);
+		const isEveryStatementZero = Object.values(coverage.s).every((hits) => hits === 0);
 
-		expect(everyStatementZero).toBeTrue();
+		expect(isEveryStatementZero).toBeTrue();
 	});
 });

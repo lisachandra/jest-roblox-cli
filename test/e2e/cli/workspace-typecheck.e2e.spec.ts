@@ -1,21 +1,17 @@
 /**
  * E2e — workspace `--typecheckOnly`.
  *
- * Drives the real CLI binary through config-load → discovery → classification →
- * grouping → real tsgo → result-merge → exit-code, in workspace mode. Pure-local
- * tsgo: no rojo build, no Open Cloud, no secrets — so this lives in the default
- * `e2e` project (not the rojo/live-gated ones).
+ * Drives the real CLI binary through config-load → discovery → classification
+ * → grouping → real tsgo → result-merge → exit-code, in workspace mode.
+ * Pure-local tsgo: no rojo build, no Open Cloud, no secrets — so this lives in
+ * the default `e2e` project (not the rojo/live-gated ones).
  */
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { createFixtureSandbox, readJsonSync, runCliAsync } from "./helpers.ts";
+import { createFixtureSandbox, readMergedTestFilePaths, runCliAsync } from "./helpers.ts";
 
 const WORKSPACE_FIXTURE = path.resolve(__dirname, "../fixtures/workspace");
-
-interface MergedResult {
-	testResults: Array<{ testFilePath: string }>;
-}
 
 describe("workspace --typecheckOnly e2e", () => {
 	it("should run a package's type tests and exit 0 when they pass", async () => {
@@ -31,33 +27,18 @@ describe("workspace --typecheckOnly e2e", () => {
 
 		expect(result.exitCode).toBe(0);
 
-		const merged = readJsonSync(outputFile) as MergedResult;
-		const composed = merged.testResults.some((file) =>
-			file.testFilePath.includes("@e2e/typed/"),
-		);
+		const paths = readMergedTestFilePaths(outputFile);
+		const hasTypedResult = paths.some((filePath) => filePath.includes("@e2e/typed/"));
 
-		expect(composed).toBeTrue();
+		expect(hasTypedResult).toBeTrue();
 	});
 
-	it("should exit 1 and name the failing type test with its TS code", async () => {
-		expect.assertions(3);
-
-		const sandbox = createFixtureSandbox(WORKSPACE_FIXTURE);
-
-		const result = await runCliAsync(
-			["--workspace", "--packages=@e2e/typed-broken", "--typecheckOnly"],
-			{ cwd: sandbox },
-		);
-
-		const output = result.stdout + result.stderr;
-
-		expect(result.exitCode).toBe(1);
-		expect(output).toContain("should reject a string assigned to number");
-		expect(output).toMatch(/TS\d+/);
-	});
-
-	it("should group type tests per package with package-composed identity", async () => {
-		expect.assertions(3);
+	// The mixed run carries the failure reporting too. A broken package on its
+	// own used to have a test of its own, but it drives the same tsgo spawn and
+	// prints the same diagnostics — nothing about the failure path is specific
+	// to running the broken package alone.
+	it("should group type tests per package and name the failing one with its TS code", async () => {
+		expect.assertions(5);
 
 		const sandbox = createFixtureSandbox(WORKSPACE_FIXTURE);
 		const outputFile = path.join(sandbox, "grouped-result.json");
@@ -73,12 +54,15 @@ describe("workspace --typecheckOnly e2e", () => {
 			{ cwd: sandbox },
 		);
 
+		const output = result.stdout + result.stderr;
+
 		// typed passes, typed-broken fails — the run fails overall, but BOTH
 		// packages' type tests are reported under their own package identity.
 		expect(result.exitCode).toBe(1);
+		expect(output).toContain("should reject a string assigned to number");
+		expect(output).toMatch(/TS\d+/);
 
-		const merged = readJsonSync(outputFile) as MergedResult;
-		const paths = merged.testResults.map((file) => file.testFilePath);
+		const paths = readMergedTestFilePaths(outputFile);
 
 		expect(paths.some((filePath) => filePath.includes("@e2e/typed/"))).toBeTrue();
 		expect(paths.some((filePath) => filePath.includes("@e2e/typed-broken/"))).toBeTrue();

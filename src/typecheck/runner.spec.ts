@@ -1,20 +1,29 @@
+import { fromAny } from "@total-typescript/shoehorn";
+
 import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as path from "node:path";
 import process from "node:process";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { ConfigError } from "../config/errors.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import {
 	createLocationsIndexMap,
 	isCompositeProject,
 	mapErrorsToTests,
-	runTypecheck,
+	runTypecheckAsync,
 } from "./runner.ts";
 import type { RawErrorsMap, TestDefinition } from "./types.ts";
 
 vi.mock(import("node:child_process"));
 vi.mock(import("node:fs"));
+
+// `resolveTsgoScript` locates the tsgo binary through `createRequire`. `spy`
+// keeps every export's real implementation, so only the missing-package test
+// overrides it and every other test resolves the installed package.
+vi.mock(import("node:module"), { spy: true });
 
 describe(createLocationsIndexMap, () => {
 	it("should map line:column pairs to character indices", () => {
@@ -53,7 +62,7 @@ describe(mapErrorsToTests, () => {
 	});
 
 	it("should fail the test containing the error", () => {
-		expect.assertions(3);
+		expect.assertions(4);
 
 		const source =
 			'describe("suite", () => {\n  it("should fail", () => {\n    bad;\n  });\n});';
@@ -80,15 +89,16 @@ describe(mapErrorsToTests, () => {
 			["/test.ts", { definitions, source }],
 		]);
 
-		const result = mapErrorsToTests(errors, files, Date.now());
+		const result = mapErrorsToTests(errors, files, 123);
 
 		expect(result.success).toBeFalse();
 		expect(result.testResults[0]!.testResults[0]!.status).toBe("failed");
 		expect(result.testResults[0]!.testResults[0]!.failureMessages).toHaveLength(1);
+		expect(result).toMatchSnapshot();
 	});
 
 	it("should attribute error outside test blocks to file-level failure", () => {
-		expect.assertions(2);
+		expect.assertions(3);
 
 		const source = 'const x: number = "bad";\nit("should pass", () => {});';
 		const errors: RawErrorsMap = new Map([
@@ -113,10 +123,11 @@ describe(mapErrorsToTests, () => {
 			["/test.ts", { definitions, source }],
 		]);
 
-		const result = mapErrorsToTests(errors, files, Date.now());
+		const result = mapErrorsToTests(errors, files, 123);
 
 		expect(result.success).toBeFalse();
 		expect(result.numFailedTests).toBePositive();
+		expect(result).toMatchSnapshot();
 	});
 
 	it("should collect multiple errors in the same test", () => {
@@ -158,7 +169,7 @@ describe(mapErrorsToTests, () => {
 	});
 
 	it("should handle mixed files with and without errors", () => {
-		expect.assertions(3);
+		expect.assertions(4);
 
 		const errors: RawErrorsMap = new Map([
 			[
@@ -196,7 +207,11 @@ describe(mapErrorsToTests, () => {
 			],
 		]);
 
-		const result = mapErrorsToTests(errors, files, Date.now());
+		const result = mapErrorsToTests(errors, files, 123);
+
+		// The result crosses the Jest reporter boundary. Pin its complete shape
+		// alongside the aggregate counts below.
+		expect(result).toMatchSnapshot();
 
 		expect(result.numFailedTests).toBe(1);
 		expect(result.numPassedTests).toBe(1);
@@ -204,6 +219,48 @@ describe(mapErrorsToTests, () => {
 	});
 
 	it("should surface errors for non-test source files as source-level failures", () => {
+		expect.assertions(5);
+
+		const errors: RawErrorsMap = new Map([
+			[
+				"src/source.ts",
+				[
+					{
+						column: 7,
+						errorCode: 2322,
+						errorMessage: "Type 'string' is not assignable to type 'number'.",
+						filePath: "src/source.ts",
+						line: 1,
+					},
+				],
+			],
+		]);
+		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
+			[
+				"src/test.test-d.ts",
+				{
+					definitions: [
+						{ name: "should pass", ancestorNames: [], end: 27, start: 0, type: "test" },
+					],
+					source: 'it("should pass", () => {});',
+				},
+			],
+		]);
+
+		const result = mapErrorsToTests(errors, files, 123, false);
+
+		const sourceResult = result.testResults.find(
+			(file) => file.testFilePath === "src/source.ts",
+		);
+
+		expect(result.success).toBeFalse();
+		expect(result.numFailedTests).toBe(1);
+		expect(sourceResult).toBeDefined();
+		expect(sourceResult!.testResults[0]!.failureMessages[0]).toContain("TS2322");
+		expect(result).toMatchSnapshot();
+	});
+
+	it("should suppress non-test source file errors when ignoreSourceErrors is true", () => {
 		expect.assertions(4);
 
 		const errors: RawErrorsMap = new Map([
@@ -232,54 +289,14 @@ describe(mapErrorsToTests, () => {
 			],
 		]);
 
-		const result = mapErrorsToTests(errors, files, Date.now(), false);
-
-		const sourceResult = result.testResults.find(
-			(file) => file.testFilePath === "src/source.ts",
-		);
-
-		expect(result.success).toBeFalse();
-		expect(result.numFailedTests).toBe(1);
-		expect(sourceResult).toBeDefined();
-		expect(sourceResult!.testResults[0]!.failureMessages[0]).toContain("TS2322");
-	});
-
-	it("should suppress non-test source file errors when ignoreSourceErrors is true", () => {
-		expect.assertions(3);
-
-		const errors: RawErrorsMap = new Map([
-			[
-				"src/source.ts",
-				[
-					{
-						column: 7,
-						errorCode: 2322,
-						errorMessage: "Type 'string' is not assignable to type 'number'.",
-						filePath: "src/source.ts",
-						line: 1,
-					},
-				],
-			],
-		]);
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"src/test.test-d.ts",
-				{
-					definitions: [
-						{ name: "should pass", ancestorNames: [], end: 27, start: 0, type: "test" },
-					],
-					source: 'it("should pass", () => {});',
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, Date.now(), true);
+		const result = mapErrorsToTests(errors, files, 123, true);
 
 		expect(result.success).toBeTrue();
 		expect(result.numFailedTests).toBe(0);
 		expect(
 			result.testResults.find((file) => file.testFilePath === "src/source.ts"),
 		).toBeUndefined();
+		expect(result).toMatchSnapshot();
 	});
 
 	it("should produce correct JestResult counts", () => {
@@ -342,6 +359,71 @@ describe(mapErrorsToTests, () => {
 
 		expect(result.numFailedTests).toBe(1);
 	});
+
+	it("should attribute an end-boundary diagnostic to the innermost overlapping test", () => {
+		expect.assertions(1);
+
+		const source = 'it("outer", () => { it("inner", () => { bad; }); });';
+		const badIndex = source.indexOf("bad");
+		const innerStart = source.indexOf('it("inner"');
+		const errors: RawErrorsMap = new Map([
+			[
+				"src/nested.spec.ts",
+				[
+					{
+						column: badIndex + 1,
+						errorCode: 2322,
+						errorMessage: "Nested mismatch",
+						filePath: "src/nested.spec.ts",
+						line: 1,
+					},
+				],
+			],
+		]);
+		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
+			[
+				"src/nested.spec.ts",
+				{
+					definitions: [
+						{
+							name: "outer",
+							ancestorNames: [],
+							end: source.length,
+							start: 0,
+							type: "test",
+						},
+						{
+							name: "inner",
+							ancestorNames: ["outer"],
+							end: badIndex,
+							start: innerStart,
+							type: "test",
+						},
+					],
+					source,
+				},
+			],
+		]);
+
+		const result = mapErrorsToTests(errors, files, 123);
+
+		expect(result.testResults[0]!.testResults).toStrictEqual([
+			{
+				ancestorTitles: [],
+				failureMessages: [],
+				fullName: "outer",
+				status: "passed",
+				title: "outer",
+			},
+			{
+				ancestorTitles: ["outer"],
+				failureMessages: ["TS2322: Nested mismatch"],
+				fullName: "outer > inner",
+				status: "failed",
+				title: "inner",
+			},
+		]);
+	});
 });
 
 describe(isCompositeProject, () => {
@@ -361,6 +443,30 @@ describe(isCompositeProject, () => {
 		vi.mocked(fs.readFileSync).mockReturnValue(
 			JSON.stringify({ compilerOptions: { strict: true } }),
 		);
+
+		expect(isCompositeProject("/project")).toBeFalse();
+	});
+
+	it("should return false when compilerOptions is absent", () => {
+		expect.assertions(1);
+
+		vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ include: ["src"] }));
+
+		expect(isCompositeProject("/project")).toBeFalse();
+	});
+
+	it("should return false when compilerOptions is null", () => {
+		expect.assertions(1);
+
+		vi.mocked(fs.readFileSync).mockReturnValue('{ "compilerOptions": null }');
+
+		expect(isCompositeProject("/project")).toBeFalse();
+	});
+
+	it("should return false when compilerOptions is an array", () => {
+		expect.assertions(1);
+
+		vi.mocked(fs.readFileSync).mockReturnValue('{ "compilerOptions": [] }');
 
 		expect(isCompositeProject("/project")).toBeFalse();
 	});
@@ -412,12 +518,10 @@ describe(isCompositeProject, () => {
 			throw new Error("ENOENT");
 		});
 
-		const result = isCompositeProject("/project", "tsconfig.build.json");
+		const isComposite = isCompositeProject("/project", "tsconfig.build.json");
 
-		expect(result).toBeFalse();
+		expect(isComposite).toBeFalse();
 		expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("tsconfig.build.json"));
-
-		stderrSpy.mockRestore();
 	});
 
 	it("should warn with stringified error when thrown value is not an Error", () => {
@@ -430,12 +534,10 @@ describe(isCompositeProject, () => {
 			throw "raw string error";
 		});
 
-		const result = isCompositeProject("/project", "tsconfig.build.json");
+		const isComposite = isCompositeProject("/project", "tsconfig.build.json");
 
-		expect(result).toBeFalse();
+		expect(isComposite).toBeFalse();
 		expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("raw string error"));
-
-		stderrSpy.mockRestore();
 	});
 
 	it("should not warn when default tsconfig does not exist", () => {
@@ -447,12 +549,10 @@ describe(isCompositeProject, () => {
 			throw new Error("ENOENT");
 		});
 
-		const result = isCompositeProject("/project");
+		const isComposite = isCompositeProject("/project");
 
-		expect(result).toBeFalse();
+		expect(isComposite).toBeFalse();
 		expect(stderrSpy).not.toHaveBeenCalled();
-
-		stderrSpy.mockRestore();
 	});
 
 	it("should resolve custom tsconfig path against root directory", () => {
@@ -471,7 +571,7 @@ describe(isCompositeProject, () => {
 	});
 });
 
-describe(runTypecheck, () => {
+describe(runTypecheckAsync, () => {
 	interface TsgoSpawnError extends Error {
 		code?: number | string;
 		killed?: boolean;
@@ -480,38 +580,47 @@ describe(runTypecheck, () => {
 
 	type TsgoCallback = (error: null | TsgoSpawnError, stdout: string, stderr: string) => void;
 
+	/** One `execFile` invocation, in the shape `spawnTsgo` calls it. */
+	interface TsgoInvocation {
+		arguments: Array<string>;
+		options: { timeout?: number };
+	}
+
 	// `spawnTsgo` drives `execFile` in callback form and listens once for the
-	// child `spawn` event to clear its launch timer. `stubTsgo` returns a fake
-	// child (`emitSpawn` fires the registered `spawn` listener, `kill` is the spy
-	// `spawnTsgo` calls on a launch timeout) and lets a test simulate tsgo
-	// finishing (exit 0), exiting non-zero with diagnostics, failing to spawn,
-	// or never launching.
-	function stubTsgo(respond: (callback: TsgoCallback) => void): {
-		emitSpawn: () => void;
-		kill: ReturnType<typeof vi.fn<() => void>>;
-	} {
+	// child `spawn` event to clear its launch timer. `stubTsgo` returns the
+	// recorded invocations plus a fake child (`emitSpawn` fires the registered
+	// `spawn` listener, `kill` is the spy `spawnTsgo` calls on a launch timeout)
+	// and lets a test simulate tsgo finishing (exit 0), exiting non-zero with
+	// diagnostics, failing to spawn, or never launching.
+	function stubTsgo(respond: (callback: TsgoCallback) => void) {
 		let spawnListener: (() => void) | undefined;
+		const invocations: Array<TsgoInvocation> = [];
 		const kill = vi.fn<() => void>();
-		const child = {
-			kill,
-			once(event: string, listener: () => void) {
+		let child: childProcess.ChildProcess;
+		const once = vi.fn<(event: string, listener: () => void) => childProcess.ChildProcess>(
+			(event, listener) => {
 				if (event === "spawn") {
 					spawnListener = listener;
 				}
 
 				return child;
 			},
-		};
-		vi.mocked(childProcess.execFile).mockImplementation(((
-			_file: string,
-			_arguments: ReadonlyArray<string>,
-			_options: object,
-			callback: TsgoCallback,
-		) => {
-			respond(callback);
-			return child as unknown as childProcess.ChildProcess;
-		}) as unknown as typeof childProcess.execFile);
-		return { emitSpawn: () => spawnListener?.(), kill };
+		);
+		child = fromAny({ kill, once });
+		const execFileStub: typeof childProcess.execFile = fromAny(
+			(
+				_file: string,
+				commandArguments: Array<string>,
+				options: { timeout?: number },
+				callback: TsgoCallback,
+			) => {
+				invocations.push({ arguments: commandArguments, options });
+				respond(callback);
+				return child;
+			},
+		);
+		vi.mocked(childProcess.execFile).mockImplementation(execFileStub);
+		return { emitSpawn: () => spawnListener?.(), invocations, kill, once };
 	}
 
 	function exitWith(code: number): TsgoSpawnError {
@@ -532,12 +641,12 @@ describe(runTypecheck, () => {
 	it("should pass tsconfig option to tsgo for non-composite project", async () => {
 		expect.assertions(4);
 
-		stubTsgo((callback) => {
+		const { invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 			tsconfig: "tsconfig.test.json",
@@ -545,41 +654,47 @@ describe(runTypecheck, () => {
 
 		expect(result.success).toBeTrue();
 
-		const callArgs = vi.mocked(childProcess.execFile).mock.calls[0]![1] as Array<string>;
+		const [tsgoScript, ...callArgs] = invocations[0]!.arguments;
 
-		expect(vi.mocked(childProcess.execFile)).toHaveBeenCalledWith(
-			process.execPath,
-			expect.anything(),
-			expect.anything(),
-			expect.anything(),
-		);
-		expect(callArgs).toContain("-p");
-		expect(callArgs).toContain(path.resolve("/project", "tsconfig.test.json"));
+		expect(normalizeWindowsPath(tsgoScript)).toEndWith("/bin/tsgo.js");
+		expect(callArgs).toStrictEqual([
+			"--noEmit",
+			"--pretty",
+			"false",
+			"-p",
+			path.resolve("/project", "tsconfig.test.json"),
+		]);
+		expect(invocations[0]!.options).toStrictEqual({
+			cwd: "/project",
+			encoding: "utf-8",
+			timeout: 300_000,
+			windowsHide: true,
+		});
 	});
 
 	it("should use --noEmit for non-composite projects", async () => {
 		expect.assertions(2);
 
-		stubTsgo((callback) => {
+		const { invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 		});
 
-		const callArgs = vi.mocked(childProcess.execFile).mock.calls[0]![1] as Array<string>;
+		const callArgs = invocations[0]!.arguments;
 
 		expect(result.success).toBeTrue();
 		expect(callArgs).toContain("--noEmit");
 	});
 
 	it("should use --build --emitDeclarationOnly for composite projects", async () => {
-		expect.assertions(3);
+		expect.assertions(2);
 
-		stubTsgo((callback) => {
+		const { invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
 		mockReadFileSync(
@@ -587,22 +702,21 @@ describe(runTypecheck, () => {
 			'it("should pass", () => {});',
 		);
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 		});
 
-		const callArgs = vi.mocked(childProcess.execFile).mock.calls[0]![1] as Array<string>;
+		const [, ...callArgs] = invocations[0]!.arguments;
 
 		expect(result.success).toBeTrue();
-		expect(callArgs).toContain("--build");
-		expect(callArgs).toContain("--emitDeclarationOnly");
+		expect(callArgs).toStrictEqual(["--build", "--emitDeclarationOnly", "--pretty", "false"]);
 	});
 
 	it("should pass tsconfig as positional arg for composite --build", async () => {
 		expect.assertions(1);
 
-		stubTsgo((callback) => {
+		const { invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
 		mockReadFileSync(
@@ -610,13 +724,13 @@ describe(runTypecheck, () => {
 			'it("should pass", () => {});',
 		);
 
-		await runTypecheck({
+		await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 			tsconfig: "tsconfig.test.json",
 		});
 
-		const callArgs = vi.mocked(childProcess.execFile).mock.calls[0]![1] as Array<string>;
+		const callArgs = invocations[0]!.arguments;
 
 		expect(callArgs.at(-1)).toBe(path.resolve("/project", "tsconfig.test.json"));
 	});
@@ -629,7 +743,7 @@ describe(runTypecheck, () => {
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 		});
@@ -642,38 +756,34 @@ describe(runTypecheck, () => {
 	it("should bound the tsgo compile with the default run timeout", async () => {
 		expect.assertions(1);
 
-		stubTsgo((callback) => {
+		const { invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		await runTypecheck({
+		await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 		});
 
-		const options = vi.mocked(childProcess.execFile).mock.calls[0]![2] as { timeout?: number };
-
-		expect(options.timeout).toBe(300_000);
+		expect(invocations[0]!.options.timeout).toBe(300_000);
 	});
 
 	it("should bound the tsgo compile with a custom run timeout", async () => {
 		expect.assertions(1);
 
-		stubTsgo((callback) => {
+		const { invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		await runTypecheck({
+		await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 			timeout: 250,
 		});
 
-		const options = vi.mocked(childProcess.execFile).mock.calls[0]![2] as { timeout?: number };
-
-		expect(options.timeout).toBe(250);
+		expect(invocations[0]!.options.timeout).toBe(250);
 	});
 
 	it("should throw when the tsgo compile exceeds the run timeout", async () => {
@@ -689,7 +799,7 @@ describe(runTypecheck, () => {
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
 		await expect(
-			runTypecheck({
+			runTypecheckAsync({
 				files: ["src/test.spec.ts"],
 				rootDir: "/project",
 				timeout: 250,
@@ -710,7 +820,7 @@ describe(runTypecheck, () => {
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
 		await expect(
-			runTypecheck({
+			runTypecheckAsync({
 				files: ["src/test.spec.ts"],
 				rootDir: "/project",
 				spawnTimeout: 1,
@@ -738,7 +848,7 @@ describe(runTypecheck, () => {
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		const promise = runTypecheck({
+		const promise = runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 			spawnTimeout: 10_000,
@@ -751,20 +861,126 @@ describe(runTypecheck, () => {
 		expect(kill).not.toHaveBeenCalled();
 	});
 
-	it("should rethrow when the tsgo spawn fails to start", async () => {
-		expect.assertions(1);
+	it("should register the spawn listener and keep a launched process alive past its launch deadline", async () => {
+		expect.assertions(3);
 
-		stubTsgo((callback) => {
-			callback(Object.assign(new Error("spawn failed"), { code: "ENOENT" }), "", "");
+		vi.useFakeTimers();
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+
+		let captured: TsgoCallback | undefined;
+		const { emitSpawn, kill, once } = stubTsgo((callback) => {
+			captured = callback;
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
+		const guarded = runTypecheckAsync({
+			files: ["src/test.spec.ts"],
+			rootDir: "/project",
+			spawnTimeout: 5,
+		}).catch((err: unknown) => err);
+		emitSpawn();
+		await vi.advanceTimersByTimeAsync(10);
+
+		expect(once).toHaveBeenCalledExactlyOnceWith("spawn", expect.any(Function));
+		expect(kill).not.toHaveBeenCalled();
+
+		captured!(null, "", "");
+		const result = await guarded;
+
+		expect(result).toMatchObject({ success: true });
+	});
+
+	it("should not arm the launch timer after a synchronous completion", async () => {
+		expect.assertions(1);
+
+		vi.useFakeTimers();
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+
+		const { kill } = stubTsgo((callback) => {
+			callback(null, "", "");
+		});
+		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+
+		await runTypecheckAsync({
+			files: ["src/test.spec.ts"],
+			rootDir: "/project",
+			spawnTimeout: 5,
+		});
+		await vi.advanceTimersByTimeAsync(10);
+
+		expect(kill).not.toHaveBeenCalled();
+	});
+
+	it("should rethrow when the tsgo spawn fails to start", async () => {
+		expect.assertions(2);
+
+		const spawnFailure = Object.assign(new Error("spawn failed"), { code: "ENOENT" });
+		stubTsgo((callback) => {
+			callback(spawnFailure, "", "");
+		});
+		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+
+		const error: unknown = await runTypecheckAsync({
+			files: ["src/test.spec.ts"],
+			rootDir: "/project",
+		}).catch((err: unknown) => err);
+
+		expect(error).toBeInstanceOf(Error);
+		expect(error).toMatchObject({ cause: spawnFailure });
+	});
+
+	// The guard throws before `executeTsgo`, so this test needs no spawn stub.
+	it("should name the optional peer dependency when tsgo is not installed", async () => {
+		expect.assertions(1);
+
+		vi.mocked(createRequire).mockReturnValueOnce(
+			fromAny({
+				resolve: () => {
+					throw Object.assign(new Error("Cannot find module"), {
+						code: "MODULE_NOT_FOUND",
+					});
+				},
+			}),
+		);
+
+		const error: unknown = await runTypecheckAsync({
+			files: ["src/test.spec.ts"],
+			rootDir: "/project",
+		}).catch((err: unknown) => err);
+
+		assert(error instanceof ConfigError, "expected a ConfigError");
+
+		expect({ hint: error.hint, message: error.message }).toStrictEqual({
+			hint: "npm install -D @typescript/native-preview — or run without --typecheck/--typecheckOnly.",
+			message:
+				"Type tests need '@typescript/native-preview', an optional peer dependency that is not installed.",
+		});
+	});
+
+	// Only a missing module means "not installed". Relabelling every failure
+	// would tell someone whose install is present but unreadable to install it
+	// again.
+	it("should rethrow a resolution failure that is not a missing module", async () => {
+		expect.assertions(1);
+
+		vi.mocked(createRequire).mockReturnValueOnce(
+			fromAny({
+				resolve: () => {
+					throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+				},
+			}),
+		);
+
 		await expect(
-			runTypecheck({
+			runTypecheckAsync({
 				files: ["src/test.spec.ts"],
 				rootDir: "/project",
 			}),
-		).rejects.toThrow("spawn failed");
+		).rejects.toThrow("permission denied");
 	});
 
 	it("should parse tsgo diagnostics from stdout on a non-zero exit", async () => {
@@ -787,7 +1003,7 @@ describe(runTypecheck, () => {
 			'const x: number = "bad";\nit("should fail", () => {});',
 		);
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: [filePath],
 			rootDir: rootDirectory,
 		});
@@ -815,7 +1031,7 @@ describe(runTypecheck, () => {
 			'const x: number = "bad";\nit("should fail", () => {});',
 		);
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: [filePath],
 			rootDir: rootDirectory,
 		});
@@ -831,7 +1047,7 @@ describe(runTypecheck, () => {
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
 			rootDir: "/project",
 		});
@@ -855,7 +1071,7 @@ describe(runTypecheck, () => {
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		const result = await runTypecheck({ files: [filePath], rootDir: rootDirectory });
+		const result = await runTypecheckAsync({ files: [filePath], rootDir: rootDirectory });
 
 		const sourceResult = result.testResults.find((file) => file.testFilePath === "other.ts");
 
@@ -879,7 +1095,7 @@ describe(runTypecheck, () => {
 		});
 		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
 
-		const result = await runTypecheck({
+		const result = await runTypecheckAsync({
 			files: [filePath],
 			ignoreSourceErrors: true,
 			rootDir: rootDirectory,

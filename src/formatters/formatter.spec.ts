@@ -5,13 +5,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import process from "node:process";
 import { stripVTControlCharacters } from "node:util";
-import { describe, expect, it, vi } from "vitest";
+import color from "tinyrainbow";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { mergeJestTotals } from "../results/merge.ts";
 import * as sourceMapperModule from "../source-mapper/index.ts";
 import type { SourceMapper, SourceSnippet } from "../source-mapper/index.ts";
 import type { JestResult, TestCaseResult, TestFileResult } from "../types/jest-result.ts";
 import type { TimingResult } from "../types/timing.ts";
 import {
+	EMPTY_FILE_RESULT,
 	EXEC_ERROR_RESULT,
 	FAILING_RESULT,
 	LOADSTRING_ERROR_RESULT,
@@ -20,9 +23,11 @@ import {
 	PASSING_RESULT,
 	SKIPPED_RESULT,
 	SNAPSHOT_FAILING_RESULT,
+	TIMED_OUT_RESULT,
 	TIMING,
 	TIMING_COVERAGE,
 	TIMING_NO_UPLOAD,
+	TIMING_STAGING,
 	TYPECHECK_FAILING_RESULT,
 	TYPECHECK_MIXED_RESULT,
 	TYPECHECK_PASSING_RESULT,
@@ -40,7 +45,7 @@ import {
 	formatRunHeader,
 	formatSourceSnippet,
 	formatTestSummary,
-	formatTypecheckSummary,
+	formatTypecheckReport,
 	getExecErrorHint,
 	mergeSnapshotSummaries,
 	parseErrorMessage,
@@ -129,6 +134,28 @@ describe(formatTestSummary, () => {
 		expect(summary).toContain("2 failed");
 		expect(summary).toContain("1 skipped");
 		expect(summary).toContain("(10)");
+	});
+
+	it("should order buckets failed-first like vitest", () => {
+		expect.assertions(2);
+
+		const summary = stripVTControlCharacters(
+			formatTestSummary(MIXED_RESULT, createTiming(1000)),
+		);
+
+		expect(summary).toContain(" Test Files  1 failed | 1 passed (2)");
+		expect(summary).toContain("      Tests  1 failed | 4 passed | 1 skipped (6)");
+	});
+
+	it("should count a file that collected no tests as passed", () => {
+		expect.assertions(2);
+
+		const summary = stripVTControlCharacters(
+			formatTestSummary(EMPTY_FILE_RESULT, createTiming(1000)),
+		);
+
+		expect(summary).toContain(" Test Files  2 passed (2)");
+		expect(summary).not.toContain("skipped");
 	});
 
 	it("should hide snapshots line when no snapshot data", () => {
@@ -502,7 +529,7 @@ describe(formatTestSummary, () => {
 		const summary = formatTestSummary(result, createTiming(1000));
 
 		expect(summary).toContain("Test Files");
-		expect(summary).toMatch(/1 passed.*\|.*1 failed/);
+		expect(summary).toMatch(/1 failed.*\|.*1 passed/);
 		expect(summary).toContain("Tests");
 	});
 });
@@ -634,7 +661,7 @@ Received: {"name": "other"}`;
 	});
 
 	it("should extract values from toThrow with labeled expected/received", () => {
-		expect.assertions(2);
+		expect.assertions(1);
 
 		const message = `expect(received).toThrow(expected)
 
@@ -643,8 +670,11 @@ Received value:     "some error message"`;
 
 		const parsed = parseErrorMessage(message);
 
-		expect(parsed.expected).toBe('".pass"');
-		expect(parsed.received).toBe('"some error message"');
+		expect(parsed).toStrictEqual({
+			expected: '".pass"',
+			message: "expect(received).toThrow(expected)",
+			received: '"some error message"',
+		});
 	});
 });
 
@@ -654,8 +684,8 @@ describe(parseSourceLocation, () => {
 
 		const result = parseSourceLocation("path/test.luau:25");
 
-		expect(result?.path).toBe("path/test.luau");
-		expect(result?.line).toBe(25);
+		expect(result!.path).toBe("path/test.luau");
+		expect(result!.line).toBe(25);
 	});
 
 	it("should parse .lua file location with column", () => {
@@ -663,9 +693,9 @@ describe(parseSourceLocation, () => {
 
 		const result = parseSourceLocation("path/test.lua:10:5");
 
-		expect(result?.path).toBe("path/test.lua");
-		expect(result?.line).toBe(10);
-		expect(result?.column).toBe(5);
+		expect(result!.path).toBe("path/test.lua");
+		expect(result!.line).toBe(10);
+		expect(result!.column).toBe(5);
 	});
 });
 
@@ -684,15 +714,14 @@ describe(formatFailedTestsHeader, () => {
 
 		const original = process.stdout.columns;
 		process.stdout.columns = 40;
-
-		try {
-			const header = formatFailedTestsHeader(1, undefined);
-			const stripped = stripVTControlCharacters(header);
-
-			expect(stripped).toHaveLength(40);
-		} finally {
+		onTestFinished(() => {
 			process.stdout.columns = original;
-		}
+		});
+
+		const header = formatFailedTestsHeader(1, undefined);
+		const stripped = stripVTControlCharacters(header);
+
+		expect(stripped).toHaveLength(40);
 	});
 
 	it("should fill terminal width with odd-length badge", () => {
@@ -700,31 +729,29 @@ describe(formatFailedTestsHeader, () => {
 
 		const original = process.stdout.columns;
 		process.stdout.columns = 41;
-
-		try {
-			const header = formatFailedTestsHeader(10, undefined);
-			const stripped = stripVTControlCharacters(header);
-
-			expect(stripped).toHaveLength(41);
-		} finally {
+		onTestFinished(() => {
 			process.stdout.columns = original;
-		}
+		});
+
+		const header = formatFailedTestsHeader(10, undefined);
+		const stripped = stripVTControlCharacters(header);
+
+		expect(stripped).toHaveLength(41);
 	});
 
 	it("should fall back to 80 columns when stdout has no columns", () => {
 		expect.assertions(1);
 
 		const original = process.stdout.columns;
-		delete (process.stdout as unknown as Record<string, unknown>)["columns"];
-
-		try {
-			const header = formatFailedTestsHeader(1, undefined);
-			const stripped = stripVTControlCharacters(header);
-
-			expect(stripped).toHaveLength(80);
-		} finally {
+		Reflect.deleteProperty(process.stdout, "columns");
+		onTestFinished(() => {
 			process.stdout.columns = original;
-		}
+		});
+
+		const header = formatFailedTestsHeader(1, undefined);
+		const stripped = stripVTControlCharacters(header);
+
+		expect(stripped).toHaveLength(80);
 	});
 });
 
@@ -846,7 +873,6 @@ describe(formatFailure, () => {
 		sourceContent[28] = "expect(player).toMatchSnapshot();";
 
 		const sourceMapper = fromPartial<SourceMapper>({
-			mapFailureMessage: (message: string) => message,
 			mapFailureWithLocations: () => {
 				return {
 					locations: [
@@ -899,46 +925,45 @@ describe(formatFailure, () => {
 
 		expect(formatted).toContain("❯ src/traits.spec.ts:29:16");
 		expect(formatted).toContain("- Snapshot  - 1");
-		expect(formatted.match(/src\/traits\.spec\.ts:29/g)?.length).toBe(1);
+		expect(formatted.match(/src\/traits\.spec\.ts:29/g)!).toHaveLength(1);
 	});
 
 	it("should show Luau snippet for Luau-only mapped location", () => {
 		expect.assertions(3);
 
 		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "fmt-test-"));
+		onTestFinished(() => {
+			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
+		});
 		const luauFile = path.join(temporaryDirectory, "test.spec.luau");
 		fs.writeFileSync(luauFile, "line1\nline2\nline3\nline4\nexpect(x).toBe(1)\nline6");
 
-		try {
-			const luauOnlyResult = {
-				locations: [{ luauLine: 5, luauPath: luauFile }],
-				message: `${luauFile}:5`,
-			};
-			const sourceMapper = fromPartial<SourceMapper>({
-				mapFailureWithLocations: () => luauOnlyResult,
-			});
+		const luauOnlyResult = {
+			locations: [{ luauLine: 5, luauPath: luauFile }],
+			message: `${luauFile}:5`,
+		};
+		const sourceMapper = fromPartial<SourceMapper>({
+			mapFailureWithLocations: () => luauOnlyResult,
+		});
 
-			const test: TestCaseResult = {
-				ancestorTitles: ["Suite"],
-				duration: 10,
-				failureMessages: ["Expected: 1\nReceived: 2"],
-				fullName: "Suite should work",
-				status: "failed",
-				title: "should work",
-			};
+		const test: TestCaseResult = {
+			ancestorTitles: ["Suite"],
+			duration: 10,
+			failureMessages: ["Expected: 1\nReceived: 2"],
+			fullName: "Suite should work",
+			status: "failed",
+			title: "should work",
+		};
 
-			const formatted = formatFailure({
-				sourceMapper,
-				test,
-				useColor: false,
-			});
+		const formatted = formatFailure({
+			sourceMapper,
+			test,
+			useColor: false,
+		});
 
-			expect(formatted).toContain(`❯ ${luauFile}:5`);
-			expect(formatted).not.toContain("(TypeScript)");
-			expect(formatted).not.toContain("(Luau)");
-		} finally {
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
-		}
+		expect(formatted).toContain(`❯ ${luauFile}:5`);
+		expect(formatted).not.toContain("(TypeScript)");
+		expect(formatted).not.toContain("(Luau)");
 	});
 
 	it("should format multiple failure messages", () => {
@@ -1355,7 +1380,7 @@ describe("formatResult snapshots", () => {
 			  ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
 
 			 Test Files  1 failed (1)
-			      Tests  1 passed | 2 failed (3)
+			      Tests  2 failed | 1 passed (3)
 			   Start at  22:13:20
 			   Duration  250ms (upload 50ms, environment 50ms, tests 100ms, cli 50ms)"
 		`);
@@ -1389,8 +1414,8 @@ describe("formatResult snapshots", () => {
 			  
 			  ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
 
-			 Test Files  1 passed | 1 failed (2)
-			      Tests  4 passed | 1 failed | 1 skipped (6)
+			 Test Files  1 failed | 1 passed (2)
+			      Tests  1 failed | 4 passed | 1 skipped (6)
 			   Start at  22:13:20
 			   Duration  250ms (upload 50ms, environment 50ms, tests 100ms, cli 50ms)"
 		`);
@@ -1616,6 +1641,48 @@ describe("formatResult exec errors", () => {
 	});
 });
 
+describe("formatResult timeouts", () => {
+	it("should name the budget rather than a suite that threw", () => {
+		expect.assertions(5);
+
+		const output = formatResult(TIMED_OUT_RESULT, TIMING, {
+			...defaultOptions,
+			color: false,
+		});
+
+		expect(output).toContain("Test suite timed out");
+		expect(output).not.toContain("Test suite failed to run");
+		expect(output).toContain("Timed out after 60s, aborting tests");
+		expect(output).toContain(" TIMEOUT ");
+		expect(output).not.toContain(" FAIL ");
+	});
+
+	it("should paint the timeout badge apart from the fail badge", () => {
+		expect.assertions(2);
+
+		const output = formatResult(TIMED_OUT_RESULT, TIMING, {
+			...defaultOptions,
+			color: true,
+		});
+		const plainFailure = formatResult(EXEC_ERROR_RESULT, TIMING, {
+			...defaultOptions,
+			color: true,
+		});
+
+		expect(output).toContain(color.bgYellow(color.black(color.bold(" TIMEOUT "))));
+		expect(plainFailure).toContain(color.bgRed(color.white(color.bold(" FAIL "))));
+	});
+
+	it("should still count the run as failed", () => {
+		expect.assertions(2);
+
+		const summary = formatTestSummary(TIMED_OUT_RESULT, createTiming(1000));
+
+		expect(summary).toContain("1 failed");
+		expect(summary).not.toContain("skipped");
+	});
+});
+
 describe("formatResult exec error snapshots", () => {
 	const baseOptions: FormatOptions = {
 		color: false,
@@ -1666,7 +1733,7 @@ describe("formatResult exec error snapshots", () => {
 
 			  ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
 
-			 Test Files  1 passed | 1 failed (2)
+			 Test Files  1 failed | 1 passed (2)
 			      Tests  3 passed (3)
 			   Start at  22:13:20
 			   Duration  250ms (upload 50ms, environment 50ms, tests 100ms, cli 50ms)"
@@ -1718,7 +1785,7 @@ describe("formatResult with typecheck data", () => {
 			  ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
 
 			 Test Files  1 failed (1)
-			      Tests  1 passed | 1 failed (2)
+			      Tests  1 failed | 1 passed (2)
 			   Start at  22:13:20
 			   Duration  200ms (environment 50ms, tests 100ms, cli 50ms)"
 		`);
@@ -1744,8 +1811,8 @@ describe("formatResult with typecheck data", () => {
 			  
 			  ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
 
-			 Test Files  1 passed | 1 failed (2)
-			      Tests  3 passed | 1 failed (4)
+			 Test Files  1 failed | 1 passed (2)
+			      Tests  1 failed | 3 passed (4)
 			   Start at  22:13:20
 			   Duration  200ms (environment 50ms, tests 100ms, cli 50ms)"
 		`);
@@ -1785,15 +1852,16 @@ describe("formatTestSummary type errors line", () => {
 	});
 });
 
-describe("formatTypecheckSummary snapshots", () => {
+describe("formatTypecheckReport snapshots", () => {
 	it("should format passing typecheck summary", () => {
 		expect.assertions(1);
 
-		const output = formatTypecheckSummary(TYPECHECK_PASSING_RESULT, false);
+		const output = formatTypecheckReport(TYPECHECK_PASSING_RESULT, { useColor: false });
 
 		expect(output).toMatchInlineSnapshot(`
 			"
-			Type Tests: 2 passed, 2 total
+			      Tests  2 passed (2)
+			Type Errors  no errors
 			"
 		`);
 	});
@@ -1801,13 +1869,14 @@ describe("formatTypecheckSummary snapshots", () => {
 	it("should format failing typecheck summary with failures", () => {
 		expect.assertions(1);
 
-		const output = formatTypecheckSummary(TYPECHECK_FAILING_RESULT, false);
+		const output = formatTypecheckReport(TYPECHECK_FAILING_RESULT, { useColor: false });
 
 		expect(output).toMatchInlineSnapshot(`
 			"   FAIL  type checks > should reject string as number
 			    TS2322: Type 'string' is not assignable to type 'number'.
 
-			Type Tests: 1 failed, 1 passed, 2 total
+			      Tests  1 failed | 1 passed (2)
+			Type Errors  1 failed
 			"
 		`);
 	});
@@ -1815,15 +1884,44 @@ describe("formatTypecheckSummary snapshots", () => {
 	it("should format mixed typecheck summary with failure from one file", () => {
 		expect.assertions(1);
 
-		const output = formatTypecheckSummary(TYPECHECK_MIXED_RESULT, false);
+		const output = formatTypecheckReport(TYPECHECK_MIXED_RESULT, { useColor: false });
 
 		expect(output).toMatchInlineSnapshot(`
 			"   FAIL  failing types > should reject string as number
 			    TS2322: Type 'string' is not assignable to type 'number'.
 
-			Type Tests: 1 failed, 3 passed, 4 total
+			      Tests  1 failed | 3 passed (4)
+			Type Errors  1 failed
 			"
 		`);
+	});
+});
+
+describe("formatTypecheckReport without summary rows", () => {
+	it("should return the failure detail alone, newline-terminated", () => {
+		expect.assertions(1);
+
+		const output = formatTypecheckReport(TYPECHECK_FAILING_RESULT, {
+			includeSummaryRows: false,
+			useColor: false,
+		});
+
+		expect(output).toMatchInlineSnapshot(`
+			"   FAIL  type checks > should reject string as number
+			    TS2322: Type 'string' is not assignable to type 'number'.
+			"
+		`);
+	});
+
+	it("should return nothing when a clean pass leaves no detail", () => {
+		expect.assertions(1);
+
+		const output = formatTypecheckReport(TYPECHECK_PASSING_RESULT, {
+			includeSummaryRows: false,
+			useColor: false,
+		});
+
+		expect(output).toBe("");
 	});
 });
 
@@ -2250,6 +2348,37 @@ describe("formatTestSummary coverage timing", () => {
 	});
 });
 
+describe("formatTestSummary staging timing", () => {
+	it("should show staging bucket when stagingMs is provided", () => {
+		expect.assertions(2);
+
+		const summary = formatTestSummary(PASSING_RESULT, TIMING_STAGING);
+		const plain = stripVTControlCharacters(summary);
+
+		expect(plain).toContain("staging 400ms");
+		expect(plain).toContain("Duration  650ms");
+	});
+
+	it("should subtract stagingMs from the cli residual", () => {
+		expect.assertions(1);
+
+		// totalMs=650, uploadMs=50, executionMs=150, stagingMs=400 -> cli=50
+		const summary = formatTestSummary(PASSING_RESULT, TIMING_STAGING);
+		const plain = stripVTControlCharacters(summary);
+
+		expect(plain).toContain("cli 50ms");
+	});
+
+	it("should omit staging bucket when stagingMs is zero", () => {
+		expect.assertions(1);
+
+		const summary = formatTestSummary(PASSING_RESULT, { ...TIMING, stagingMs: 0 });
+		const plain = stripVTControlCharacters(summary);
+
+		expect(plain).not.toContain("staging");
+	});
+});
+
 describe("formatTestSummary setup timing", () => {
 	it("should show setup bucket when setupMs is provided", () => {
 		expect.assertions(1);
@@ -2316,6 +2445,9 @@ describe("formatSnapshotCallSnippet via formatFailure", () => {
 	function writeTemporary(content: string): string {
 		const filePath = path.join(os.tmpdir(), `formatter-test-${Date.now()}.ts`);
 		fs.writeFileSync(filePath, content, "utf-8");
+		onTestFinished(() => {
+			fs.unlinkSync(filePath);
+		});
 		return filePath;
 	}
 
@@ -2348,27 +2480,23 @@ describe("formatSnapshotCallSnippet via formatFailure", () => {
 			].join("\n"),
 		);
 
-		try {
-			const test: TestCaseResult = {
-				ancestorTitles: [],
-				duration: 1,
-				failureMessages: [makeSnapshotMessage()],
-				fullName: "test",
-				status: "failed",
-				title: "test",
-			};
+		const test: TestCaseResult = {
+			ancestorTitles: [],
+			duration: 1,
+			failureMessages: [makeSnapshotMessage()],
+			fullName: "test",
+			status: "failed",
+			title: "test",
+		};
 
-			const formatted = formatFailure({
-				filePath,
-				test,
-				useColor: false,
-			});
+		const formatted = formatFailure({
+			filePath,
+			test,
+			useColor: false,
+		});
 
-			expect(formatted).toContain(`❯ ${filePath}:5`);
-			expect(formatted).toContain("toMatchSnapshot");
-		} finally {
-			fs.unlinkSync(filePath);
-		}
+		expect(formatted).toContain(`❯ ${filePath}:5`);
+		expect(formatted).toContain("toMatchSnapshot");
 	});
 
 	it("should not show snippet when file has multiple toMatchSnapshot calls", () => {
@@ -2378,27 +2506,23 @@ describe("formatSnapshotCallSnippet via formatFailure", () => {
 			["expect(a).toMatchSnapshot();", "expect(b).toMatchSnapshot();"].join("\n"),
 		);
 
-		try {
-			const test: TestCaseResult = {
-				ancestorTitles: [],
-				duration: 1,
-				failureMessages: [makeSnapshotMessage()],
-				fullName: "test",
-				status: "failed",
-				title: "test",
-			};
+		const test: TestCaseResult = {
+			ancestorTitles: [],
+			duration: 1,
+			failureMessages: [makeSnapshotMessage()],
+			fullName: "test",
+			status: "failed",
+			title: "test",
+		};
 
-			const formatted = formatFailure({
-				filePath,
-				test,
-				useColor: false,
-			});
+		const formatted = formatFailure({
+			filePath,
+			test,
+			useColor: false,
+		});
 
-			// Multiple toMatchSnapshot calls — no snippet shown
-			expect(formatted).not.toContain("❯");
-		} finally {
-			fs.unlinkSync(filePath);
-		}
+		// Multiple toMatchSnapshot calls — no snippet shown
+		expect(formatted).not.toContain("❯");
 	});
 });
 
@@ -2409,72 +2533,78 @@ describe("showLuau mapped location snippets", () => {
 		const luauContent = Array.from({ length: 15 }, (_, index) => `-- line ${index + 1}`);
 		luauContent[9] = "expect(value).toBe(42)";
 		const luauFile = path.join(os.tmpdir(), `formatter-test-${Date.now()}.luau`);
+		onTestFinished(() => {
+			fs.unlinkSync(luauFile);
+		});
 		fs.writeFileSync(luauFile, luauContent.join("\n"), "utf-8");
 
-		try {
-			const sourceContent = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`);
-			sourceContent[4] = "expect(value).toBe(42);";
+		const sourceContent = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`);
+		sourceContent[4] = "expect(value).toBe(42);";
 
-			const sourceMapper = fromPartial<SourceMapper>({
-				mapFailureWithLocations: () => {
-					return {
-						locations: [
-							{
-								luauLine: 10,
-								luauPath: luauFile,
-								sourceContent: sourceContent.join("\n"),
-								tsColumn: 15,
-								tsLine: 5,
-								tsPath: "src/test.ts",
-							},
-						],
-						message: "Expected: 42\nReceived: 0\n\nsrc/test.ts:5",
-					};
-				},
-			});
+		const sourceMapper = fromPartial<SourceMapper>({
+			mapFailureWithLocations: () => {
+				return {
+					locations: [
+						{
+							luauLine: 10,
+							luauPath: luauFile,
+							sourceContent: sourceContent.join("\n"),
+							tsColumn: 15,
+							tsLine: 5,
+							tsPath: "src/test.ts",
+						},
+					],
+					message: "Expected: 42\nReceived: 0\n\nsrc/test.ts:5",
+				};
+			},
+		});
 
-			const test: TestCaseResult = {
-				ancestorTitles: [],
-				duration: 1,
-				failureMessages: ["Expected: 42\nReceived: 0"],
-				fullName: "test",
-				status: "failed",
-				title: "test",
-			};
+		const test: TestCaseResult = {
+			ancestorTitles: [],
+			duration: 1,
+			failureMessages: ["Expected: 42\nReceived: 0"],
+			fullName: "test",
+			status: "failed",
+			title: "test",
+		};
 
-			const formatted = formatFailure({
-				showLuau: true,
-				sourceMapper,
-				test,
-				useColor: false,
-			});
+		const formatted = formatFailure({
+			showLuau: true,
+			sourceMapper,
+			test,
+			useColor: false,
+		});
 
-			expect(formatted).toContain("(TypeScript)");
-			expect(formatted).toContain("(Luau)");
-			expect(formatted).toContain("❯ src/test.ts:5:15");
-		} finally {
-			fs.unlinkSync(luauFile);
-		}
+		expect(formatted).toContain("(TypeScript)");
+		expect(formatted).toContain("(Luau)");
+		expect(formatted).toContain("❯ src/test.ts:5:15");
 	});
 });
 
 describe("formatFallbackSnippet via formatFailure", () => {
-	it("should show fallback snippet when message contains a parseable source location", () => {
-		expect.assertions(2);
+	// Reads and renders a real source file; measured ~130ms under full-suite
+	// load, so the suite-wide per-test budget cannot hold it.
+	it(
+		"should show fallback snippet when message contains a parseable source location",
+		{ timeout: 1000 },
+		() => {
+			expect.assertions(2);
 
-		const fileContent = [
-			"import { describe, it, expect } from 'vitest';",
-			"",
-			"describe('math', () => {",
-			"  it('should add', () => {",
-			"    expect(1 + 1).toBe(3);",
-			"  });",
-			"});",
-		].join("\n");
-		const temporaryFile = path.join("src", "formatters", `__tmp-fallback-${Date.now()}.ts`);
-		fs.writeFileSync(temporaryFile, fileContent, "utf-8");
+			const fileContent = [
+				"import { describe, it, expect } from 'vitest';",
+				"",
+				"describe('math', () => {",
+				"  it('should add', () => {",
+				"    expect(1 + 1).toBe(3);",
+				"  });",
+				"});",
+			].join("\n");
+			const temporaryFile = path.join("src", "formatters", `__tmp-fallback-${Date.now()}.ts`);
+			onTestFinished(() => {
+				fs.unlinkSync(temporaryFile);
+			});
+			fs.writeFileSync(temporaryFile, fileContent, "utf-8");
 
-		try {
 			const test: TestCaseResult = {
 				ancestorTitles: [],
 				duration: 1,
@@ -2488,10 +2618,8 @@ describe("formatFallbackSnippet via formatFailure", () => {
 
 			expect(formatted).toContain(`❯ ${temporaryFile}:5:10`);
 			expect(formatted).toContain("expect(1 + 1).toBe(3)");
-		} finally {
-			fs.unlinkSync(temporaryFile);
-		}
-	});
+		},
+	);
 });
 
 describe("expandTabs via formatSourceSnippet", () => {
@@ -2793,37 +2921,35 @@ describe("formatSnapshotCallSnippet getSourceSnippet guard via formatFailure", (
 		const filePath = path.join(os.tmpdir(), `formatter-snap-guard-${Date.now()}.ts`);
 		fs.writeFileSync(filePath, "expect(x).toMatchSnapshot();", "utf-8");
 
-		const spy = vi.spyOn(sourceMapperModule, "getSourceSnippet").mockReturnValue(undefined);
-
-		try {
-			const test: TestCaseResult = {
-				ancestorTitles: [],
-				duration: 1,
-				failureMessages: [
-					[
-						"expect(received).toMatchSnapshot()",
-						"",
-						"- Snapshot  - 1",
-						"+ Received  + 1",
-						"",
-						'-   "a": 1,',
-						'+   "a": 2,',
-						"",
-						'[string "RS.test"]:10',
-					].join("\n"),
-				],
-				fullName: "test",
-				status: "failed",
-				title: "test",
-			};
-
-			const formatted = formatFailure({ filePath, test, useColor: false });
-
-			expect(formatted).not.toContain("❯");
-		} finally {
-			spy.mockRestore();
+		vi.spyOn(sourceMapperModule, "getSourceSnippet").mockReturnValue(undefined);
+		onTestFinished(() => {
 			fs.unlinkSync(filePath);
-		}
+		});
+
+		const test: TestCaseResult = {
+			ancestorTitles: [],
+			duration: 1,
+			failureMessages: [
+				[
+					"expect(received).toMatchSnapshot()",
+					"",
+					"- Snapshot  - 1",
+					"+ Received  + 1",
+					"",
+					'-   "a": 1,',
+					'+   "a": 2,',
+					"",
+					'[string "RS.test"]:10',
+				].join("\n"),
+			],
+			fullName: "test",
+			status: "failed",
+			title: "test",
+		};
+
+		const formatted = formatFailure({ filePath, test, useColor: false });
+
+		expect(formatted).not.toContain("❯");
 	});
 });
 
@@ -2917,8 +3043,9 @@ describe("formatResult testFilePath resolution", () => {
 				color: false,
 				sourceMapper: fromPartial({
 					mapFailureWithLocations: (message: string) => ({ locations: [], message }),
-					resolveDisplayPath: (testFilePath: string) =>
-						testFilePath.replace("init.spec", "index.spec"),
+					resolveDisplayPath: (testFilePath: string) => {
+						return testFilePath.replace("init.spec", "index.spec");
+					},
 					resolveTestFilePath: () => {},
 				}),
 			}),
@@ -3004,6 +3131,35 @@ describe(formatProjectHeader, () => {
 		const plain = stripVTControlCharacters(output);
 
 		expect(plain).toMatch(/\d+ms/);
+	});
+
+	it("should omit the duration suffix when every test has zero duration", () => {
+		expect.assertions(1);
+
+		const result: JestResult = {
+			...PASSING_RESULT,
+			testResults: PASSING_RESULT.testResults.map((file) => {
+				return {
+					...file,
+					testResults: file.testResults.map((test) => ({ ...test, duration: 0 })),
+				};
+			}),
+		};
+		const output = formatProjectHeader({ displayName: "core", result, useColor: false });
+
+		expect(output).toBe("▶ core  1 passed (3 tests)");
+	});
+
+	// The header and the trailing `Test Files` row bucket the same files, so
+	// this pins the empty-file case on both sides of the report.
+	it("should count a file that collected no tests as passed", () => {
+		expect.assertions(2);
+
+		const output = formatProjectHeader({ displayName: "core", result: EMPTY_FILE_RESULT });
+		const plain = stripVTControlCharacters(output);
+
+		expect(plain).toContain("2 passed");
+		expect(plain).not.toContain("skipped");
 	});
 });
 
@@ -3094,10 +3250,136 @@ describe(formatProjectSection, () => {
 
 		expect(output).toContain("[33m 100[2mms[22m[39m");
 	});
+
+	describe("game output", () => {
+		const gameOutput = JSON.stringify([
+			{ message: "materializing auth", messageType: 0, timestamp: 1 },
+			{ message: "Infinite yield possible on 'Config'", messageType: 2, timestamp: 2 },
+			{ message: "first line\nsecond line", messageType: 3, timestamp: 3 },
+		]);
+
+		it("should render a failing project's game output below its failures", () => {
+			expect.assertions(5);
+
+			const output = formatProjectSection({
+				displayName: "auth",
+				failureCtx: { currentIndex: 1, totalFailures: 2 },
+				gameOutput,
+				options: noColorOptions,
+				result: FAILING_RESULT,
+			});
+
+			expect(output).toContain("  Game output:");
+			expect(output).toContain("    materializing auth");
+			expect(output).toContain("    Infinite yield possible on 'Config'");
+			expect(output).toContain("    first line\n    second line");
+			expect(output.indexOf("Game output:")).toBeGreaterThan(output.lastIndexOf("[2/2]"));
+		});
+
+		it("should colour warnings and errors by message type", () => {
+			expect.assertions(3);
+
+			const output = formatProjectSection({
+				displayName: "auth",
+				failureCtx: { currentIndex: 1, totalFailures: 2 },
+				gameOutput,
+				options: { ...defaultOptions, color: true },
+				result: FAILING_RESULT,
+			});
+
+			expect(output).toContain("    materializing auth");
+			expect(output).toContain(`    ${color.yellow("Infinite yield possible on 'Config'")}`);
+			expect(output).toContain(
+				`    ${color.red("first line")}\n    ${color.red("second line")}`,
+			);
+		});
+
+		it("should render game output for a project whose suite never ran", () => {
+			expect.assertions(1);
+
+			const output = formatProjectSection({
+				displayName: "broken",
+				failureCtx: { currentIndex: 1, totalFailures: 1 },
+				gameOutput,
+				options: noColorOptions,
+				result: EXEC_ERROR_RESULT,
+			});
+
+			expect(output).toContain("  Game output:\n    materializing auth");
+		});
+
+		it("should not render game output for a passing project", () => {
+			expect.assertions(1);
+
+			const output = formatProjectSection({
+				displayName: "core",
+				failureCtx,
+				gameOutput,
+				options: noColorOptions,
+				result: PASSING_RESULT,
+			});
+
+			expect(output).not.toContain("Game output");
+		});
+
+		it("should not render the block when a failing project printed nothing", () => {
+			expect.assertions(1);
+
+			const output = formatProjectSection({
+				displayName: "auth",
+				failureCtx: { currentIndex: 1, totalFailures: 2 },
+				options: noColorOptions,
+				result: FAILING_RESULT,
+			});
+
+			expect(output).not.toContain("Game output");
+		});
+	});
 });
 
 describe(formatMultiProjectResult, () => {
 	const noColorOptions: FormatOptions = { ...defaultOptions, color: false };
+
+	// --bail stops the run partway, so the report has to say the packages it
+	// shows are not the whole selection.
+	it("should report how far a bailed run got", () => {
+		expect.assertions(1);
+
+		const output = formatMultiProjectResult(
+			[
+				{ displayName: "core", result: PASSING_RESULT },
+				{ displayName: "integration", result: PASSING_RESULT },
+			],
+			TIMING,
+			{ ...noColorOptions, bail: { notRun: 3, ran: 2 } },
+		);
+
+		expect(output).toContain("Bailed  after 2 packages, 3 not run");
+	});
+
+	it("should say package, singular, when a bail stopped after one", () => {
+		expect.assertions(1);
+
+		const output = formatMultiProjectResult(
+			[{ displayName: "core", result: PASSING_RESULT }],
+			TIMING,
+			{ ...noColorOptions, bail: { notRun: 1, ran: 1 } },
+		);
+
+		expect(output).toContain("Bailed  after 1 package, 1 not run");
+	});
+
+	it("should leave the bail line out of a run that did not bail", () => {
+		expect.assertions(1);
+
+		const output = formatMultiProjectResult(
+			[{ displayName: "core", result: PASSING_RESULT }],
+			TIMING,
+			noColorOptions,
+		);
+
+		expect(output).not.toContain("Bailed");
+	});
 
 	it("should group files under project headers with combined summary", () => {
 		expect.assertions(5);
@@ -3295,6 +3577,37 @@ describe(formatMultiProjectResult, () => {
 		expect(snapshotLine).toMatch(/1 written/);
 		expect(snapshotLine).toMatch(/3 passed.*\(4\)/);
 	});
+
+	it("should keep each failing project's game output under its own section", () => {
+		expect.assertions(3);
+
+		const output = formatMultiProjectResult(
+			[
+				{
+					displayName: "auth",
+					gameOutput: JSON.stringify([
+						{ message: "auth says hi", messageType: 0, timestamp: 1 },
+					]),
+					result: FAILING_RESULT,
+				},
+				{
+					displayName: "core",
+					gameOutput: JSON.stringify([
+						{ message: "core says hi", messageType: 0, timestamp: 2 },
+					]),
+					result: PASSING_RESULT,
+				},
+			],
+			TIMING,
+			noColorOptions,
+		);
+
+		const authSection = output.slice(output.indexOf("▶ auth"), output.indexOf("▶ core"));
+
+		expect(authSection).toContain("    auth says hi");
+		expect(authSection).not.toContain("core says hi");
+		expect(output).not.toContain("core says hi");
+	});
 });
 
 describe(mergeSnapshotSummaries, () => {
@@ -3306,7 +3619,14 @@ describe(mergeSnapshotSummaries, () => {
 			{ added: 0, didUpdate: false, matched: 1, total: 1, unmatched: 0, updated: 0 },
 		]);
 
-		expect(merged).toMatchObject({ didUpdate: true });
+		expect(merged).toStrictEqual({
+			added: 0,
+			didUpdate: true,
+			matched: 2,
+			total: 2,
+			unmatched: 0,
+			updated: 0,
+		});
 	});
 
 	it("should aggregate didUpdate as false when no project ran in update mode", () => {
@@ -3317,7 +3637,14 @@ describe(mergeSnapshotSummaries, () => {
 			{ added: 0, didUpdate: false, matched: 1, total: 1, unmatched: 0, updated: 0 },
 		]);
 
-		expect(merged).toMatchObject({ didUpdate: false });
+		expect(merged).toStrictEqual({
+			added: 0,
+			didUpdate: false,
+			matched: 2,
+			total: 2,
+			unmatched: 0,
+			updated: 0,
+		});
 	});
 
 	it("should sum unchecked across all projects", () => {
@@ -3329,7 +3656,14 @@ describe(mergeSnapshotSummaries, () => {
 			{ added: 0, matched: 0, total: 0, unmatched: 0, updated: 0 },
 		]);
 
-		expect(merged).toMatchObject({ unchecked: 5 });
+		expect(merged).toStrictEqual({
+			added: 0,
+			matched: 0,
+			total: 0,
+			unchecked: 5,
+			unmatched: 0,
+			updated: 0,
+		});
 	});
 
 	it("should sum filesRemoved across projects so JSON consumers see it", () => {
@@ -3340,13 +3674,61 @@ describe(mergeSnapshotSummaries, () => {
 			{ added: 0, filesRemoved: 2, matched: 0, total: 0, unmatched: 0, updated: 0 },
 		]);
 
-		expect(merged).toMatchObject({ filesRemoved: 3 });
+		expect(merged).toStrictEqual({
+			added: 0,
+			filesRemoved: 3,
+			matched: 0,
+			total: 0,
+			unmatched: 0,
+			updated: 0,
+		});
 	});
 
 	it("should return undefined when no snapshots provided", () => {
 		expect.assertions(1);
 
 		expect(mergeSnapshotSummaries([])).toBeUndefined();
+	});
+});
+
+describe(mergeJestTotals, () => {
+	it("should merge the complete Jest result contract exactly", () => {
+		expect.assertions(1);
+
+		const firstFile = fromPartial<TestFileResult>({ testFilePath: "first.spec.ts" });
+		const secondFile = fromPartial<TestFileResult>({ testFilePath: "second.spec.ts" });
+		const merged = mergeJestTotals([
+			fromPartial<JestResult>({
+				numFailedTests: 0,
+				numPassedTests: 2,
+				numPendingTests: 1,
+				numTodoTests: 3,
+				numTotalTests: 6,
+				startTime: 20,
+				success: true,
+				testResults: [firstFile],
+			}),
+			fromPartial<JestResult>({
+				numFailedTests: 1,
+				numPassedTests: 4,
+				numPendingTests: 2,
+				numTotalTests: 7,
+				startTime: 10,
+				success: false,
+				testResults: [secondFile],
+			}),
+		]);
+
+		expect(merged).toStrictEqual({
+			numFailedTests: 1,
+			numPassedTests: 6,
+			numPendingTests: 3,
+			numTodoTests: 3,
+			numTotalTests: 13,
+			startTime: 10,
+			success: false,
+			testResults: [firstFile, secondFile],
+		});
 	});
 });
 
@@ -3383,6 +3765,15 @@ describe("multi-project output snapshots", () => {
 		const plain = stripVTControlCharacters(output);
 
 		expect(plain).toMatchInlineSnapshot('"▶  utils   1 passed | 2 skipped (12 tests - 50ms)"');
+	});
+
+	it("should order project header buckets failed-first", () => {
+		expect.assertions(1);
+
+		const output = formatProjectHeader({ displayName: "game", result: MIXED_RESULT });
+		const plain = stripVTControlCharacters(output);
+
+		expect(plain).toContain("1 failed | 1 passed");
 	});
 
 	it("should format project section for passing result", () => {
@@ -3518,8 +3909,8 @@ describe("multi-project output snapshots", () => {
 			  
 			  ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
 
-			 Test Files  1 passed | 1 failed (2)
-			      Tests  4 passed | 2 failed (6)
+			 Test Files  1 failed | 1 passed (2)
+			      Tests  2 failed | 4 passed (6)
 			   Start at  22:13:20
 			   Duration  250ms (upload 50ms, environment 50ms, tests 100ms, cli 50ms)"
 		`);
@@ -3612,27 +4003,31 @@ describe(formatProjectBadge, () => {
 		expect(output).not.toBe("▶ core");
 	});
 
+	it("should treat Object prototype names as unknown displayColors", () => {
+		expect.assertions(1);
+
+		expect(formatProjectBadge("core", true, "toString")).toBe(formatProjectBadge("core", true));
+	});
+
 	it("should apply all named displayColors", () => {
-		expect.assertions(7);
+		expect.assertions(1);
 
 		const colors = ["blue", "cyan", "green", "magenta", "red", "white", "yellow"];
 
-		for (const colorName of colors) {
-			const output = formatProjectBadge("x", true, colorName);
+		const badges = colors.map((colorName) => formatProjectBadge("x", true, colorName));
 
-			expect(output).not.toBe("▶ x");
-		}
+		expect(badges).not.toContain("▶ x");
 	});
 
 	it("should use all hash-based badge colors", () => {
-		expect.assertions(4);
+		expect.assertions(1);
 
 		// d→0 (bgYellow), a→1 (bgCyan), b→2 (bgGreen), c→3 (bgMagenta)
-		for (const name of ["d", "a", "b", "c"]) {
-			const output = formatProjectBadge(name, true);
+		const names = ["d", "a", "b", "c"];
 
-			expect(output).not.toBe(`▶ ${name}`);
-		}
+		const badges = names.map((name) => formatProjectBadge(name, true));
+
+		expect(badges).not.toIncludeAnyMembers(names.map((name) => `▶ ${name}`));
 	});
 
 	it("should honor caller-supplied slowTestThreshold for duration coloring", () => {
@@ -3964,5 +4359,91 @@ describe("test duration coloring", () => {
 		});
 
 		expect(formatted).toContain("[32m 400[2mms[22m[39m");
+	});
+});
+
+describe("complete formatter contracts", () => {
+	it("should render an expected/received failure exactly", () => {
+		expect.assertions(1);
+
+		const test: TestCaseResult = {
+			ancestorTitles: ["inventory", "stacking"],
+			duration: 12,
+			failureMessages: [
+				"expect(received).toStrictEqual(expected)\n\nExpected: { count: 2 }\nReceived: { count: 1 }",
+			],
+			fullName: "inventory stacking should merge items",
+			status: "failed",
+			title: "should merge items",
+		};
+
+		expect(
+			formatFailure({
+				failureIndex: 2,
+				filePath: "src/inventory.spec.ts",
+				test,
+				totalFailures: 3,
+				useColor: false,
+			}),
+		).toMatchSnapshot();
+	});
+
+	it("should render a snapshot diff exactly", () => {
+		expect.assertions(1);
+
+		const test: TestCaseResult = {
+			ancestorTitles: ["inventory"],
+			duration: 12,
+			failureMessages: [
+				[
+					"expect(received).toMatchSnapshot()",
+					"",
+					"- Snapshot  - 1",
+					"+ Received  + 1",
+					"",
+					'-   "count": 2,',
+					'+   "count": 1,',
+					"",
+					'[string "ReplicatedStorage.inventory.spec"]:41',
+				].join("\n"),
+			],
+			fullName: "inventory matches snapshot",
+			status: "failed",
+			title: "matches snapshot",
+		};
+
+		expect(
+			formatFailure({ filePath: "src/inventory.spec.ts", test, useColor: false }),
+		).toMatchSnapshot();
+	});
+
+	it("should render complete pass, skip, failure, and exec-error reports exactly", () => {
+		expect.assertions(1);
+
+		const reports = [PASSING_RESULT, SKIPPED_RESULT, FAILING_RESULT, EXEC_ERROR_RESULT].map(
+			(result) => formatResult(result, TIMING, { ...defaultOptions, color: false }),
+		);
+
+		expect(reports).toMatchSnapshot();
+	});
+
+	it("should render line padding, tabs, a caret, and language exactly", () => {
+		expect.assertions(1);
+
+		const snippet: SourceSnippet = {
+			column: 6,
+			failureLine: 10,
+			lines: [
+				{ content: "\tconst count = 1;", num: 9 },
+				{ content: "\t expect(count).toBe(2);", num: 10 },
+			],
+		};
+
+		expect(
+			formatSourceSnippet(snippet, "src/inventory.spec.ts", {
+				language: "TypeScript",
+				useColor: false,
+			}),
+		).toMatchSnapshot();
 	});
 });

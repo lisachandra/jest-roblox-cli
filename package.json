@@ -1,6 +1,6 @@
 {
 	"name": "@isentinel/jest-roblox",
-	"version": "0.3.10",
+	"version": "0.3.24",
 	"description": "Jest-compatible CLI for running roblox-ts tests via Roblox Open Cloud",
 	"keywords": [
 		"jest",
@@ -24,14 +24,16 @@
 	"exports": {
 		".": {
 			"source": "./src/source.ts",
-			"types": "./dist/index.d.mts",
 			"default": "./dist/index.mjs"
 		},
 		"./artifacts": {
-			"types": "./dist/index.d.mts",
+			"source": "./src/index.ts",
 			"default": "./dist/index.mjs"
 		},
-		"./cli": "./dist/cli.mjs",
+		"./cli": {
+			"source": "./src/cli.ts",
+			"default": "./dist/cli.mjs"
+		},
 		"./package.json": "./package.json"
 	},
 	"types": "./dist/index.d.mts",
@@ -48,13 +50,14 @@
 		"!dist/**/*.tsbuildinfo"
 	],
 	"scripts": {
-		"bench": "vitest bench --project unit",
+		"bench": "vitest bench --project \"unit (bench)\"",
 		"build": "pnpm build:packages && pnpm build:bundle && tsdown && pnpm build:plugin",
 		"build:bundle": "weld",
 		"build:packages": "pnpm -r --filter !@isentinel/jest-roblox run build",
-		"build:plugin": "rojo build plugin/plugin.project.json -o plugin/JestRobloxRunner.rbxm",
+		"build:plugin": "node scripts/stamp-plugin-version.run.ts && rojo build plugin/plugin.project.json -o plugin/JestRobloxRunner.rbxm",
 		"lint": "eslint --cache",
 		"lint:ci": "eslint --cache --cache-strategy content",
+		"mutation": "pnpm build:bundle && stryker run",
 		"prepack": "pnpm build",
 		"prepublishOnly": "pnpm build",
 		"release": "bumpp",
@@ -63,36 +66,40 @@
 		"watch": "tsdown --watch"
 	},
 	"dependencies": {
-		"@bedrock-rbx/ocale": "0.1.0",
+		"@bedrock-rbx/ocale": "0.3.0",
 		"@jridgewell/trace-mapping": "0.3.31",
-		"arktype": "2.2.0",
+		"arktype": "2.2.3",
 		"c12": "4.0.0-beta.5",
 		"confbox": "0.2.4",
 		"defu": "6.1.7",
-		"get-tsconfig": "4.14.0",
+		"get-tsconfig": "4.14.3",
 		"highlight.js": "11.11.1",
 		"istanbul-lib-coverage": "3.2.2",
 		"istanbul-lib-report": "3.0.1",
 		"istanbul-reports": "3.2.0",
-		"oxc-parser": "0.123.0",
-		"picomatch": "4.0.4",
+		"oxc-parser": "0.146.0",
+		"picomatch": "4.0.5",
 		"std-env": "4.1.0",
-		"tinyrainbow": "3.1.0",
-		"ws": "8.20.1"
+		"tinyrainbow": "3.1.1",
+		"ws": "8.21.3"
 	},
 	"devDependencies": {
-		"@isentinel/eslint-config": "6.0.0-beta.3",
+		"@isentinel/eslint-config": "6.0.0-beta.42",
 		"@isentinel/luau-ast": "workspace:*",
 		"@isentinel/roblox-runner": "workspace:*",
 		"@isentinel/roblox-ts": "4.0.11",
 		"@isentinel/rojo-utils": "workspace:*",
-		"@isentinel/tsconfig": "1.2.0",
-		"@isentinel/weld": "0.2.0",
-		"@oxc-project/types": "0.123.0",
+		"@isentinel/tsconfig": "2.0.0",
+		"@isentinel/weld": "0.2.1",
+		"@oxc-project/types": "0.146.0",
 		"@rbxts/jest": "3.16.0-ts.1",
-		"@rbxts/types": "1.0.925",
+		"@rbxts/types": "latest",
+		"@stryker-mutator/api": "10.0.0",
+		"@stryker-mutator/core": "10.0.0",
+		"@stryker-mutator/typescript-checker": "10.0.0",
+		"@stryker-mutator/vitest-runner": "10.0.0",
 		"@total-typescript/shoehorn": "0.1.2",
-		"@tsdown/exe": "0.22.0",
+		"@tsdown/exe": "0.22.14",
 		"@types/istanbul-lib-coverage": "2.0.6",
 		"@types/istanbul-lib-report": "3.0.3",
 		"@types/istanbul-reports": "3.0.4",
@@ -100,24 +107,40 @@
 		"@types/picomatch": "4.0.3",
 		"@types/ws": "8.18.1",
 		"@typescript/native-preview": "7.0.0-dev.20260607.1",
-		"@vitest/coverage-v8": "4.1.8",
+		"@vitest/coverage-v8": "5.0.0-rc.4",
 		"@vitest/eslint-plugin": "1.6.19",
 		"better-typescript-lib": "2.12.0",
 		"bumpp": "11.1.0",
-		"eslint": "10.6.0",
+		"eslint": "10.9.0",
 		"eslint-plugin-jest-extended": "3.0.1",
-		"eslint-plugin-n": "18.2.1",
-		"eslint-plugin-pnpm": "1.6.1",
+		"eslint-plugin-n": "18.3.0",
+		"eslint-plugin-pnpm": "1.8.0",
 		"jest-extended": "7.0.0",
-		"memfs": "4.57.2",
+		"memfs": "4.68.1",
 		"publint": "0.3.21",
-		"tsdown": "0.22.0",
+		"tsdown": "0.22.14",
 		"type-fest": "5.7.0",
 		"typescript": "6.0.3",
-		"vitest": "4.1.8"
+		"vitest": "5.0.0-rc.4"
 	},
-	"packageManager": "pnpm@11.5.2+sha512.71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916",
+	"peerDependencies": {
+		"@typescript/native-preview": ">=7.0.0-0"
+	},
+	"peerDependenciesMeta": {
+		"@typescript/native-preview": {
+			"optional": true
+		}
+	},
+	"packageManager": "pnpm@11.24.0+sha512.bd27e345e976dcb0be0b7a1228217b049a817e21b1f355c90dbe7dc46671895a8bc1e6d06c24554505ea93ea0b45f489a27ec1bfbc8de6a9659fca0f16fa0000",
 	"engines": {
 		"node": ">=24.12.0"
+	},
+	"publishConfig": {
+		"exports": {
+			".": "./dist/index.mjs",
+			"./artifacts": "./dist/index.mjs",
+			"./cli": "./dist/cli.mjs",
+			"./package.json": "./package.json"
+		}
 	}
 }

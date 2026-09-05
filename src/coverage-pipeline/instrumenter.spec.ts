@@ -1,85 +1,57 @@
-import { fromAny, fromPartial } from "@total-typescript/shoehorn";
+import { fromAny } from "@total-typescript/shoehorn";
 
 import { vol } from "memfs";
-import * as cp from "node:child_process";
+import * as fs from "node:fs";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { createTimingCollector } from "../timing/orchestration-collector.ts";
+import { normalizeWindowsPath, toPosixRoot } from "../utils/normalize-windows-path.ts";
+import { createCopyIgnoreMatcher } from "./discover-files.ts";
 import { instrument, instrumentRoot } from "./instrumenter.ts";
 import { MANIFEST_VERSION } from "./manifest.ts";
-
-vi.mock<typeof import("node:os")>(import("node:os"), async (importOriginal) => {
-	const actual = await importOriginal();
-	return { ...actual, tmpdir: vi.fn<() => string>(() => "/tmp") };
-});
-vi.mock<typeof import("node:child_process")>(import("node:child_process"));
 
 vi.mock(import("node:fs"), async () => {
 	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
 	return fromAny({ ...memfs.fs, default: memfs.fs });
 });
 
-const EMPTY_AST = {
-	kind: "stat",
-	location: { beginColumn: 1, beginLine: 1, endColumn: 1, endLine: 1 },
-	statements: [],
-	tag: "block",
-};
+const LUAU_ROOT = toPosixRoot("/luau-root");
 
-const DEFAULT_FILES: Record<string, unknown> = { "init.luau": EMPTY_AST };
+const DEFAULT_FILES = { "init.luau": "local x = 1\n" } satisfies Record<string, string>;
 
 function callInstrumentWithDefaults() {
 	return instrument({
-		astOutputDirectory: "/tmp/asts",
-		luauRoot: "/luau-root",
+		luauRoot: LUAU_ROOT,
 		manifestPath: "/manifest.json",
-		parseScript: "mock.luau",
 		shadowDir: "/shadow",
 	});
 }
 
-/**
- * Seed memfs with source + AST files and configure lute mock.
- * Returns the file list that lute would return.
- */
-function setupFilesystem(
-	options: {
-		astOutputDirectory?: string;
-		files?: Record<string, unknown>;
-		luauRoot?: string;
-	} = {},
-): void {
-	const {
-		astOutputDirectory = "/tmp/asts",
-		files = DEFAULT_FILES,
-		luauRoot = "/luau-root",
-	} = options;
+/** Reads back the `__cov_file_key` literal baked into an instrumented file. */
+function readEmbeddedFileKey(fileKey: string): string | undefined {
+	const relativePath = fileKey.slice("/luau-root/".length);
+	const instrumented = vol.readFileSync(`/shadow/${relativePath}`, "utf-8").toString();
+	return /local __cov_file_key = ("(?:[^"\\]|\\.)*")/.exec(instrumented)?.[1];
+}
 
+/** Seed memfs with source files; instrumentation parses them in process. */
+function setupFilesystem({
+	files = DEFAULT_FILES,
+	luauRoot = "/luau-root",
+}: {
+	files?: Record<string, string>;
+	luauRoot?: string;
+} = {}): void {
 	onTestFinished(() => {
 		vol.reset();
 	});
 
-	const fileNames = Object.keys(files);
-
-	// Seed source files
-	for (const relativePath of fileNames) {
+	for (const [relativePath, source] of Object.entries(files)) {
 		const sourcePath = `${luauRoot}/${relativePath}`;
-		const directory = sourcePath.substring(0, sourcePath.lastIndexOf("/"));
+		const directory = sourcePath.slice(0, sourcePath.lastIndexOf("/"));
 		vol.mkdirSync(directory, { recursive: true });
-		vol.writeFileSync(sourcePath, "local x = 1\n");
+		vol.writeFileSync(sourcePath, source);
 	}
-
-	// Seed AST JSON files
-	vol.mkdirSync(astOutputDirectory, { recursive: true });
-	for (const [relativePath, ast] of Object.entries(files)) {
-		const astPath = `${astOutputDirectory}/${relativePath}.json`;
-		const directory = astPath.substring(0, astPath.lastIndexOf("/"));
-		vol.mkdirSync(directory, { recursive: true });
-		vol.writeFileSync(astPath, JSON.stringify(ast)!);
-	}
-
-	// Lute returns the file list
-	vi.mocked(cp.execFileSync).mockReturnValue(JSON.stringify(fileNames));
 }
 
 describe(instrumentRoot, () => {
@@ -93,29 +65,73 @@ describe(instrumentRoot, () => {
 	// build/run machine boundary with no type error to catch it.
 	describe("cross-machine join key", () => {
 		it("should bake the manifest file key verbatim into the instrumented preamble", () => {
-			expect.assertions(4);
+			expect.assertions(2);
 
 			setupFilesystem({
-				files: { "init.luau": EMPTY_AST, "shared/player.luau": EMPTY_AST },
+				files: { "init.luau": "local x = 1\n", "shared/player.luau": "local y = 2\n" },
 			});
 
 			const files = instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
+				luauRoot: LUAU_ROOT,
+				shadowDir: "/shadow",
+			});
+			const keys = Object.keys(files);
+
+			// The manifest record keys on `key`; the preamble embeds the same
+			// literal (JSON string encoding matches the preamble's escape rules
+			// for these path keys).
+			expect(Object.values(files).map((record) => record.key)).toStrictEqual(keys);
+			expect(keys.map(readEmbeddedFileKey)).toStrictEqual(
+				keys.map((key) => JSON.stringify(key)),
+			);
+		});
+	});
+
+	// The shadow tree carries no `.luau.map`: `coverageCopyIgnorePatterns`
+	// leaves them behind because every reader opens the one in `outDir`. This
+	// pins the coverage half of that — the stack mapper's half holds because a
+	// coverage run swaps only `placeFile`, never `rojoProject`.
+	it("should record each source map against the source root, not the shadow", () => {
+		expect.assertions(1);
+
+		setupFilesystem({ files: { "init.luau": "local x = 1\n" } });
+
+		const files = instrumentRoot({ luauRoot: LUAU_ROOT, shadowDir: "/shadow" });
+
+		expect(Object.values(files).map((record) => record.sourceMapPath)).toStrictEqual([
+			"/luau-root/init.luau.map",
+		]);
+	});
+
+	// The walk writes each file name relative to the root, then this function
+	// reads those names back from the disk. If the root keeps a leading `./`,
+	// each name loses two characters and the read fails with an ENOENT for a
+	// file that does not exist.
+	it("should instrument a root written with a ./ prefix", () => {
+		expect.assertions(1);
+
+		setupFilesystem({ files: { "shared/player.luau": "local x = 1\n" }, luauRoot: "out" });
+
+		const files = instrumentRoot({ luauRoot: toPosixRoot("./out"), shadowDir: "/shadow" });
+
+		expect(Object.keys(files)).toStrictEqual(["out/shared/player.luau"]);
+	});
+
+	describe("when copy-ignored paths are provided", () => {
+		it("should never instrument a path the shadow will not carry", () => {
+			expect.assertions(1);
+
+			setupFilesystem({
+				files: { "init.luau": "local x = 1\n", "vendor/dep.luau": "local y = 2\n" },
+			});
+
+			const files = instrumentRoot({
+				isCopyIgnored: createCopyIgnoreMatcher(["vendor", "vendor/**"]),
+				luauRoot: LUAU_ROOT,
 				shadowDir: "/shadow",
 			});
 
-			for (const [key, record] of Object.entries(files)) {
-				// The manifest record keys on `key`; the preamble embeds the same
-				// literal (JSON string encoding matches the preamble's escape
-				// rules for these path keys).
-				const relativePath = key.slice("/luau-root/".length);
-				const instrumented = vol.readFileSync(`/shadow/${relativePath}`, "utf-8") as string;
-
-				expect(record.key).toBe(key);
-				expect(instrumented).toContain(`local __cov_file_key = ${JSON.stringify(key)}\n`);
-			}
+			expect(Object.keys(files)).toStrictEqual(["/luau-root/init.luau"]);
 		});
 	});
 
@@ -124,16 +140,11 @@ describe(instrumentRoot, () => {
 			expect.assertions(2);
 
 			setupFilesystem({
-				files: {
-					"init.luau": EMPTY_AST,
-					"shared/player.luau": EMPTY_AST,
-				},
+				files: { "init.luau": "local x = 1\n", "shared/player.luau": "local y = 2\n" },
 			});
 
 			const files = instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
+				luauRoot: LUAU_ROOT,
 				shadowDir: "/shadow",
 				skipFiles: new Set(["shared/player.luau"]),
 			});
@@ -144,87 +155,112 @@ describe(instrumentRoot, () => {
 			expect(keys).not.toContain("/luau-root/shared/player.luau");
 		});
 
-		it("should pass skip list file to lute when skipFiles is non-empty", () => {
-			expect.assertions(2);
-
-			setupFilesystem();
-
-			instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-				skipFiles: new Set(["shared/player.luau"]),
-			});
-
-			const luteArgs = vi.mocked(cp.execFileSync).mock.calls[0]![1] as Array<string>;
-			const skipListPath = luteArgs.at(-1)!;
-
-			expect(skipListPath).toContain("skip-list.json");
-			expect(JSON.parse(vol.readFileSync(skipListPath, "utf-8") as string)).toStrictEqual([
-				"shared/player.luau",
-			]);
-		});
-
-		it("should not pass skip list to lute when skipFiles is empty", () => {
+		it("should not parse a skipped file at all", () => {
 			expect.assertions(1);
 
-			setupFilesystem();
-
-			instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-				skipFiles: new Set(),
+			// The skipped file does not even parse — proven by it being
+			// syntactically invalid without failing the run.
+			setupFilesystem({
+				files: { "broken.luau": "local = = =\n", "init.luau": "local x = 1\n" },
 			});
 
-			const luteArgs = vi.mocked(cp.execFileSync).mock.calls[0]?.[1] as Array<string>;
-
-			// 5 args: run, scriptPath, --, luauRoot, astOutputDir (no skip list)
-			expect(luteArgs).toHaveLength(5);
-		});
-
-		it("should not pass skip list to lute when skipFiles is undefined", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-
-			instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
+			const files = instrumentRoot({
+				luauRoot: LUAU_ROOT,
 				shadowDir: "/shadow",
+				skipFiles: new Set(["broken.luau"]),
 			});
 
-			const luteArgs = vi.mocked(cp.execFileSync).mock.calls[0]?.[1] as Array<string>;
-
-			expect(luteArgs).toHaveLength(5);
+			expect(Object.keys(files)).toStrictEqual(["/luau-root/init.luau"]);
 		});
 	});
 
-	describe("when the file list includes snapshot files", () => {
-		it("should exclude .snap.luau files from instrumentation", () => {
-			expect.assertions(2);
+	it("should throw a contextual error for an unparseable file", () => {
+		expect.assertions(1);
+
+		setupFilesystem({ files: { "init.luau": "local = = =\n" } });
+
+		expect(() => {
+			instrumentRoot({
+				luauRoot: LUAU_ROOT,
+				shadowDir: "/shadow",
+			});
+		}).toThrowWithMessage(Error, /Failed to parse init\.luau/);
+	});
+
+	describe("when the root includes spec, test, and snapshot files", () => {
+		it("should exclude them from instrumentation", () => {
+			expect.assertions(1);
 
 			setupFilesystem({
 				files: {
-					"__snapshots__/Button.spec.snap.luau": EMPTY_AST,
-					"init.luau": EMPTY_AST,
+					"__snapshots__/Button.spec.snap.luau": "return {}\n",
+					"button.spec.luau": "return {}\n",
+					"button.test.luau": "return {}\n",
+					"init.luau": "local x = 1\n",
 				},
 			});
 
 			const files = instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
+				luauRoot: LUAU_ROOT,
 				shadowDir: "/shadow",
 			});
 
-			const keys = Object.keys(files);
+			expect(Object.keys(files)).toStrictEqual(["/luau-root/init.luau"]);
+		});
+	});
 
-			expect(keys).toContain("/luau-root/init.luau");
-			expect(keys).not.toContain("/luau-root/__snapshots__/Button.spec.snap.luau");
+	// A root holds far more files than directories, so creating the output
+	// directory per file spends a recursive stat/mkdir chain to make something
+	// the previous sibling already made — thousands of them over a real root.
+	describe("when several files share a shadow directory", () => {
+		it("should create each directory once for the twin, not once per file", () => {
+			expect.assertions(2);
+
+			setupFilesystem({
+				files: {
+					"init.luau": "local x = 1\n",
+					"shared/a.luau": "local a = 1\n",
+					"shared/b.luau": "local b = 2\n",
+					"shared/deep/c.luau": "local c = 3\n",
+				},
+			});
+
+			const mkdirSpy = vi.spyOn(fs, "mkdirSync");
+
+			instrumentRoot({
+				luauRoot: LUAU_ROOT,
+				shadowDir: "/shadow",
+			});
+
+			// Two sources land here, and only the first is this cache's to
+			// elide: one call per directory for the twin, plus one call per
+			// file from the `atomicWrite` under `writeCoverageMap`, which
+			// makes its own parent for every sidecar. So `/shadow/shared`
+			// holds two files and appears three times, not four.
+			//
+			// Sorted, not walk-ordered: the counts are the claim, and pinning
+			// the order would tie this to the directory walk instead.
+			// Normalized because the target is a host `path.join`, so it
+			// carries backslashes on Windows and forward slashes elsewhere.
+			const directories = mkdirSpy.mock.calls.map(([directory]) => {
+				return normalizeWindowsPath(String(directory));
+			});
+
+			expect(directories.toSorted()).toStrictEqual([
+				"/shadow",
+				"/shadow",
+				"/shadow/shared",
+				"/shadow/shared",
+				"/shadow/shared",
+				"/shadow/shared/deep",
+				"/shadow/shared/deep",
+			]);
+			// Every file still landed, so the skipped calls really were repeats.
+			expect(
+				["init", "shared/a", "shared/b", "shared/deep/c"].map((name) => {
+					return vol.existsSync(`/shadow/${name}.luau`);
+				}),
+			).toStrictEqual([true, true, true, true]);
 		});
 	});
 
@@ -235,9 +271,7 @@ describe(instrumentRoot, () => {
 			setupFilesystem();
 
 			const files = instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
+				luauRoot: LUAU_ROOT,
 				shadowDir: "/shadow",
 			});
 
@@ -247,7 +281,7 @@ describe(instrumentRoot, () => {
 	});
 
 	describe("when a timing profiler is supplied", () => {
-		it("should record the parse-ast, probe-insert, and map-build sub-phases", () => {
+		it("should record every step of the per-file pass", () => {
 			expect.assertions(1);
 
 			setupFilesystem();
@@ -262,41 +296,78 @@ describe(instrumentRoot, () => {
 			});
 
 			instrumentRoot({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
+				luauRoot: LUAU_ROOT,
 				shadowDir: "/shadow",
 				timing,
 			});
 			timing.flushTimingReport();
 
 			expect(lines).toStrictEqual([
+				// No enclosing phase here, so each sub-phase is its own root:
+				// it announces itself and reports as it closes.
+				"[TIMING] discover-files: start",
+				"[TIMING] discover-files: 0ms",
+				"[TIMING] read-source: start",
+				"[TIMING] read-source: 0ms",
+				"[TIMING] parse-ast: start",
 				"[TIMING] parse-ast: 0ms",
+				"[TIMING] collect-coverage: start",
+				"[TIMING] collect-coverage: 0ms",
+				"[TIMING] probe-insert: start",
 				"[TIMING] probe-insert: 0ms",
+				"[TIMING] map-build: start",
 				"[TIMING] map-build: 0ms",
+				"[TIMING] write-shadow: start",
+				"[TIMING] write-shadow: 0ms",
 				"[TIMING] TOTAL (host): 0ms",
 			]);
+		});
+	});
+
+	describe("when the shadow holds an entry of the wrong type", () => {
+		// Neither clash reaches the mirror walk's `createShadowDirectory`:
+		// `prepareShadowRoot` instruments before it mirrors, so the
+		// instrumenter is the pass that has to survive both.
+		it("should replace a directory sitting on a twin's own path", () => {
+			expect.assertions(1);
+
+			setupFilesystem();
+			vol.mkdirSync("/shadow/init.luau", { recursive: true });
+			vol.writeFileSync("/shadow/init.luau/stale.luau", "-- stale");
+
+			instrumentRoot({ luauRoot: LUAU_ROOT, shadowDir: "/shadow" });
+
+			expect(vol.readFileSync("/shadow/init.luau", "utf-8")).toContain("__cov_file_key");
+		});
+
+		it("should replace a file sitting on a directory above a twin", () => {
+			expect.assertions(1);
+
+			setupFilesystem({ files: { "nested/init.luau": "local x = 1\n" } });
+			vol.mkdirSync("/shadow", { recursive: true });
+			vol.writeFileSync("/shadow/nested", "-- stale");
+
+			instrumentRoot({ luauRoot: LUAU_ROOT, shadowDir: "/shadow" });
+
+			expect(vol.readFileSync("/shadow/nested/init.luau", "utf-8")).toContain(
+				"__cov_file_key",
+			);
 		});
 	});
 });
 
 describe(instrument, () => {
-	describe("when processing files from lute", () => {
-		it("should create file records for each entry in the file list", () => {
+	describe("when processing discovered files", () => {
+		it("should create file records for each discovered file", () => {
 			expect.assertions(3);
 
 			setupFilesystem({
-				files: {
-					"init.luau": EMPTY_AST,
-					"shared/player.luau": EMPTY_AST,
-				},
+				files: { "init.luau": "local x = 1\n", "shared/player.luau": "local y = 2\n" },
 			});
 
 			const result = instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
+				luauRoot: LUAU_ROOT,
 				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
 				shadowDir: "/shadow",
 			});
 
@@ -313,16 +384,10 @@ describe(instrument, () => {
 			expect.assertions(1);
 
 			setupFilesystem({
-				files: { "shared/player.luau": EMPTY_AST },
+				files: { "shared/player.luau": "local y = 2\n" },
 			});
 
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			callInstrumentWithDefaults();
 
 			expect(vol.existsSync("/shadow/shared/player.luau")).toBeTrue();
 		});
@@ -332,13 +397,7 @@ describe(instrument, () => {
 
 			setupFilesystem();
 
-			const result = instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			const result = callInstrumentWithDefaults();
 
 			expect(result.version).toBe(MANIFEST_VERSION);
 			expect(result.shadowDir).toBeDefined();
@@ -350,17 +409,11 @@ describe(instrument, () => {
 
 			setupFilesystem();
 
-			const result = instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			const result = callInstrumentWithDefaults();
 
 			const record = result.files["/luau-root/init.luau"];
 
-			expect(record?.sourceHash).toMatch(/^[a-f0-9]{64}$/);
+			expect(record!.sourceHash).toMatch(/^[a-f0-9]{64}$/);
 		});
 
 		it("should include instrumenterVersion in manifest", () => {
@@ -368,67 +421,31 @@ describe(instrument, () => {
 
 			setupFilesystem();
 
-			const result = instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			const result = callInstrumentWithDefaults();
 
-			expect(result.instrumenterVersion).toBe(2);
+			expect(result.instrumenterVersion).toBe(5);
 		});
 
 		it("should emit manifest file records with correct metadata", () => {
 			expect.assertions(3);
 
-			const astWithStatement = {
-				kind: "stat",
-				location: { beginColumn: 1, beginLine: 1, endColumn: 12, endLine: 1 },
-				statements: [
-					{
-						kind: "stat",
-						location: { beginColumn: 1, beginLine: 1, endColumn: 12, endLine: 1 },
-						tag: "local",
-						values: [],
-						variables: [],
-					},
-				],
-				tag: "block",
-			};
+			setupFilesystem({ files: { "init.luau": "local x = 1\n" } });
 
-			setupFilesystem({ files: { "init.luau": astWithStatement } });
-
-			const result = instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			const result = callInstrumentWithDefaults();
 
 			expect(result.files["/luau-root/init.luau"]).toBeDefined();
-			expect(result.files["/luau-root/init.luau"]?.statementCount).toBe(1);
-			expect(result.files["/luau-root/init.luau"]?.key).toBe("/luau-root/init.luau");
+			expect(result.files["/luau-root/init.luau"]!.statementCount).toBe(1);
+			expect(result.files["/luau-root/init.luau"]!.key).toBe("/luau-root/init.luau");
 		});
 
 		it("should write covmap sidecar for each file", () => {
 			expect.assertions(2);
 
 			setupFilesystem({
-				files: {
-					"init.luau": EMPTY_AST,
-					"shared/player.luau": EMPTY_AST,
-				},
+				files: { "init.luau": "local x = 1\n", "shared/player.luau": "local y = 2\n" },
 			});
 
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			callInstrumentWithDefaults();
 
 			expect(vol.existsSync("/shadow/init.cov-map.json")).toBeTrue();
 			expect(vol.existsSync("/shadow/shared/player.cov-map.json")).toBeTrue();
@@ -443,16 +460,10 @@ describe(instrument, () => {
 			expect.assertions(2);
 
 			setupFilesystem({
-				files: { "RuntimeLib.lua": EMPTY_AST },
+				files: { "RuntimeLib.lua": "local x = 1\n" },
 			});
 
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			callInstrumentWithDefaults();
 
 			expect(vol.existsSync("/shadow/RuntimeLib.cov-map.json")).toBeTrue();
 			expect(vol.readFileSync("/shadow/RuntimeLib.lua", "utf-8")).not.toStartWith("{");
@@ -463,15 +474,9 @@ describe(instrument, () => {
 		it("should normalize paths to POSIX format", () => {
 			expect.assertions(3);
 
-			setupFilesystem({ files: { "shared/player.luau": EMPTY_AST } });
+			setupFilesystem({ files: { "shared/player.luau": "local y = 2\n" } });
 
-			const result = instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			const result = callInstrumentWithDefaults();
 
 			for (const key of Object.keys(result.files)) {
 				expect(key).not.toContain("\\");
@@ -479,147 +484,8 @@ describe(instrument, () => {
 
 			const record = result.files["/luau-root/shared/player.luau"];
 
-			expect(record?.originalLuauPath).not.toContain("\\");
-			expect(record?.instrumentedLuauPath).not.toContain("\\");
-		});
-	});
-
-	describe("when resolving the parse script path", () => {
-		it("should write parse-ast.luau to a temp directory when parseScript is not provided", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				shadowDir: "/shadow",
-			});
-
-			const allFiles = vol.toJSON();
-			const parseAstFiles = Object.keys(allFiles).filter((filePath) => {
-				return filePath.includes("parse-ast.luau");
-			});
-
-			expect(parseAstFiles).toHaveLength(1);
-		});
-
-		it("should reuse the cached script path on subsequent calls", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-
-			// First call: creates temp dir + parse-ast.luau
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				shadowDir: "/shadow",
-			});
-
-			const filesAfterFirst = vol.toJSON();
-			const temporaryDirectories = Object.keys(filesAfterFirst).filter((filePath) => {
-				return filePath.includes("jest-roblox-instrument-");
-			});
-
-			// Second call: should reuse the same temp dir
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				shadowDir: "/shadow",
-			});
-
-			const filesAfterSecond = vol.toJSON();
-			const temporaryDirectoriesAfter = Object.keys(filesAfterSecond).filter((filePath) => {
-				return filePath.includes("jest-roblox-instrument-");
-			});
-
-			expect(temporaryDirectoriesAfter).toStrictEqual(temporaryDirectories);
-		});
-	});
-
-	describe("when lute is not available", () => {
-		it("should throw a friendly error when lute is not found on PATH", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-
-			const enoentError = Object.assign(new Error("spawn lute ENOENT"), {
-				code: "ENOENT",
-			});
-			vi.mocked(cp.execFileSync).mockImplementation(() => {
-				throw enoentError;
-			});
-
-			expect(() => {
-				instrument({
-					astOutputDirectory: "/tmp/asts",
-					luauRoot: "/luau-root",
-					manifestPath: "/manifest.json",
-					parseScript: "mock.luau",
-					shadowDir: "/shadow",
-				});
-			}).toThrowWithMessage(
-				Error,
-				"lute is required for instrumentation but was not found on PATH",
-			);
-		});
-
-		it("should throw a contextual error for other lute failures", () => {
-			expect.assertions(2);
-
-			setupFilesystem();
-
-			const originalError = new Error("lute exited with code 1");
-			vi.mocked(cp.execFileSync).mockImplementation(() => {
-				throw originalError;
-			});
-
-			expect(callInstrumentWithDefaults).toThrowWithMessage(
-				Error,
-				"Failed to parse Luau files",
-			);
-			expect(callInstrumentWithDefaults).toThrow(
-				expect.objectContaining(fromPartial({ cause: originalError })),
-			);
-		});
-	});
-
-	describe("when the file list is invalid", () => {
-		it("should throw when lute returns invalid JSON", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-			vi.mocked(cp.execFileSync).mockReturnValue("not json {{{");
-
-			expect(() => {
-				instrument({
-					astOutputDirectory: "/tmp/asts",
-					luauRoot: "/luau-root",
-					manifestPath: "/manifest.json",
-					parseScript: "mock.luau",
-					shadowDir: "/shadow",
-				});
-			}).toThrowWithMessage(Error, "Failed to parse file list from lute");
-		});
-
-		it("should throw when lute returns a non-array", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-			vi.mocked(cp.execFileSync).mockReturnValue('{"not": "array"}');
-
-			expect(() => {
-				instrument({
-					astOutputDirectory: "/tmp/asts",
-					luauRoot: "/luau-root",
-					manifestPath: "/manifest.json",
-					parseScript: "mock.luau",
-					shadowDir: "/shadow",
-				});
-			}).toThrowWithMessage(Error, "Expected file list array from lute");
+			expect(record!.originalLuauPath).not.toContain("\\");
+			expect(record!.instrumentedLuauPath).not.toContain("\\");
 		});
 	});
 
@@ -629,99 +495,9 @@ describe(instrument, () => {
 
 			setupFilesystem();
 
-			const result = instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
+			const result = callInstrumentWithDefaults();
 
 			expect(result.luauRoots).toStrictEqual(["/luau-root"]);
-		});
-	});
-
-	describe("when astOutputDirectory is not provided", () => {
-		it("should fall back to a temporary directory for AST output", () => {
-			expect.assertions(1);
-
-			onTestFinished(() => {
-				vol.reset();
-			});
-			vol.mkdirSync("/tmp", { recursive: true });
-			vol.mkdirSync("/luau-root", { recursive: true });
-			vi.mocked(cp.execFileSync).mockReturnValue("[]");
-
-			const files = instrumentRoot({
-				luauRoot: "/luau-root",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
-
-			expect(files).toBeEmpty();
-		});
-	});
-
-	describe("when creating the AST output directory", () => {
-		it("should create the AST output directory before calling lute", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
-
-			expect(vol.existsSync("/tmp/asts")).toBeTrue();
-		});
-
-		it("should throw contextual error when per-file AST read fails", () => {
-			expect.assertions(2);
-
-			// Seed init.luau but NOT missing.luau's AST JSON
-			setupFilesystem({
-				files: { "init.luau": EMPTY_AST },
-			});
-
-			// Override lute to claim missing.luau also exists
-			vi.mocked(cp.execFileSync).mockReturnValue(
-				JSON.stringify(["init.luau", "missing.luau"]),
-			);
-
-			// Seed the source file for missing.luau (but no AST JSON)
-			vol.mkdirSync("/luau-root", { recursive: true });
-			vol.writeFileSync("/luau-root/missing.luau", "local y = 2\n");
-
-			expect(callInstrumentWithDefaults).toThrowWithMessage(
-				Error,
-				"Failed to read AST for missing.luau",
-			);
-			expect(callInstrumentWithDefaults).toThrow(
-				expect.objectContaining(fromPartial<Error>({ cause: expect.any(Error) })),
-			);
-		});
-
-		it("should pass the AST output directory to lute", () => {
-			expect.assertions(1);
-
-			setupFilesystem();
-
-			instrument({
-				astOutputDirectory: "/tmp/asts",
-				luauRoot: "/luau-root",
-				manifestPath: "/manifest.json",
-				parseScript: "mock.luau",
-				shadowDir: "/shadow",
-			});
-
-			const luteCall = vi.mocked(cp.execFileSync).mock.calls[0];
-			const luteArguments = luteCall?.[1] as Array<string>;
-
-			expect(luteArguments).toContain("/tmp/asts");
 		});
 	});
 });

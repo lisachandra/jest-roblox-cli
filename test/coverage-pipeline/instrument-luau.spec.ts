@@ -1,6 +1,3 @@
-import type { AstStatBlock } from "@isentinel/luau-ast";
-
-import { type } from "arktype";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -10,86 +7,32 @@ import { assert, describe, expect, it } from "vitest";
 import { collectCoverage } from "../../src/coverage-pipeline/coverage-collector.ts";
 import { buildCoverageMap } from "../../src/coverage-pipeline/coverage-map-builder.ts";
 import { insertProbes } from "../../src/coverage-pipeline/probe-inserter.ts";
+import { luauParser } from "../../src/luau/parser.ts";
 
-const PARSE_SCRIPT = path.resolve(import.meta.dirname, "../../src/luau/parse-ast.luau");
 const FIXTURES_DIR = path.resolve(import.meta.dirname, "../fixtures/coverage-pipeline");
-
-// Cache the AST map from a single lute call for all fixtures
-let cachedAstMap: Record<string, unknown> | undefined;
-
-function getAstMap(): Record<string, unknown> {
-	if (cachedAstMap !== undefined) {
-		return cachedAstMap;
-	}
-
-	const astOutputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cov-ast-"));
-
-	const fileListJson = cp.execFileSync(
-		"lute",
-		["run", PARSE_SCRIPT, "--", FIXTURES_DIR, astOutputDirectory],
-		{ encoding: "utf-8", timeout: 10_000, windowsHide: true },
-	);
-
-	const fileList = type("string[]").assert(JSON.parse(fileListJson));
-	const astMap: Record<string, unknown> = {};
-	for (const relativePath of fileList) {
-		const astJsonPath = path.join(astOutputDirectory, `${relativePath}.json`);
-		astMap[relativePath] = JSON.parse(fs.readFileSync(astJsonPath, "utf-8"));
-	}
-
-	// The parsed AST is now wholly in memory; the scratch dir can go.
-	fs.rmSync(astOutputDirectory, { force: true, recursive: true });
-
-	cachedAstMap = astMap;
-	return cachedAstMap;
-}
 
 function instrumentFixture(fixtureName: string, fileKey: string) {
 	const fixturePath = path.join(FIXTURES_DIR, fixtureName);
 	const source = fs.readFileSync(fixturePath, "utf-8");
 
-	const astMap = getAstMap();
-	const rawAst = astMap[fixtureName];
-	assert(rawAst !== undefined, `Fixture ${fixtureName} not found in AST map`);
+	const parsed = luauParser.parse(source);
+	assert(parsed.ok, `Fixture ${fixtureName} has no parsed AST block`);
 
-	const ast = rawAst as AstStatBlock;
-	const result = collectCoverage(ast);
+	const result = collectCoverage(parsed.root, source);
 	const instrumentedSource = insertProbes(source, result, fileKey);
 	const covMap = buildCoverageMap(result);
 
-	return { covMap, instrumentedSource, result };
+	return { covMap, instrumentedSource, result, source };
 }
 
+/** Parse-checks instrumented output; "OK" when it is non-empty valid Luau. */
 function validateLuauSource(source: string): string {
-	const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cov-validate-"));
-	const luauFile = path.join(temporaryDirectory, "check.luau");
-	fs.writeFileSync(luauFile, source);
+	const parsed = luauParser.parse(source);
+	if (!parsed.ok) {
+		return parsed.errors.join("; ");
+	}
 
-	const normalizedPath = luauFile.replaceAll("\\", "/");
-	/* cspell:disable */
-	const checkScript = [
-		'local syntax = require("@std/syntax")',
-		'local fs = require("@std/fs")',
-		`local source = fs.readFileToString("${normalizedPath}")`,
-		"local result = syntax.parse(source)",
-		"if result.root and #result.root.statements > 0 then",
-		'  print("OK")',
-		"else",
-		'  print("EMPTY")',
-		"end",
-	].join("\n");
-	const checkFile = path.join(temporaryDirectory, "validate.luau");
-	fs.writeFileSync(checkFile, checkScript);
-
-	const output = cp.execFileSync("lute", ["run", checkFile], {
-		encoding: "utf-8",
-		timeout: 10_000,
-		windowsHide: true,
-	});
-
-	fs.rmSync(temporaryDirectory, { force: true, recursive: true });
-
-	return output.trim();
+	return parsed.root.body.length > 0 ? "OK" : "EMPTY";
 }
 
 // Executes instrumented Luau through Lute and returns its stdout. Used to prove
@@ -188,7 +131,7 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("functions.luau", "functions.luau");
 
-			const functionEntries = Object.values(covMap.functionMap ?? {});
+			const functionEntries = Object.values(covMap.functionMap!);
 
 			expect(functionEntries).not.toBeEmpty();
 			expect(covMap.functionMap).toBeDefined();
@@ -204,9 +147,7 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("functions.luau", "functions.luau");
 
-			const functionNames = Object.values(covMap.functionMap ?? {}).map(
-				(entry) => entry.name,
-			);
+			const functionNames = Object.values(covMap.functionMap!).map((entry) => entry.name);
 
 			expect(functionNames).toContain("(anonymous)");
 		});
@@ -236,11 +177,11 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("if-else.luau", "if-else.luau");
 
-			const branchEntries = Object.values(covMap.branchMap ?? {});
+			const branchEntries = Object.values(covMap.branchMap!);
 
 			expect(branchEntries).toHaveLength(1);
 			expect(covMap.branchMap).toBeDefined();
-			expect(covMap.branchMap?.["1"]?.locations).toHaveLength(3);
+			expect(covMap.branchMap!["1"]!.locations).toHaveLength(3);
 		});
 
 		it("should set branch type to if in the cov-map", () => {
@@ -248,7 +189,7 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("if-else.luau", "if-else.luau");
 
-			expect(covMap.branchMap?.["1"]?.type).toBe("if");
+			expect(covMap.branchMap!["1"]!.type).toBe("if");
 		});
 
 		it("should initialize __cov_b preamble with correct arm counts", () => {
@@ -287,9 +228,9 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("if-only.luau", "if-only.luau");
 
-			expect(Object.values(covMap.branchMap ?? {})).toHaveLength(1);
+			expect(Object.values(covMap.branchMap!)).toHaveLength(1);
 			// then arm + implicit else arm
-			expect(covMap.branchMap?.["1"]?.locations).toHaveLength(2);
+			expect(covMap.branchMap!["1"]!.locations).toHaveLength(2);
 		});
 	});
 
@@ -299,7 +240,7 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("expr-if.luau", "expr-if.luau");
 
-			const branchEntries = Object.values(covMap.branchMap ?? {});
+			const branchEntries = Object.values(covMap.branchMap!);
 
 			expect(branchEntries.length).toBeGreaterThanOrEqual(2);
 			expect(covMap.branchMap).toBeDefined();
@@ -314,7 +255,7 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("expr-if.luau", "expr-if.luau");
 
-			expect(covMap.branchMap?.["1"]?.locations).toHaveLength(2);
+			expect(covMap.branchMap!["1"]!.locations).toHaveLength(2);
 		});
 
 		it("should record correct arm count for expression-if with elseif", () => {
@@ -322,7 +263,7 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("expr-if.luau", "expr-if.luau");
 
-			expect(covMap.branchMap?.["2"]?.locations).toHaveLength(3);
+			expect(covMap.branchMap!["2"]!.locations).toHaveLength(3);
 		});
 
 		it("should not inject runtime probes for expression-if", () => {
@@ -360,7 +301,7 @@ describe("instrumentation pipeline (integration)", () => {
 
 			const { covMap } = instrumentFixture("and-or.luau", "and-or.luau");
 
-			const branchEntries = Object.values(covMap.branchMap ?? {});
+			const branchEntries = Object.values(covMap.branchMap!);
 
 			// `x and y`, `p or q`, and `i and j and k` (two nested nodes) = 4.
 			expect(branchEntries).toHaveLength(4);
@@ -467,6 +408,47 @@ describe("instrumentation pipeline (integration)", () => {
 		});
 	});
 
+	// lute reports columns as UTF-8 byte offsets, so every probe on a line
+	// holding a multi-byte character lands further right than its byte column
+	// suggests unless the columns are converted first. A probe inside a string
+	// literal or mid-identifier still yields text, so the guard is a re-parse.
+	describe("when instrumenting a file with multi-byte characters", () => {
+		it("should place probes at character boundaries", () => {
+			expect.assertions(4);
+
+			const { instrumentedSource } = instrumentFixture(
+				"utf8-columns.luau",
+				"utf8-columns.luau",
+			);
+
+			expect(instrumentedSource).toContain(
+				'local heart = if true then __cov_br(1, 1, `❤️ {1}`) else __cov_br(1, 2, "none")',
+			);
+			expect(instrumentedSource).toContain(
+				'local infinity = __cov_br(2, 1, "∞") or __cov_br(2, 2, "fallback")',
+			);
+			// U+E002, the private-use Robux glyph — a three-byte character like
+			// `∞`, and one of the corruptions this fix was reported for.
+			expect(instrumentedSource).toContain(
+				'local price = __cov_br(3, 1, `\u{E002}{100}`) and __cov_br(3, 2, "free")',
+			);
+			expect(instrumentedSource).toContain(
+				'local party = __cov_br(4, 1, "\u{1F389}") and __cov_br(4, 2, "yes")',
+			);
+		});
+
+		it("should produce valid Luau that Lute can parse", () => {
+			expect.assertions(1);
+
+			const { instrumentedSource } = instrumentFixture(
+				"utf8-columns.luau",
+				"utf8-columns.luau",
+			);
+
+			expect(validateLuauSource(instrumentedSource)).toBe("OK");
+		});
+	});
+
 	describe("when producing valid Luau output", () => {
 		it("should produce output that Lute can parse without errors", () => {
 			expect.assertions(1);
@@ -475,5 +457,24 @@ describe("instrumentation pipeline (integration)", () => {
 
 			expect(validateLuauSource(instrumentedSource)).toBe("OK");
 		});
+	});
+
+	// The alignment invariant the AGENTS.md Coverage section states. Every
+	// fixture, because the shift it guards against grew with the file.
+	describe("when a stack frame is mapped back to source", () => {
+		it.for(fs.readdirSync(FIXTURES_DIR).filter((name) => name.endsWith(".luau")))(
+			"should keep %s line-for-line aligned with its original",
+			(fixtureName) => {
+				expect.assertions(1);
+
+				const { instrumentedSource, source } = instrumentFixture(fixtureName, fixtureName);
+
+				// The twin drops the source's trailing newline, so count the
+				// lines that carry code rather than the terminator after them.
+				const originalLineCount = source.replace(/\r?\n$/u, "").split(/\r?\n/u).length;
+
+				expect(instrumentedSource.split("\n")).toHaveLength(originalLineCount);
+			},
+		);
 	});
 });

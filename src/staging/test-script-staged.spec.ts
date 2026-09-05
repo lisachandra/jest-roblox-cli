@@ -150,7 +150,7 @@ describe(generateMaterializerScript, () => {
 		// rest of the runtime workflow lives in luau/staging/entry.luau but
 		// must survive bundling; assert both halves are present.
 		expect(script).toContain("__jest_roblox_cov");
-		expect(script).toMatch(/_coverage/);
+		expect(script).toMatch(/runnerCoverage/);
 	});
 
 	it("should throw when serialized payload contains the long-string terminator", () => {
@@ -189,6 +189,41 @@ describe(generateWorkStealingScript, () => {
 		expect(script).toContain('"queueId":"queue-uuid-1"');
 		expect(script).toContain('"invisibilityWindowSeconds":90');
 		expect(script).toContain('"pkg":"@halcyon/foo"');
+	});
+
+	// A worker that drops an entry over budget puts its queue item back, and
+	// the put-back has to name a TTL. Only the CLI knows which one the queue
+	// was seeded with, so it has to travel in the payload.
+	it("should embed the queue TTL the items were seeded with", () => {
+		expect.assertions(1);
+
+		const script = generateWorkStealingScript(
+			[{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] }],
+			"queue-uuid-1",
+			90,
+			{ queueTtlSeconds: 120 },
+		);
+
+		expect(script).toContain('"queueTtlSeconds":120');
+	});
+
+	// The materializer carries its own default, so a run that says nothing
+	// about the budget must not pin one into the payload.
+	it("should embed a result budget only when one is given", () => {
+		expect.assertions(2);
+
+		const inputs = [
+			{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] },
+		];
+
+		// Matched in its encoded form: the bundled materializer source names
+		// the field too, so a bare substring would always be present.
+		expect(generateWorkStealingScript(inputs, "queue-uuid-3", 90)).not.toContain(
+			'"resultBudgetBytes":',
+		);
+		expect(
+			generateWorkStealingScript(inputs, "queue-uuid-3", 90, { resultBudgetBytes: 2048 }),
+		).toContain('"resultBudgetBytes":2048');
 	});
 
 	it("should preserve entries in input order", () => {
@@ -260,5 +295,83 @@ describe("generateMaterializerScript with streaming", () => {
 		);
 
 		expect(script).toContain('"sortedMapId":"stream-uuid"');
+	});
+});
+
+describe("bail payload", () => {
+	it("should embed bail in the single-task payload when requested", () => {
+		expect.assertions(1);
+
+		const script = generateMaterializerScript(
+			[{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] }],
+			{ bail: true },
+		);
+
+		expect(script).toContain('"bail":true');
+	});
+
+	it("should embed bail in the work-stealing payload when requested", () => {
+		expect.assertions(1);
+
+		const script = generateWorkStealingScript(
+			[{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] }],
+			"queue-uuid-1",
+			90,
+			{ bail: true },
+		);
+
+		expect(script).toContain('"bail":true');
+	});
+
+	// Sharded runs dispatch this script rather than the materializer one. The
+	// map only reaches the runtime through the payload, so a generator that
+	// drops it leaves every sharded timeout as opaque as it was before.
+	it("should embed the progress map in the work-stealing payload", () => {
+		expect.assertions(1);
+
+		const script = generateWorkStealingScript(
+			[{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] }],
+			"queue-uuid-1",
+			90,
+			{ testProgressMapId: "progress-uuid" },
+		);
+
+		expect(script).toContain('"progress":{"mapId":"progress-uuid"}');
+	});
+
+	it("should embed the bail signal map when one is given", () => {
+		expect.assertions(1);
+
+		const script = generateWorkStealingScript(
+			[{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] }],
+			"queue-uuid-1",
+			90,
+			{ bail: true, bailMapId: "bail-uuid" },
+		);
+
+		expect(script).toContain('"bailMapId":"bail-uuid"');
+	});
+
+	// The single-task path has no siblings to broadcast to, so it bails
+	// locally and the payload carries no map.
+	it("should omit the bail signal map when none is given", () => {
+		expect.assertions(1);
+
+		const script = generateMaterializerScript(
+			[{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] }],
+			{ bail: true },
+		);
+
+		expect(script).not.toContain('"bailMapId":');
+	});
+
+	it("should omit bail from the payload when not requested", () => {
+		expect.assertions(1);
+
+		const script = generateMaterializerScript([
+			{ config: DEFAULT_CONFIG, pkg: "@halcyon/foo", project: "core", testFiles: [] },
+		]);
+
+		expect(script).not.toContain('"bail":');
 	});
 });

@@ -13,17 +13,17 @@ import { parseVersionedManifest } from "./manifest-parse.ts";
  * probe-inserter is intentionally not formalized here: it has no serialization
  * boundary, so the TypeScript interface is sufficient.
  */
-export const MANIFEST_VERSION = 4 as const;
+export const MANIFEST_VERSION = 5 as const;
 
 export interface InstrumentedFileRecord {
 	key: string;
 	branchCount?: number;
 	coverageMapPath: string;
 	/**
-	 * Per-statement attribution: maps a Luau statement id (the probe index, same
-	 * key space as the coverage-map sidecar) to the ids of the tests that covered
-	 * it. Populated after a coverage run by the per-test attribution harvester;
-	 * absent on a freshly-instrumented manifest (no run yet).
+	 * Per-statement attribution: maps a Luau statement id (the probe index,
+	 * same key space as the coverage-map sidecar) to the ids of the tests that
+	 * covered it. Populated after a coverage run by the per-test attribution
+	 * harvester; absent on a freshly-instrumented manifest (no run yet).
 	 */
 	coveringTestIds?: Record<string, Array<string>>;
 	functionCount?: number;
@@ -34,11 +34,17 @@ export interface InstrumentedFileRecord {
 	statementCount: number;
 	/**
 	 * Statement ids hit during the coverage run but credited to no per-test
-	 * window (executed at module load or in a hook). Computed by the per-test
-	 * attribution harvester; a consumer marks a mutant on one of these as
-	 * Ignored (ADR-0003). Absent on a freshly-instrumented manifest (no run yet).
+	 * window (executed at module load or in a hook). Computed by the
+	 * per-test attribution harvester; a consumer marks a mutant on one of
+	 * these as Ignored (ADR-0003). Absent on a freshly-instrumented
+	 * manifest (no run yet).
 	 */
 	staticStatementIds?: Array<string>;
+}
+
+export interface TestLocation {
+	column: number;
+	line: number;
 }
 
 /**
@@ -47,6 +53,13 @@ export interface InstrumentedFileRecord {
  * `coveringTestIds` references these by `testId`.
  */
 export interface TestRecord {
+	/**
+	 * Where the test is declared, in the coordinates of the file
+	 * `testFileSourceHash` hashes: the TypeScript line when the test file has a
+	 * source map, the Luau line otherwise. The column is always 0, as Luau
+	 * frames carry none. Absent when the runtime could not read the call site.
+	 */
+	location?: TestLocation;
 	/** Full test name (describe chain + leaf `it`). */
 	testCaseId: string;
 	/** The test file's DataModel path, as the runner observed it. */
@@ -55,6 +68,12 @@ export interface TestRecord {
 	testFileSourceHash: string;
 	/** Stable unique id for the test case; referenced by `coveringTestIds`. */
 	testId: string;
+	/**
+	 * SHA-256 of the test's own range of the file: from `location` to the next
+	 * test's start, or to end of file. Lets a consumer see a spec edit that
+	 * left this test alone. Present exactly when `location` is.
+	 */
+	testSourceHash?: string;
 }
 
 export interface NonInstrumentedFileRecord {
@@ -66,6 +85,24 @@ export interface NonInstrumentedFileRecord {
 export interface CoverageManifest {
 	/** Shared UUID linking this manifest to its sibling `BuildManifest`. */
 	buildId: string;
+	/**
+	 * Digest of the `coverageCopyIgnorePatterns` that decided what this shadow
+	 * carries, per `hashCopyIgnorePatterns`. The incremental cache rebuilds on
+	 * a mismatch: a widened list demotes a file the shadow already holds while
+	 * its source hash stays put, exactly as a narrowed universe does. Absent on
+	 * manifests written before this field existed, which reads as changed and
+	 * repopulates it on the next run.
+	 */
+	copyIgnoreHash?: string | undefined;
+	/**
+	 * Digest of the `collectCoverageFrom` / `coveragePathIgnorePatterns` pair
+	 * that decided which files were instrumented, per
+	 * `createInstrumentUniverse`. Absent when the config narrowed nothing, so
+	 * the whole root was instrumented. The incremental cache rebuilds on a
+	 * mismatch: narrowing the globs leaves already-probed copies in the shadow
+	 * that no source hash would invalidate.
+	 */
+	coverageUniverseHash?: string | undefined;
 	files: Record<string, InstrumentedFileRecord>;
 	generatedAt: string;
 	instrumenterVersion: number;
@@ -73,18 +110,18 @@ export interface CoverageManifest {
 	nonInstrumentedFiles: Record<string, NonInstrumentedFileRecord>;
 	placeFilePath?: string;
 	/**
-	 * SHA-256 over every rojo build input OUTSIDE the luauRoots (non-luauRoot
-	 * `$path` mounts plus the rojo project files), per `computeRojoInputsHash`.
-	 * The incremental cache rebuilds the place when it drifts. Absent on manifests
-	 * written before this field existed; a missing value is treated as changed so
-	 * the next run repopulates it.
+	 * SHA-256 over every rojo build input OUTSIDE the luauRoots
+	 * (non-luauRoot `$path` mounts plus the rojo project files), per
+	 * `computeRojoInputsHash`. The incremental cache rebuilds the place when
+	 * it drifts. Absent on manifests written before this field existed; a
+	 * missing value is treated as changed so the next run repopulates it.
 	 */
 	rojoInputsHash?: string;
 	shadowDir: string;
 	/**
-	 * Per-test attribution records, one per Jest test case that covered at least
-	 * one statement. Populated by the harvester after a coverage run; absent on a
-	 * freshly-instrumented manifest.
+	 * Per-test attribution records, one per Jest test case that covered at
+	 * least one statement. Populated by the harvester after a coverage run;
+	 * absent on a freshly-instrumented manifest.
 	 */
 	tests?: Array<TestRecord>;
 	version: typeof MANIFEST_VERSION;
@@ -107,10 +144,12 @@ const instrumentedFileRecordSchema = type({
 }).as<InstrumentedFileRecord>();
 
 const testRecordSchema = type({
-	testCaseId: "string",
-	testFilePath: "string",
-	testFileSourceHash: "string",
-	testId: "string",
+	"location?": type({ column: "number", line: "number" }),
+	"testCaseId": "string",
+	"testFilePath": "string",
+	"testFileSourceHash": "string",
+	"testId": "string",
+	"testSourceHash?": "string",
 }).as<TestRecord>();
 
 const nonInstrumentedRecordSchema = type({
@@ -121,6 +160,8 @@ const nonInstrumentedRecordSchema = type({
 
 export const manifestSchema: type<CoverageManifest> = type({
 	"buildId": "string",
+	"copyIgnoreHash?": "string",
+	"coverageUniverseHash?": "string",
 	"files": type({ "[string]": instrumentedFileRecordSchema }),
 	"generatedAt": "string",
 	"instrumenterVersion": "number",
@@ -134,7 +175,7 @@ export const manifestSchema: type<CoverageManifest> = type({
 }).as<CoverageManifest>();
 
 export function writeManifest(filePath: string, manifest: CoverageManifest): void {
-	atomicWrite(filePath, JSON.stringify(manifest, undefined, "\t"));
+	atomicWrite({ contents: JSON.stringify(manifest, undefined, "\t"), targetPath: filePath });
 }
 
 export function readManifest(filePath: string): ReadManifestResult {

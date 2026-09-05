@@ -1,7 +1,9 @@
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 
-import { startFakeOpenCloudServer } from "./fake-open-cloud.ts";
+import { startFakeOpenCloudServerAsync } from "./fake-open-cloud.ts";
+import type { JestEnvelopePayload } from "./helpers.ts";
 import {
 	buildMixedOutput,
 	buildPassingPayload,
@@ -14,13 +16,33 @@ import {
 const LUAU_FIXTURE = path.resolve(__dirname, "../fixtures/luau-project");
 const RBXTS_FIXTURE = path.resolve(__dirname, "../fixtures/rbxts-project");
 
+/**
+ * Shorten the boot probe's budget for a sandbox, so a spec that stalls the
+ * probe on purpose costs seconds rather than the 90s a real cold boot is
+ * allowed. Patches the fixture's own config rather than restating it, so the
+ * sandbox keeps testing the same project shape as every sibling spec.
+ */
+function writeBootProbeTimeout(sandbox: string, bootProbeTimeout: number): void {
+	const configPath = path.join(sandbox, "jest.config.ts");
+	const source = readFileSync(configPath, "utf-8");
+	const patched = source.replace(
+		"defineConfig({",
+		() => `defineConfig({
+	bootProbeTimeout: ${String(bootProbeTimeout)},`,
+	);
+	// A patch that matched nothing would leave the 90s default in place and the
+	// spec would fail as a long, unexplained wait rather than a broken helper.
+	assert(patched !== source, "boot-probe patch matched nothing in the fixture config");
+	writeFileSync(configPath, patched);
+}
+
 describe("cli error paths", () => {
 	describe("exit codes", () => {
 		it("should exit 1 when the Jest payload reports failed tests", async () => {
 			expect.assertions(2);
 
 			const sandbox = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
-			const server = await startFakeOpenCloudServer([
+			const server = await startFakeOpenCloudServerAsync([
 				{
 					jestOutput: buildMixedOutput(buildFailingPayload()),
 				},
@@ -63,28 +85,67 @@ describe("cli error paths", () => {
 			);
 		});
 
-		it("should exit non-zero with a 'timed out' message when the backend never completes", async () => {
-			expect.assertions(2);
+		// A poll that never settles used to be tested here too, at 48s of real
+		// wall-clock: the runner keeps polling for a fixed 45s boot-lag grace
+		// after the task deadline, and the grace does not scale with
+		// `--timeout`. It bought nothing that was not already covered twice
+		// over. `libs/roblox-runner/src/ocale-runner.spec.ts` asserts the whole
+		// message — task path, `last observed state: PROCESSING`, the
+		// deadline-plus-allowance phrasing — under fake timers, instantly. And
+		// every backend error reaches the same `printError` + exit 2 boundary in
+		// `cli.ts`, which the task-failure case below already drives in about a
+		// second.
 
+		it("should exit non-zero naming a place version Open Cloud cannot start", async () => {
+			expect.assertions(4);
+
+			// A place version Roblox cannot boot leaves every task PROCESSING
+			// with no error and no log, so the probe timing out is the only
+			// signal there is. Nothing may be dispatched against it.
 			const sandbox = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
-			const server = await startFakeOpenCloudServer([
-				{
-					jestOutput: buildMixedOutput(buildPassingPayload()),
-					// Stall on PROCESSING longer than the configured CLI
-					// timeout. The backend exhausts its timeout budget and
-					// throws "Execution timed out" before this counter drains.
-					pollsBeforeComplete: 999,
-				},
-			]);
+			writeBootProbeTimeout(sandbox, 2000);
+			const server = await startFakeOpenCloudServerAsync(
+				[{ jestOutput: buildMixedOutput(buildPassingPayload()) }],
+				{ bootProbe: "stall" },
+			);
 
-			const result = await runCliAsync(["--timeout", "2000"], {
+			const result = await runCliAsync([], {
 				cwd: sandbox,
 				env: createOpenCloudEnvironment(server.baseUrl),
-				timeoutMs: 30_000,
 			});
 
 			expect(result.exitCode).toBeGreaterThan(0);
-			expect(result.stderr).toMatch(/timed out/i);
+			expect(result.stderr).toContain("Place version 1 cannot be started by Open Cloud.");
+			expect(result.stderr).toContain("A trivial script against it also never ran (2s).");
+			expect(server.requests).toHaveLength(0);
+		});
+
+		it("should surface the Roblox error code and log tail when a task fails", async () => {
+			expect.assertions(3);
+
+			const sandbox = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
+			const server = await startFakeOpenCloudServerAsync([
+				{
+					errorMessage: "TaskScript:1: attempt to index nil",
+					logs: [
+						{ message: "loading test bundle", messageType: "OUTPUT" },
+						{
+							message: "TaskScript:1: attempt to index nil",
+							messageType: "ERROR",
+						},
+					],
+					state: "FAILED",
+				},
+			]);
+
+			const result = await runCliAsync([], {
+				cwd: sandbox,
+				env: createOpenCloudEnvironment(server.baseUrl),
+			});
+
+			expect(result.exitCode).toBeGreaterThan(0);
+			expect(result.stderr).toContain("Roblox task failed (SCRIPT_ERROR)");
+			expect(result.stderr).toContain("[ERROR] TaskScript:1: attempt to index nil");
 		});
 	});
 
@@ -110,9 +171,11 @@ describe("cli error paths", () => {
 	});
 });
 
-function buildFailingPayload(): Record<string, unknown> {
+function buildFailingPayload(): JestEnvelopePayload {
 	return {
-		_setup: 0.05,
+		runner: {
+			setup: 0.05,
+		},
 		success: true,
 		value: {
 			numFailedTests: 1,

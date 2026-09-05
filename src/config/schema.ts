@@ -11,9 +11,13 @@ export type Backend = "auto" | "open-cloud" | "studio" | "studio-cli";
 
 export type CoverageReporter = keyof ReportOptions;
 
-export type FormatterEntry = [string, Record<string, unknown>] | string;
+export type FormatterEntry = [string, object] | string;
 
-/** pretty-format options controlling how snapshots are serialized. */
+/**
+ * pretty-format options controlling how snapshots are serialized.
+ *
+ * @external
+ */
 export interface SnapshotFormatOptions {
 	/** Call a value's `toJSON` method (when present) before serializing it. */
 	callToJSON?: boolean;
@@ -56,10 +60,20 @@ export interface SharedTestConfig {
 	 */
 	injectGlobals?: boolean;
 	/**
-	 * Swap the live Roblox DataModel for a fresh mock instance per test file so
-	 * tests can mutate the tree in isolation. Default `false`.
+	 * Swap the live Roblox DataModel for a fresh mock instance per test file
+	 * so tests can mutate the tree in isolation. Default `false`.
 	 */
 	mockDataModel?: boolean;
+	/**
+	 * Wall-clock budget in milliseconds for one project's whole Jest run,
+	 * enforced inside the Roblox runtime. Default `60000`; `0` turns it off.
+	 *
+	 * The middle rung of three: `test.testTimeout` bounds a single test, this
+	 * bounds every test one project runs, and the root `timeout` bounds the
+	 * whole Open Cloud task. A project that outlives its budget is abandoned
+	 * and reported as timed out, and the run moves on to the next one.
+	 */
+	projectTimeout?: number;
 	/**
 	 * Reset mock state and remove any mocked implementation before each test
 	 * (like `jest.resetAllMocks()`). Default `false`.
@@ -75,7 +89,10 @@ export interface SharedTestConfig {
 	 * (like `jest.restoreAllMocks()`). Default `false`.
 	 */
 	restoreMocks?: boolean;
-	/** DataModel paths to scripts run once before the test framework is installed. */
+	/**
+	 * DataModel paths to scripts run once before the test framework is
+	 * installed.
+	 */
 	setupFiles?: Array<string>;
 	/**
 	 * DataModel paths to scripts run after the framework is installed, before
@@ -91,12 +108,18 @@ export interface SharedTestConfig {
 	/** Test environment used to run the tests. */
 	testEnvironment?: string;
 	/** Options forwarded to the test environment. */
-	testEnvironmentOptions?: Record<string, unknown> | string;
+	testEnvironmentOptions?: object | string;
 	/** Glob patterns Jest uses to detect test files. */
 	testMatch?: Array<string>;
-	/** Regex patterns; a test file is skipped when its path matches any of them. */
+	/**
+	 * Regex patterns; a test file is skipped when its path matches any of
+	 * them.
+	 */
 	testPathIgnorePatterns?: Array<string>;
-	/** Regex pattern(s) Jest uses to detect test files (alternative to `testMatch`). */
+	/**
+	 * Regex pattern(s) Jest uses to detect test files (alternative to
+	 * `testMatch`).
+	 */
 	testRegex?: Array<string> | string;
 	/** Default per-test timeout in milliseconds. Default `5000`. */
 	testTimeout?: number;
@@ -123,13 +146,16 @@ export interface ProjectTestConfig extends SharedTestConfig {
 	 */
 	include: Array<string>;
 	/**
-	 * Compiled-output directory the project's `.luau` lives in. Setting it pins
-	 * the project to a single DataModel mount (exact Rojo lookup, no
+	 * Compiled-output directory the project's `.luau` lives in. Setting it
+	 * pins the project to a single DataModel mount (exact Rojo lookup, no
 	 * auto-expand). roblox-ts users point this at the compiled output (e.g.
 	 * `"out/client"`), not `"src/…"`.
 	 */
 	outDir?: string;
-	/** Base path prepended to this project's `include`, `exclude`, and `outDir`. */
+	/**
+	 * Base path prepended to this project's `include`, `exclude`, and
+	 * `outDir`.
+	 */
 	root?: string;
 }
 
@@ -137,8 +163,28 @@ export interface InlineProjectConfig {
 	test: ProjectTestConfig;
 }
 
+/**
+ * A project config file as authored. `include` is optional here because
+ * `deriveIncludeFromTestMatch` fills it in from `testMatch` after the file is
+ * read; {@link ProjectTestConfig} is the shape the rest of the CLI consumes.
+ */
+export interface ProjectConfigFile extends Except<ProjectTestConfig, "include"> {
+	/** See {@link ProjectTestConfig.include}. */
+	include?: Array<string>;
+}
+
 /** Workspace-only knobs. Ignored outside `--workspace` mode. */
 export interface WorkspaceConfig {
+	/**
+	 * Globs, relative to the workspace root, naming package directories a
+	 * workspace run must never select on its own — test fixtures the package
+	 * manager installs as real members, most often. `--packages` overrides
+	 * this: naming a package is asking for it.
+	 *
+	 * Independent of `packages`/`root`, so it narrows the `pnpm-workspace.yaml`
+	 * source too.
+	 */
+	exclude?: Array<string>;
 	/**
 	 * When `true`, emit one Per-package Game Output file per selected
 	 * (package, project) under `<workspaceRoot>/.jest-roblox/output/`.
@@ -193,6 +239,24 @@ export interface GlobalTestConfig extends SharedTestConfig {
 	collectCoverageFrom?: Array<string>;
 	/** Alias for {@link collectCoverage}. */
 	coverage?: boolean;
+	/**
+	 * Globs for files a coverage run never copies into the instrumented place
+	 * it builds. Matched against each file's path relative to its compiled
+	 * root, so `**\/*.d.ts` and `foo/bar.json` both work.
+	 *
+	 * Distinct from {@link coveragePathIgnorePatterns}, which decides what the
+	 * *report* covers: this one decides what reaches the place at all, and a
+	 * pattern that matches a `.luau` removes that module from the build.
+	 *
+	 * Defaults to the three sidecars roblox-ts emits beside every module: rojo
+	 * mounts none of those extensions, and every reader of a source map opens
+	 * the one in `outDir`. Declare a function to keep them and add your own:
+	 *
+	 * ```ts
+	 * coverageCopyIgnorePatterns: (defaults) => [...defaults, "**\/*.tsbuildinfo"],
+	 * ```
+	 */
+	coverageCopyIgnorePatterns?: Array<string>;
 	/** Directory coverage reports are written to. Default `"coverage"`. */
 	coverageDirectory?: string;
 	/** Globs excluded from coverage collection. */
@@ -240,7 +304,10 @@ export interface GlobalTestConfig extends SharedTestConfig {
 	maxWorkers?: number | string;
 	/** Omit stack traces from failure output. */
 	noStackTrace?: boolean;
-	/** Default compiled-output directory for test discovery when not set per-project. */
+	/**
+	 * Default compiled-output directory for test discovery when not set
+	 * per-project.
+	 */
 	outDir?: string;
 	/** Exit `0` even when no tests are found. Default `false`. */
 	passWithNoTests?: boolean;
@@ -273,7 +340,10 @@ export interface GlobalTestConfig extends SharedTestConfig {
 	timers?: string;
 	/** Update stored snapshots to match current output. */
 	updateSnapshot?: boolean;
-	/** Report each individual test result, not just suite summaries. Default `false`. */
+	/**
+	 * Report each individual test result, not just suite summaries. Default
+	 * `false`.
+	 */
 	verbose?: boolean;
 }
 
@@ -283,14 +353,27 @@ export interface GlobalTestConfig extends SharedTestConfig {
  */
 export interface Config {
 	/**
-	 * Execution backend. `"auto"` probes for a running Studio then falls back to
-	 * Open Cloud; `"open-cloud"` uploads and runs via Roblox Open Cloud;
-	 * `"studio"` drives a locally running Studio; `"studio-cli"` launches its own
-	 * headless Studio via `--task RunScript` and quits it (pass `--headed` to show
-	 * the Studio window during the run). Default `"auto"`. `"studio-cli"` is never
-	 * selected by `"auto"` — request it explicitly.
+	 * Execution backend. `"auto"` probes for a running Studio then falls back
+	 * to Open Cloud; `"open-cloud"` uploads and runs via Roblox Open Cloud;
+	 * `"studio"` drives a locally running Studio; `"studio-cli"` launches its
+	 * own headless Studio via `--task RunScript` and quits it (pass `--headed`
+	 * to show the Studio window during the run). Default `"auto"`.
+	 * `"studio-cli"` is never selected by `"auto"` — request it explicitly.
 	 */
 	backend?: Backend;
+	/**
+	 * How long the Open Cloud backend gives its boot probe — one trivial
+	 * pinned task run against a freshly uploaded place version — to complete,
+	 * in milliseconds. Default `90000`.
+	 *
+	 * Roblox reports nothing at all for a place version it cannot start: the
+	 * task stays `PROCESSING` past every deadline, with no error and no log.
+	 * The probe is how that is caught, so this must comfortably exceed the
+	 * worst cold place boot (10-45s) or a healthy run fails for being slow.
+	 * Zero turns the probe off, and with it the upload cache: an entry means
+	 * "these bytes boot", which nothing has proved.
+	 */
+	bootProbeTimeout?: number;
 	/** Force ANSI colour in output. Default `true`. */
 	color?: boolean;
 	/**
@@ -299,8 +382,8 @@ export interface Config {
 	 */
 	coverageCache?: boolean;
 	/**
-	 * One or more config files to inherit from (c12 layering), relative to this
-	 * file. Local keys win over extended ones.
+	 * One or more config files to inherit from (c12 layering), relative to
+	 * this file. Local keys win over extended ones.
 	 */
 	extends?: Array<string> | string;
 	/**
@@ -332,7 +415,10 @@ export interface Config {
 	 * single aggregated result file (consensus-resolved).
 	 */
 	outputFile?: string | true;
-	/** Number of places to shard the run across, or `"auto"` to pick automatically. */
+	/**
+	 * Number of places to shard the run across, or `"auto"` to pick
+	 * automatically.
+	 */
 	parallel?: "auto" | number;
 	/** Path to the `.rbxl` place uploaded and run. Default `"./game.rbxl"`. */
 	placeFile?: string;
@@ -347,17 +433,21 @@ export interface Config {
 	rojoProject?: string;
 	/**
 	 * Base directory for resolving relative paths. Defaults to the current
-	 * working directory.
+	 * working directory. A relative value resolves against the directory the
+	 * config was loaded from, which in workspace mode is the package
+	 * directory — so `rootDir: "."` names the package, not the workspace root.
 	 */
 	rootDir?: string;
-	/** Include the translated Luau line in error/stack output. Default `true`. */
+	/**
+	 * Include the translated Luau line in error/stack output. Default `true`.
+	 */
 	showLuau?: boolean;
 	/** Map Luau stack traces back to TypeScript source. Default `true`. */
 	sourceMap?: boolean;
 	/**
-	 * Path to the Roblox Studio executable the `"studio-cli"` backend launches.
-	 * Overrides per-OS auto-discovery. Also settable via `--studioPath` or the
-	 * `JEST_ROBLOX_STUDIO_PATH` environment variable.
+	 * Path to the Roblox Studio executable the `"studio-cli"` backend
+	 * launches. Overrides per-OS auto-discovery. Also settable via
+	 * `--studioPath` or the `JEST_ROBLOX_STUDIO_PATH` environment variable.
 	 */
 	studioPath?: string;
 	/**
@@ -366,12 +456,25 @@ export interface Config {
 	 */
 	test?: GlobalTestConfig;
 	/**
-	 * Maximum remote execution time in milliseconds before the run is
-	 * abandoned. Default `300000`.
+	 * Deadline in milliseconds Roblox is given to run the script. Default
+	 * `300000`.
+	 *
+	 * The run is not abandoned the instant this elapses. Roblox starts the
+	 * deadline when the script begins running, which is after the place boots,
+	 * so the poll waits a fixed allowance past it for Roblox's own verdict —
+	 * without that wait the run reports a poll timeout for a failure Roblox
+	 * already described.
 	 */
 	timeout?: number;
 	/** Open Cloud universe id that owns the place. */
 	universeId?: string;
+	/**
+	 * Skip the place upload when the place file's bytes already have a version
+	 * on Roblox, recorded in `.jest-roblox/upload-cache.json`. An upload is the
+	 * only thing measured to precede a cold place boot, so an unchanged build
+	 * keeps the warm path. Default `true`.
+	 */
+	uploadCache?: boolean;
 	/**
 	 * Workspace-mode knobs for multi-package runs. Ignored outside
 	 * `--workspace`.
@@ -380,29 +483,93 @@ export interface Config {
 }
 
 /**
+ * Relaxes optional properties to accept an explicit `undefined`.
+ *
+ * Only for internal, already-resolved shapes. The authoring surface (`Config`
+ * and friends) must stay strict: `validateConfig` counts keys with
+ * `Object.keys` and the arktype schema rejects unknown/misplaced ones, so a
+ * present-but-undefined key there is a validation error, not a no-op.
+ * Homomorphic (`[K in keyof T]`) so each property keeps its source JSDoc on
+ * hover, same as {@link ConfigInput}.
+ */
+export type UndefinedTolerant<T> = { [K in keyof T]: T[K] | undefined };
+
+/**
+ * A concurrency count as the CLI and config accept it: an explicit number, or
+ * `"auto"` to let the layer that runs the work pick.
+ */
+export type ParallelCount = "auto" | number;
+
+/**
  * Resolved config flattens the root CLI keys with the `test:` jest options
  * so downstream code (executor, projects, test-script, formatters) can read
  * options uniformly. Refactoring those consumers to read `config.test.foo`
- * is follow-up work; this shape lets the structural split land first.
+ * is follow-up work; this representation lets the structural split land first.
+ *
+ * Its optional properties tolerate an explicit `undefined`: every producer
+ * (`mergeCliWithConfig`, `narrowForLuauRun`) writes the key unconditionally,
+ * and every consumer reads by value.
  */
 export interface ResolvedConfig
-	extends Except<Config, "test">, Except<GlobalTestConfig, "projects"> {
+	extends
+		UndefinedTolerant<Except<Config, "test">>,
+		UndefinedTolerant<Except<GlobalTestConfig, "projects">> {
 	backend: Backend;
+	bootProbeTimeout: number;
 	collectCoverage: boolean;
-	collectPerTestCoverage?: boolean;
+	collectPerTestCoverage?: boolean | undefined;
 	color: boolean;
 	coverageCache: boolean;
+	coverageCopyIgnorePatterns: Array<string>;
 	coverageDirectory: string;
 	coveragePathIgnorePatterns: Array<string>;
 	coverageReporters: Array<CoverageReporter>;
-	/** `true` is expanded to `<rootDir>/game-output.log` at resolve time; an explicit path is kept as-is. */
-	gameOutput?: string;
-	/** `true` is expanded to `<rootDir>/jest-output.log` at resolve time; an explicit path is kept as-is. */
-	outputFile?: string;
+	/**
+	 * Studio-only, experimental: the VM count `--experimental-vm-parallel`
+	 * asked for. Sourced from the CLI alone — {@link Config} has no such key,
+	 * so a config file cannot turn in-session parallelism on for everyone who
+	 * runs the suite.
+	 */
+	experimentalVmParallel?: ParallelCount | undefined;
+	/**
+	 * `true` is expanded to `<rootDir>/game-output.log` at resolve time; an
+	 * explicit path is kept as-is.
+	 */
+	gameOutput?: string | undefined;
+	/**
+	 * `true` is expanded to `<rootDir>/jest-output.log` at resolve time; an
+	 * explicit path is kept as-is.
+	 */
+	outputFile?: string | undefined;
+	/**
+	 * Declare this run the only writer of its place, which lets every submit
+	 * stay on head.
+	 *
+	 * A pinned submit misses the warm-server pool and pays a cold place boot
+	 * (measured: 12.2s median against 3.0s for the same bytes on head). Two
+	 * submits pin today — the boot probe always, and the version guard's retry
+	 * when a concurrent upload moves head. Both go away once this run has
+	 * uploaded: head is then its own version, so the probe proves the same
+	 * thing unpinned and the guard has no race to catch.
+	 *
+	 * Resolved-only, with no config key and no flag behind it. The claim is
+	 * true of a place a lease handed out and false of one a person guessed at,
+	 * so the only caller who can set it honestly is the one holding the lease.
+	 * The backend still checks it rather than trusting it, and a run whose
+	 * claim fails keeps the guard.
+	 */
+	ownedPlace: boolean;
 	passWithNoTests: boolean;
 	placeFile: string;
 	port: number;
-	projects?: Array<string>;
+	/**
+	 * The `projects` entries as authored. Resolution turns each into a
+	 * {@link ResolvedProjectConfig}; this field keeps the raw form, because
+	 * single/multi dispatch and workspace mode both read it before resolution
+	 * runs.
+	 */
+	projects?: Array<ProjectEntry> | undefined;
+	projectTimeout: number;
 	rootDir: string;
 	showLuau: boolean;
 	silent: boolean;
@@ -410,6 +577,7 @@ export interface ResolvedConfig
 	testMatch: Array<string>;
 	testPathIgnorePatterns: Array<string>;
 	timeout: number;
+	uploadCache: boolean;
 	verbose: boolean;
 }
 
@@ -420,6 +588,11 @@ export interface ResolvedConfig
  */
 export interface WorkspaceRunOptions {
 	backend: Backend;
+	/**
+	 * Stop the run at the first failing package. CLI-only — there is no config
+	 * counterpart, so a package cannot opt its workspace into failing fast.
+	 */
+	bail: boolean;
 	color: boolean;
 	formatters: Array<FormatterEntry>;
 	/** Absolute path for the Aggregated Game Output file; undefined = off. */
@@ -430,12 +603,20 @@ export interface WorkspaceRunOptions {
 	placeId?: string;
 	port: number;
 	silent: boolean;
-	/** Studio executable override for the `studio-cli` backend; undefined = auto-discover. */
+	/**
+	 * Studio executable override for the `studio-cli` backend; undefined =
+	 * auto-discover.
+	 */
 	studioPath?: string;
 	universeId?: string;
-	/** When true, emit Per-package Game Output files under `.jest-roblox/output/`. */
+	/**
+	 * When true, emit Per-package Game Output files under
+	 * `.jest-roblox/output/`.
+	 */
 	workspaceGameOutput: boolean;
-	/** When true, emit per-package result files under `.jest-roblox/output/`. */
+	/**
+	 * When true, emit per-package result files under `.jest-roblox/output/`.
+	 */
 	workspaceOutputFile: boolean;
 }
 
@@ -454,10 +635,30 @@ export function isValidBackend(value: string): value is Backend {
 	return VALID_BACKENDS.has(value);
 }
 
+export const VALID_COVERAGE_REPORTERS: ReadonlySet<string> = new Set<CoverageReporter>([
+	"clover",
+	"cobertura",
+	"html",
+	"html-spa",
+	"json",
+	"json-summary",
+	"lcov",
+	"lcovonly",
+	"none",
+	"teamcity",
+	"text",
+	"text-lcov",
+	"text-summary",
+]);
+
+export function isCoverageReporter(value: string): value is CoverageReporter {
+	return VALID_COVERAGE_REPORTERS.has(value);
+}
+
 /**
- * Resolve a config's `placeFile` against its `rootDir` to an absolute path. The
- * one resolution every backend shares: `placeFile` is rootDir-relative, and a
- * coverage run has the run layer point it at the instrumented place.
+ * Resolve a config's `placeFile` against its `rootDir` to an absolute path.
+ * The one resolution every backend shares: `placeFile` is rootDir-relative,
+ * and a coverage run has the run layer point it at the instrumented place.
  */
 export function resolvePlaceFilePath(config: ResolvedConfig): string {
 	return path.resolve(config.rootDir, config.placeFile);
@@ -465,9 +666,17 @@ export function resolvePlaceFilePath(config: ResolvedConfig): string {
 
 export const DEFAULT_CONFIG: ResolvedConfig = {
 	backend: "auto",
+	bootProbeTimeout: 90_000,
 	collectCoverage: false,
 	color: true,
 	coverageCache: true,
+	// The three sidecars roblox-ts emits beside every compiled module. rojo
+	// mounts none of these extensions, and every stage that wants a source map
+	// opens the one in `outDir`: the source mapper resolves `$path` from the
+	// user's own rojo project, never the synthesized one, and the coverage
+	// manifest records `sourceMapPath` against the source root. On a
+	// game-sized tree they are three quarters of the mirrored files.
+	coverageCopyIgnorePatterns: ["**/*.d.ts", "**/*.d.ts.map", "**/*.luau.map"],
 	coverageDirectory: "coverage",
 	coveragePathIgnorePatterns: [
 		"**/*.spec.lua",
@@ -478,9 +687,11 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
 		"**/rbxts_include/**",
 	],
 	coverageReporters: ["text", "lcov"],
+	ownedPlace: false,
 	passWithNoTests: false,
 	placeFile: "./game.rbxl",
 	port: 3001,
+	projectTimeout: 60_000,
 	rootDir: process.cwd(),
 	showLuau: true,
 	silent: false,
@@ -499,58 +710,76 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
 	],
 	testPathIgnorePatterns: ["/node_modules/", "/dist/", "/out/"],
 	timeout: 300_000,
+	uploadCache: true,
 	verbose: false,
 };
 
 export interface CliOptions {
-	affectedSince?: string;
-	apiKey?: string;
-	backend?: Backend;
-	collectCoverage?: boolean;
-	collectCoverageFrom?: Array<string>;
-	color?: boolean;
+	affectedSince?: string | undefined;
+	apiKey?: string | undefined;
+	backend?: Backend | undefined;
+	/**
+	 * Workspace mode: stop the run as soon as a package fails (`--bail`).
+	 * CLI-only, and distinct from Jest's own `test.bail`, which counts
+	 * failing test suites inside a single package.
+	 */
+	bail?: boolean | undefined;
+	collectCoverage?: boolean | undefined;
+	collectCoverageFrom?: Array<string> | undefined;
+	color?: boolean | undefined;
 
-	config?: string;
-	coverageCache?: boolean;
-	coverageDirectory?: string;
-	coverageReporters?: Array<CoverageReporter>;
-	files?: Array<string>;
-	formatters?: Array<string>;
-	gameOutput?: string;
+	config?: string | undefined;
+	coverageCache?: boolean | undefined;
+	coverageDirectory?: string | undefined;
+	coverageReporters?: Array<CoverageReporter> | undefined;
+	/**
+	 * Studio-only, experimental (`--experimental-vm-parallel [n]`): run the
+	 * multi-project configs across `n` Luau VMs inside one Studio session
+	 * (`"auto"` = one VM per config). CLI-only — there is no config
+	 * counterpart, because the DataModel contention it exposes is a property
+	 * of the machine running it, not of the suite.
+	 */
+	experimentalVmParallel?: ParallelCount | undefined;
+	files?: Array<string> | undefined;
+	formatters?: Array<string> | undefined;
+	gameOutput?: string | undefined;
 	/**
 	 * Show the Studio window during a `studio-cli` run (`--headed`). CLI-only;
 	 * inert for every other backend. Never sourced from config or env.
 	 */
-	headed?: boolean;
-	help?: boolean;
-	outputFile?: string;
-	packages?: string;
-	parallel?: "auto" | number;
-	passWithNoTests?: boolean;
-	placeId?: string;
-	port?: number;
-	project?: Array<string>;
-	reporters?: Array<string>;
-	rojoProject?: string;
-	setupFiles?: Array<string>;
-	setupFilesAfterEnv?: Array<string>;
-	showLuau?: boolean;
-	silent?: boolean;
-	sourceMap?: boolean;
-	studioPath?: string;
-	testNamePattern?: string;
-	testPathPattern?: string;
-	timeout?: number;
-	typecheck?: boolean;
-	typecheckOnly?: boolean;
-	typecheckTsconfig?: string;
-	universeId?: string;
-	updateSnapshot?: boolean;
-	verbose?: boolean;
-	version?: boolean;
-	workspace?: boolean;
-	/** Directory to load the workspace config from when run outside a package. */
-	workspaceRoot?: string;
+	headed?: boolean | undefined;
+	help?: boolean | undefined;
+	outputFile?: string | undefined;
+	packages?: string | undefined;
+	parallel?: "auto" | number | undefined;
+	passWithNoTests?: boolean | undefined;
+	placeId?: string | undefined;
+	port?: number | undefined;
+	project?: Array<string> | undefined;
+	reporters?: Array<string> | undefined;
+	rojoProject?: string | undefined;
+	setupFiles?: Array<string> | undefined;
+	setupFilesAfterEnv?: Array<string> | undefined;
+	showLuau?: boolean | undefined;
+	silent?: boolean | undefined;
+	sourceMap?: boolean | undefined;
+	studioPath?: string | undefined;
+	testNamePattern?: string | undefined;
+	testPathPattern?: string | undefined;
+	timeout?: number | undefined;
+	typecheck?: boolean | undefined;
+	typecheckOnly?: boolean | undefined;
+	typecheckTsconfig?: string | undefined;
+	universeId?: string | undefined;
+	updateSnapshot?: boolean | undefined;
+	uploadCache?: boolean | undefined;
+	verbose?: boolean | undefined;
+	version?: boolean | undefined;
+	workspace?: boolean | undefined;
+	/**
+	 * Directory to load the workspace config from when run outside a package.
+	 */
+	workspaceRoot?: string | undefined;
 }
 
 const snapshotFormatSchema = type({
@@ -590,11 +819,12 @@ const typecheckConfigSchema = type({
 	"tsconfig?": "string",
 });
 
-const sharedTestSchemaShape = {
+const sharedTestDefinition = type.define({
 	"automock?": "boolean",
 	"clearMocks?": "boolean",
 	"injectGlobals?": "boolean",
 	"mockDataModel?": "boolean",
+	"projectTimeout?": "number >= 0",
 	"resetMocks?": "boolean",
 	"resetModules?": "boolean",
 	"restoreMocks?": "boolean",
@@ -610,16 +840,22 @@ const sharedTestSchemaShape = {
 	"testRegex?": type("string").or(type("string[]")),
 	"testTimeout?": "number",
 	"typecheck?": typecheckConfigSchema,
-} as const;
+});
+
+// Everything a project's `test` block carries except `include`, which is
+// required once resolved but optional as authored — see ProjectConfigFile.
+const projectTestDefinition = type.define({
+	...sharedTestDefinition,
+	"displayName": type("string").or(displayNameSchema),
+	"exclude?": "string[]",
+	"outDir?": "string",
+	"root?": "string",
+});
 
 const projectTestConfigSchema = type({
 	"+": "reject",
-	...sharedTestSchemaShape,
-	"displayName": type("string").or(displayNameSchema),
-	"exclude?": "string[]",
+	...projectTestDefinition,
 	"include": "string[]",
-	"outDir?": "string",
-	"root?": "string",
 });
 
 const inlineProjectSchema = type({
@@ -627,8 +863,29 @@ const inlineProjectSchema = type({
 	"test": projectTestConfigSchema,
 });
 
+const projectConfigFileTestSchema = type({
+	"+": "reject",
+	...projectTestDefinition,
+	"include?": "string[]",
+});
+
+/**
+ * Both shapes a project config file may export — a bare `test` block, or the
+ * `defineProject` wrapper around one — parsed into the block either way. A
+ * config file is loaded by c12, which merges layers but validates nothing, so
+ * this is where it becomes a domain type.
+ */
+export const projectConfigFileSchema: Type<ProjectConfigFile> = type({
+	"+": "reject",
+	"test": projectConfigFileTestSchema,
+})
+	.pipe(({ test }) => test)
+	.or(projectConfigFileTestSchema)
+	.as<ProjectConfigFile>();
+
 const workspaceConfigSchema = type({
 	"+": "reject",
+	"exclude?": "string[]",
 	"gameOutput?": "true",
 	"outputFile?": "true",
 	"packages?": "string[]",
@@ -641,7 +898,7 @@ const projectEntrySchema = type("string").or(inlineProjectSchema);
 
 const globalTestConfigSchema = type({
 	"+": "reject",
-	...sharedTestSchemaShape,
+	...sharedTestDefinition,
 	"all?": "boolean",
 	"bail?": type("boolean").or(type("number")),
 	"changedSince?": "string",
@@ -650,6 +907,7 @@ const globalTestConfigSchema = type({
 	"collectCoverage?": "boolean",
 	"collectCoverageFrom?": "string[]",
 	"coverage?": "boolean",
+	"coverageCopyIgnorePatterns?": "string[]",
 	"coverageDirectory?": "string",
 	"coveragePathIgnorePatterns?": "string[]",
 	"coverageReporters?": "string[]",
@@ -684,6 +942,7 @@ const globalTestConfigSchema = type({
 export const configSchema: Type<Config> = type({
 	"+": "reject",
 	"backend?": type("'auto'|'open-cloud'|'studio'|'studio-cli'"),
+	"bootProbeTimeout?": "number",
 	"color?": "boolean",
 	"config?": "string",
 	"coverageCache?": "boolean",
@@ -705,6 +964,7 @@ export const configSchema: Type<Config> = type({
 	"test?": globalTestConfigSchema,
 	"timeout?": "number",
 	"universeId?": "string",
+	"uploadCache?": "boolean",
 	"workspace?": workspaceConfigSchema,
 }).as<Config>();
 
@@ -724,6 +984,7 @@ export type ConfigInput = {
 
 type MergeableTestKey =
 	| "collectCoverageFrom"
+	| "coverageCopyIgnorePatterns"
 	| "coveragePathIgnorePatterns"
 	| "coverageReporters"
 	| "coverageThreshold"
@@ -753,6 +1014,7 @@ type SharedKey = keyof SharedTestConfig;
 
 export const ROOT_CLI_KEYS_LIST: ReadonlyArray<RootCliKey> = [
 	"backend",
+	"bootProbeTimeout",
 	"color",
 	"coverageCache",
 	"extends",
@@ -772,6 +1034,7 @@ export const ROOT_CLI_KEYS_LIST: ReadonlyArray<RootCliKey> = [
 	"studioPath",
 	"timeout",
 	"universeId",
+	"uploadCache",
 	"workspace",
 ];
 
@@ -780,6 +1043,7 @@ const SHARED_TEST_KEYS_LIST = [
 	"clearMocks",
 	"injectGlobals",
 	"mockDataModel",
+	"projectTimeout",
 	"resetMocks",
 	"resetModules",
 	"restoreMocks",
@@ -806,6 +1070,7 @@ const GLOBAL_ONLY_KEYS_LIST = [
 	"collectCoverage",
 	"collectCoverageFrom",
 	"coverage",
+	"coverageCopyIgnorePatterns",
 	"coverageDirectory",
 	"coveragePathIgnorePatterns",
 	"coverageReporters",
@@ -850,10 +1115,15 @@ export const SHARED_TEST_KEYS: ReadonlySet<string> = new Set<SharedKey>(SHARED_T
 /** Keys valid in `test:` (root) but not per-project (`projects[N].test`). */
 export const GLOBAL_TEST_KEYS: ReadonlySet<string> = new Set<GlobalOnlyKey>(GLOBAL_ONLY_KEYS_LIST);
 
-/** Root-level CLI/runner keys. The complement of `test:` jest-passthrough keys. */
+/**
+ * Root-level CLI/runner keys. The complement of `test:` jest-passthrough keys.
+ */
 export const ROOT_CLI_KEYS: ReadonlySet<string> = new Set<RootCliKey>(ROOT_CLI_KEYS_LIST);
 
-/** Keys valid per-project (`projects[N].test`). Used to filter `ResolvedConfig` when generating stubs. */
+/**
+ * Keys valid per-project (`projects[N].test`). Used to filter `ResolvedConfig`
+ * when generating stubs.
+ */
 export const PROJECT_TEST_KEYS: ReadonlySet<string> = new Set<keyof ProjectTestConfig>(
 	PROJECT_TEST_KEYS_LIST,
 );
@@ -861,35 +1131,45 @@ export const PROJECT_TEST_KEYS: ReadonlySet<string> = new Set<keyof ProjectTestC
 /**
  * Keys excluded from jest argv when building the test runner script. Includes
  * all CLI/runner-level keys plus the coverage keys, which live under `test:`
- * by config shape but are consumed by the runner's lute-based coverage layer
- * (not jest itself).
+ * by configuration layout but are consumed by the runner's lute-based coverage
+ * layer (not jest itself).
  */
 export const JEST_ARGV_EXCLUDED_KEYS: ReadonlySet<string> = new Set<string>([
 	...ROOT_CLI_KEYS_LIST,
 	"collectCoverage",
 	"collectCoverageFrom",
 	"collectPerTestCoverage",
+	"coverageCopyIgnorePatterns",
 	"coverageDirectory",
 	"coveragePathIgnorePatterns",
 	"coverageReporters",
 	"coverageThreshold",
+	// CLI-only, and not in `Config`, so `ROOT_CLI_KEYS_LIST` cannot carry it:
+	// it tells the plugin how many VMs to run, and means nothing to Jest.
+	"experimentalVmParallel",
+	// Resolved-only, so `ROOT_CLI_KEYS_LIST` cannot carry it: it decides how
+	// this run submits to Open Cloud, and means nothing to Jest.
+	"ownedPlace",
+	// Read by our own runner, not by Jest — it reaches the runtime as
+	// `runnerTimeoutMs` instead. See `buildJestArgv`.
+	"projectTimeout",
 	"typecheck",
 ]);
 
 /**
  * Removed flat root keys mapped to their `test.typecheck.*` replacements.
- * `validateConfig` emits a migration error naming these so upgraders see the
- * targets, mirroring the "wrap jest options in a `test:` block" directive.
+ * `assertNoLegacyKeys` emits a migration error naming these so upgraders see
+ * the targets, mirroring the "wrap jest options in a `test:` block" directive.
  */
-const MIGRATED_TYPECHECK_KEYS: Readonly<Record<string, string>> = {
-	typecheck: "test.typecheck.enabled",
-	typecheckOnly: "test.typecheck.only",
-	typecheckTsconfig: "test.typecheck.tsconfig",
-};
+const MIGRATED_TYPECHECK_KEYS = new Map([
+	["typecheck", "test.typecheck.enabled"],
+	["typecheckOnly", "test.typecheck.only"],
+	["typecheckTsconfig", "test.typecheck.tsconfig"],
+]);
 
 /**
  * Source of truth for jest-passthrough vs CLI key partitioning.  Used by
- * `validateConfig` to emit a migration error when jest options appear at
+ * `assertNoLegacyKeys` to emit a migration error when jest options appear at
  * config root.
  */
 const KEY_LOCATIONS: Readonly<Record<string, "root" | "test">> = (() => {
@@ -910,28 +1190,7 @@ const KEY_LOCATIONS: Readonly<Record<string, "root" | "test">> = (() => {
 })();
 
 export function validateConfig(raw: unknown): Config {
-	if (typeof raw === "object" && raw !== null) {
-		const migrated = Object.keys(raw)
-			.filter((key) => key in MIGRATED_TYPECHECK_KEYS)
-			.sort();
-		if (migrated.length > 0) {
-			const targets = migrated
-				.map((key) => `${key} → ${MIGRATED_TYPECHECK_KEYS[key]}`)
-				.join(", ");
-			throw new Error(
-				`\`typecheck\` options have moved under \`test.typecheck\`. Replace these keys: ${targets}`,
-			);
-		}
-
-		const misplaced = Object.keys(raw)
-			.filter((key) => KEY_LOCATIONS[key] === "test")
-			.sort();
-		if (misplaced.length > 0) {
-			throw new Error(
-				`jest options must be wrapped in a \`test:\` block. Move these keys under \`test:\`: ${misplaced.join(", ")}`,
-			);
-		}
-	}
+	assertNoLegacyKeys(raw);
 
 	const result = configSchema(raw);
 	if (result instanceof type.errors) {
@@ -950,9 +1209,41 @@ export function validateConfig(raw: unknown): Config {
 }
 
 /**
+ * Reject configs still written against the pre-`test:` layout. Both checks run
+ * before the arktype pass so a migrating config gets a directive naming the
+ * replacement keys, rather than a generic "unknown key" schema summary.
+ */
+function assertNoLegacyKeys(raw: unknown): void {
+	if (typeof raw !== "object" || raw === null) {
+		return;
+	}
+
+	const migrated = Object.keys(raw)
+		.flatMap((key) => {
+			const replacement = MIGRATED_TYPECHECK_KEYS.get(key);
+			return replacement === undefined ? [] : [`${key} → ${replacement}`];
+		})
+		.sort();
+	if (migrated.length > 0) {
+		throw new Error(
+			`\`typecheck\` options have moved under \`test.typecheck\`. Replace these keys: ${migrated.join(", ")}`,
+		);
+	}
+
+	const misplaced = Object.keys(raw)
+		.filter((key) => KEY_LOCATIONS[key] === "test")
+		.sort();
+	if (misplaced.length > 0) {
+		throw new Error(
+			`jest options must be wrapped in a \`test:\` block. Move these keys under \`test:\`: ${misplaced.join(", ")}`,
+		);
+	}
+}
+
+/**
  * Identity helper for authoring a typed `jest.config.*` file. Returns its
  * input unchanged; it exists purely to give editors autocompletion and
- * type-checking for the root config shape (`Config` plus the c12 layer props
+ * type-checking for the root config contract (`Config` plus the c12 layer props
  * on `ConfigInput`).
  *
  * Use it as the default export of a config file discovered by c12 (`.ts`,
@@ -969,7 +1260,7 @@ export const defineConfig: (input: ConfigInput) => ConfigInput = createDefineCon
  * Identity helper for a single entry inside `test.projects`, mirroring
  * {@link defineConfig} for per-project overrides. Returns its input unchanged
  * and exists only for editor autocompletion and type-checking of the
- * `InlineProjectConfig` shape — a `test:` block carrying the project's
+ * `InlineProjectConfig` contract — a `test:` block carrying the project's
  * `include`/`displayName` plus any shared per-project jest options.
  */
 export const defineProject: (input: InlineProjectConfig) => InlineProjectConfig =

@@ -11,12 +11,19 @@ import picomatch from "picomatch";
 import { applyPlaceHook } from "../utils/place-hook.ts";
 
 import type { ResolvedConfig } from "../config/schema.ts";
-import { buildPlace } from "../staging/place-builder.ts";
+import { buildPlaceAsync } from "../staging/place-builder.ts";
 import type { CoverageRoot } from "../staging/synthesizer.ts";
+import type { TimingCollector } from "../timing/orchestration-collector.ts";
+import { NOOP_TIMING_COLLECTOR } from "../timing/orchestration-collector.ts";
 import type { RojoProject } from "../types/rojo.ts";
 import { rojoProjectSchema } from "../types/rojo.ts";
-import { hashFile } from "../utils/hash.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import { hashFileAsync } from "../utils/hash.ts";
+import type { PosixRoot } from "../utils/normalize-windows-path.ts";
+import {
+	isAbsolutePath,
+	normalizeWindowsPath,
+	toPosixRoot,
+} from "../utils/normalize-windows-path.ts";
 import type {
 	BuildManifestArtifact,
 	BuildManifestFileRecord,
@@ -24,6 +31,11 @@ import type {
 	CoverageArtifacts,
 } from "./build-manifest.ts";
 import { BUILD_MANIFEST_FILE, readBuildManifest, toBuildManifestFiles } from "./build-manifest.ts";
+import type { CopyIgnoreMatcher } from "./discover-files.ts";
+import { createCopyIgnoreMatcher, hashCopyIgnorePatterns } from "./discover-files.ts";
+import { canReuseCoverageManifest } from "./incremental-gate.ts";
+import type { InstrumentUniverse } from "./instrument-universe.ts";
+import { createInstrumentUniverse } from "./instrument-universe.ts";
 import { INSTRUMENTER_VERSION } from "./instrumenter.ts";
 import type {
 	CoverageManifest,
@@ -31,10 +43,18 @@ import type {
 	NonInstrumentedFileRecord,
 } from "./manifest.ts";
 import { MANIFEST_VERSION, readManifest, writeManifest } from "./manifest.ts";
-import { computeRojoInputsHash } from "./rojo-inputs.ts";
+import type { NarrowedMount } from "./narrow-roots.ts";
+import { narrowLuauRoots } from "./narrow-roots.ts";
+import { tryComputeRojoInputsHashAsync } from "./rojo-inputs.ts";
+import { collectRojoMounts, resolveMountWithin } from "./root-reachability.ts";
+import type { BakeOwnershipMatcher, ShadowRootResult } from "./shadow-root.ts";
 import { prepareShadowRoot } from "./shadow-root.ts";
+import type { PreparedSpine, ShadowBake } from "./spine.ts";
+import { createShadowLayout, prepareSpine } from "./spine.ts";
 
 const COVERAGE_DIR = ".jest-roblox/coverage";
+/** Framed on `rootDir`, and outside the directory a cold rebuild wipes. */
+const INPUT_DIGEST_PATH = ".jest-roblox/input-digests";
 const COVERAGE_MANIFEST = "coverage-manifest.json";
 const COVERAGE_PLACE_HOOK_ENV = "JEST_ROBLOX_COVERAGE_PLACE_HOOK";
 
@@ -49,19 +69,61 @@ export interface PrepareCoverageResult {
 	coveragePlace: BuildManifestArtifact;
 	/** SHA-256 of each compiled `.luau`, for the caller's Build Manifest. */
 	files: Record<string, BuildManifestFileRecord>;
+	/**
+	 * Host time spent instrumenting into the shadow tree — the only part of
+	 * this call a run reports as coverage.
+	 */
+	instrumentMs: number;
 	manifest: CoverageManifest;
 	placeFile: string;
 	/**
 	 * `true` when the place was rebuilt this run. `false` on the incremental
-	 * no-change short-circuit, so an entry point can skip rewriting an identical
-	 * Build Manifest.
+	 * no-change short-circuit, so an entry point can skip rewriting an
+	 * identical Build Manifest.
 	 */
 	rebuilt: boolean;
+	/**
+	 * Host time spent on the part of this call a run reports as staging
+	 * rather than as coverage: the run's stub bake, the reuse gate
+	 * that decides whether the place has to be rebuilt, and the build itself.
+	 * A non-coverage run pays the same work over uninstrumented sources, so
+	 * charging it to coverage would put a coverage segment on a run that
+	 * collected none.
+	 */
+	stagingMs: number;
+}
+
+export interface PrepareCoverageOptions {
+	/** What this run writes into the shadow before the place is built. */
+	bake?: ShadowBake | undefined;
+	/**
+	 * The run's effective coverage include globs, per `resolveCoverageInclude`
+	 * — which is where the `collectCoverageFrom ?? derived` fallback lives. A
+	 * caller that omits it gets the raw config value, so a run that never
+	 * resolves the fallback still narrows by anything explicitly set.
+	 */
+	coverageInclude?: Array<string> | undefined;
+	/**
+	 * The run's collector, so the two phases this call reports nest under the
+	 * `prepareCoverage` span the caller opened around it. Omitted by the
+	 * offline build path, which has no run to profile; both phases are still
+	 * measured, since their durations feed a Duration line either way.
+	 */
+	timing?: TimingCollector | undefined;
+}
+
+/** A rojo project this run could read, with the frame its mounts are in. */
+export interface RojoProjectInFrame {
+	project: RojoProject;
+	/** What `$path` resolves against — the project's own directory. */
+	rojoDirectory: string;
 }
 
 interface WriteManifestOptions {
 	allFiles: Record<string, InstrumentedFileRecord>;
 	buildId: string;
+	copyIgnoreHash: string;
+	coverageUniverseHash: string | undefined;
 	luauRoots: Array<string>;
 	manifestPath: string;
 	nonInstrumentedFiles: Record<string, NonInstrumentedFileRecord>;
@@ -69,22 +131,110 @@ interface WriteManifestOptions {
 	rojoInputsHash: string;
 }
 
+/** The two settings every shadow pass of one run reads the same way. */
+interface ShadowPassSettings {
+	isBakeOwned: BakeOwnershipMatcher | undefined;
+	isIncremental: boolean;
+}
+
 interface PriorPlaceReuse {
 	/**
-	 * The prior manifest's validated coverage place, when a build manifest exists.
-	 * `readBuildManifest` already re-hashed it, so the caller reuses this rather
-	 * than hashing the same `.rbxl` a second time. Absent for pre-BuildManifest
-	 * caches (coverage manifest only).
+	 * The prior manifest's validated coverage place, when a build manifest
+	 * exists. `readBuildManifest` already re-hashed it, so the caller reuses
+	 * this rather than hashing the same `.rbxl` a second time. Absent for
+	 * pre-BuildManifest caches (coverage manifest only).
 	 */
-	coveragePlace?: BuildManifestArtifact;
+	coveragePlace?: BuildManifestArtifact | undefined;
 	reusable: boolean;
 }
 
-interface ReuseCoverageOptions {
+/** One read of a rojo project: the tree, or why there is none. */
+interface RojoProjectRead {
+	/**
+	 * The parse failure, held rather than thrown, and set only for a project
+	 * too malformed to read — never for a missing one. A run that names its own
+	 * `luauRoots` never needs the tree, and refusing it for a project it does
+	 * not read would turn a working run into a hard failure, so only the root
+	 * auto-detect rethrows this.
+	 */
+	failure: Error | undefined;
+	/**
+	 * Absent when the project is missing or too malformed to parse. The tree
+	 * and the directory it is read against travel as one: a mount means
+	 * nothing without the frame it resolves in.
+	 */
+	loaded: RojoProjectInFrame | undefined;
+}
+
+/** The rojo project a run reads, parsed once and shared by everything. */
+interface RojoContext extends RojoProjectRead {
+	config: ResolvedConfig;
+}
+
+/** Everything resolved from config before any shadow dir is touched. */
+interface CoverageInputs {
 	buildManifestPath: string;
-	files: Record<string, BuildManifestFileRecord>;
-	hasChanges: boolean;
+	/** Digest of the copy-ignore list, for the incremental gate. */
+	copyIgnoreHash: string;
+	/**
+	 * `false` when the rojo inputs could not be hashed, which turns the
+	 * inputs-drift check off rather than forcing a rebuild.
+	 */
+	hasResolvedInputs: boolean;
+	/** The compiled `coverageCopyIgnorePatterns` gate for every root. */
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoots: Array<PosixRoot>;
+	manifestPath: string;
+	/**
+	 * Each rojo mount with the roots the universe narrowed it to. Carried
+	 * whole because the spine mirror reads `coverageCopyIgnorePatterns` in the
+	 * mount's own frame, which a flattened root list would have lost.
+	 */
+	narrowed: Array<NarrowedMount>;
 	previousManifest: CoverageManifest | undefined;
+	rojoInputsHash: string;
+	rojoProjectPath: string;
+	/** Absent when the config narrows nothing — the whole root is probed. */
+	universe: InstrumentUniverse | undefined;
+}
+
+/** The merged instrumentation output across every luauRoot. */
+interface ShadowRootsResult {
+	changed: boolean;
+	coverageRoots: Array<CoverageRoot>;
+	/** The demoted levels, paired with the shadow copy that stands in. */
+	coverageSpine: Array<CoverageRoot>;
+	files: Record<string, InstrumentedFileRecord>;
+	nonInstrumentedFiles: Record<string, NonInstrumentedFileRecord>;
+}
+
+/** What the coverage place build reads, once the shadow is populated. */
+interface BuildCoveragePlaceOptions {
+	packageDirectory: string;
+	placeFile: string;
+	rojoProjectPath: string;
+	shadow: Pick<ShadowRootsResult, "coverageRoots" | "coverageSpine">;
+}
+
+interface RojoInputsHashResult {
+	hash: string;
+	resolved: boolean;
+}
+
+/**
+ * The place the bake settled on, reused or built: the result minus the two
+ * phase timings, which only the caller that spanned them can supply.
+ */
+type BakedCoveragePlace = Pick<
+	PrepareCoverageResult,
+	"buildId" | "coveragePlace" | "files" | "manifest" | "placeFile" | "rebuilt"
+>;
+
+/** What the instrumentation phase leaves behind for the place build. */
+interface InstrumentedCoverage {
+	inputs: CoverageInputs;
+	isIncremental: boolean;
+	shadow: ShadowRootsResult;
 }
 
 /** Project the coverage result down to the record an entry point emits. */
@@ -102,8 +252,18 @@ export function toCoverageArtifacts(
 	};
 }
 
+/**
+ * The project's `$path` mounts that this run can take as coverage roots,
+ * `rootDir`-relative.
+ *
+ * `rootDir` is the frame — `MountFrame` says why the modes share one, and here
+ * it is where a root is read from by everything downstream: synthesis resolves
+ * one against it, the rojo inputs hash joins one onto it, and
+ * `resolveRojoMounts` states the mounts in it. A root probed in any other
+ * frame, the cwd included, is one the rest of the run cannot find.
+ */
 export function collectLuauRootsFromRojo(
-	project: RojoProject,
+	{ project, rojoDirectory }: RojoProjectInFrame,
 	config: ResolvedConfig,
 ): Array<string> {
 	const paths: Array<string> = [];
@@ -114,22 +274,35 @@ export function collectLuauRootsFromRojo(
 	// mirroring Jest's regex-based coveragePathIgnorePatterns behavior.
 	const isIgnored = picomatch(ignorePatterns, { contains: true });
 
-	return paths.filter((directoryPath) => {
+	const seen = new Set<string>();
+	const roots: Array<string> = [];
+	for (const rawPath of paths) {
+		const root = resolveMountWithin(rawPath, { frame: config.rootDir, rojoDirectory });
+		// One `$path` mounted at two places in the tree is one root: taken
+		// twice it is instrumented into the same shadow dir twice and named
+		// twice in the manifest. Workspace mode dedupes in
+		// `discoverFromRojoWalk` for the same reason.
+		if (root === undefined || seen.has(root) || isIgnored(root)) {
+			continue;
+		}
+
+		const directoryPath = path.resolve(config.rootDir, root);
 		if (!fs.existsSync(directoryPath)) {
-			return false;
+			continue;
 		}
 
 		// Only directories can be coverage roots (skip single-file $path entries)
 		if (!fs.statSync(directoryPath).isDirectory()) {
-			return false;
+			continue;
 		}
 
-		if (isIgnored(directoryPath)) {
-			return false;
+		if (containsLuauFiles(directoryPath)) {
+			seen.add(root);
+			roots.push(root);
 		}
+	}
 
-		return containsLuauFiles(directoryPath);
-	});
+	return roots;
 }
 
 export function findRojoProject(config: ResolvedConfig): string {
@@ -153,127 +326,34 @@ export function findRojoProject(config: ResolvedConfig): string {
 	);
 }
 
-export function resolveLuauRoots(config: ResolvedConfig): Array<string> {
-	return resolveLuauRootsWithRojo(config);
+export function resolveLuauRoots(config: ResolvedConfig): Array<PosixRoot> {
+	return resolveLuauRootsWithRojo(readRojoContext(config, tryFindRojoProject(config)));
 }
 
-export function prepareCoverage(
+export async function prepareCoverageAsync(
 	config: ResolvedConfig,
-	beforeBuild?: (shadowDirectory: string) => boolean,
-): PrepareCoverageResult {
-	const rojoProjectPath = findRojoProject(config);
-	const luauRoots = resolveLuauRootsWithRojo(config, rojoProjectPath);
-
-	validateRelativeRoots(luauRoots);
-
-	const { hash: rojoInputsHash, resolved: inputsResolved } = resolveRojoInputsHash(
-		config,
-		rojoProjectPath,
-		luauRoots,
+	{ bake, coverageInclude, timing = NOOP_TIMING_COLLECTOR }: PrepareCoverageOptions = {},
+): Promise<PrepareCoverageResult> {
+	const { elapsedMs: instrumentMs, value: instrumented } = await timing.profileTimedAsync(
+		"instrumentSources",
+		async () => {
+			const inputs = await resolveCoverageInputsAsync(config, coverageInclude);
+			const isIncremental = decideIncremental(config, inputs);
+			const pass = { isBakeOwned: bake?.isBakeOwned, isIncremental };
+			return { inputs, isIncremental, shadow: prepareShadowRoots(inputs, pass) };
+		},
 	);
 
-	const manifestPath = path.join(COVERAGE_DIR, COVERAGE_MANIFEST);
-	const buildManifestPath = path.join(COVERAGE_DIR, BUILD_MANIFEST_FILE);
-	const previousManifest = loadCoverageManifest(manifestPath);
-	let useIncremental = canUseIncremental(previousManifest, config);
-
-	// A dropped luauRoot is invisible to the per-root reconcile — it only walks
-	// the current roots — so the dropped root's instrumented shadow subtree and
-	// its stale manifest entries would survive a reuse. Force a cold rebuild so
-	// the rmSync below wipes them. An *added* root needs no cold rebuild: the
-	// existing roots stay cached and the new one is instrumented normally.
-	if (
-		useIncremental &&
-		previousManifest !== undefined &&
-		hasDroppedLuauRoot(previousManifest.luauRoots, luauRoots)
-	) {
-		useIncremental = false;
-	}
-
-	if (!useIncremental && fs.existsSync(COVERAGE_DIR)) {
-		fs.rmSync(COVERAGE_DIR, { recursive: true });
-	}
-
-	const allFiles: Record<string, InstrumentedFileRecord> = {};
-	const allNonInstrumented: Record<string, NonInstrumentedFileRecord> = {};
-	const coverageRoots: Array<CoverageRoot> = [];
-	let hasChanges = !useIncremental;
-
-	for (const luauRoot of luauRoots) {
-		const shadowDirectory = normalizeWindowsPath(path.join(COVERAGE_DIR, luauRoot));
-		const result = prepareShadowRoot({
-			luauRoot,
-			previousManifest,
-			shadowDir: shadowDirectory,
-			useIncremental,
-		});
-
-		if (result.changed) {
-			hasChanges = true;
-		}
-
-		Object.assign(allFiles, result.files);
-		Object.assign(allNonInstrumented, result.nonInstrumentedFiles);
-		coverageRoots.push({
-			luauRoot: result.luauRoot,
-			shadowDir: normalizeWindowsPath(path.resolve(result.shadowDir)),
-		});
-	}
-
-	if (beforeBuild !== undefined) {
-		const extraChanges = beforeBuild(COVERAGE_DIR);
-		if (extraChanges) {
-			hasChanges = true;
-		}
-	}
-
-	// A non-luauRoot rojo input changed — the shadow diff can't see those, so
-	// force a rebuild rather than reuse a stale place built from the old include/
-	// or vendored sources. When the inputs couldn't be hashed the check is
-	// skipped (not forced): a project too broken to hash would also fail the
-	// rebuild's own parse, so preserve the prior reuse behavior instead of
-	// converting it into a hard failure.
-	if (useIncremental && inputsResolved && previousManifest?.rojoInputsHash !== rojoInputsHash) {
-		hasChanges = true;
-	}
-
-	const placeFile = path.join(COVERAGE_DIR, "game.rbxl");
-	const files = toBuildManifestFiles(allFiles);
-
-	const reused = reuseCoverageResult({ buildManifestPath, files, hasChanges, previousManifest });
-	if (reused !== undefined) {
-		process.stderr.write(
-			`Reusing cached coverage place (built ${reused.manifest.generatedAt})\n`,
-		);
-		return reused;
-	}
-
-	// Build the `.rbxl` first, then hash it. The order matters: a failed
-	// `buildRojoProject` throws before the coverage manifest is written, so an
-	// interrupted run never leaves a manifest claiming an artifact that isn't on
-	// disk. The caller owns Build Manifest emission (it alone knows the full
-	// place set), keeping that write a single atomic operation.
-	const coveragePlace = buildRojoProject(
-		rojoProjectPath,
-		config.rootDir,
-		coverageRoots,
-		placeFile,
+	// Coverage pays for the instrumentation and nothing else. The other phase is
+	// the place build and the gate deciding whether to do it — the bake writes
+	// stubs into the shadow tree, and the reuse gate re-hashes the cached
+	// place. Both are staging: a non-coverage run pays the same work.
+	const { elapsedMs: stagingMs, value: baked } = await timing.profileTimedAsync(
+		"bakeCoveragePlace",
+		async () => bakeCoveragePlaceAsync({ bake, config, instrumented }),
 	);
 
-	applyPlaceHook(placeFile, COVERAGE_PLACE_HOOK_ENV);
-
-	const buildId = crypto.randomUUID();
-	const manifest = buildAndWriteManifest({
-		allFiles,
-		buildId,
-		luauRoots,
-		manifestPath,
-		nonInstrumentedFiles: allNonInstrumented,
-		placeFile,
-		rojoInputsHash,
-	});
-
-	return { buildId, coveragePlace, files, manifest, placeFile, rebuilt: true };
+	return { ...baked, instrumentMs, stagingMs };
 }
 
 function containsLuauFiles(directoryPath: string): boolean {
@@ -291,34 +371,50 @@ function containsLuauFiles(directoryPath: string): boolean {
 	});
 }
 
-function resolveLuauRootsWithRojo(config: ResolvedConfig, rojoProjectPath?: string): Array<string> {
+/** {@link findRojoProject}, answering `undefined` where there is no project. */
+function tryFindRojoProject(config: ResolvedConfig): string | undefined {
+	try {
+		return findRojoProject(config);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Auto-detect coverage roots from the Rojo project's `$path` mounts. Returns
+ * `undefined` when no project file was found or it mounted nothing
+ * instrumentable, so the caller falls through to the tsconfig `outDir`.
+ */
+function detectRootsFromRojo(
+	loaded: RojoProjectInFrame | undefined,
+	config: ResolvedConfig,
+): Array<string> | undefined {
+	if (loaded === undefined) {
+		return undefined;
+	}
+
+	const roots = collectLuauRootsFromRojo(loaded, config);
+	return roots.length > 0 ? roots : undefined;
+}
+
+/**
+ * Gets the luau roots from the first source that supplies them: the config
+ * `luauRoots`, the rojo mounts, then the tsconfig `outDir`. Each root keeps
+ * the spelling of its source. Use {@link resolveLuauRootsWithRojo} to get
+ * corrected roots.
+ */
+function selectRawLuauRoots({ config, failure, loaded }: RojoContext): Array<string> {
 	if (config.luauRoots !== undefined && config.luauRoots.length > 0) {
 		return config.luauRoots;
 	}
 
-	// Auto-detect from Rojo project
-	try {
-		const resolvedPath = rojoProjectPath ?? findRojoProject(config);
-		const validated = rojoProjectSchema(JSON.parse(fs.readFileSync(resolvedPath, "utf-8")));
-		if (validated instanceof type.errors) {
-			throw new Error(validated.summary);
-		}
+	if (failure !== undefined) {
+		throw failure;
+	}
 
-		const rojoProject = validated;
-		const resolved = {
-			...rojoProject,
-			tree: resolveNestedProjects(rojoProject.tree, path.dirname(resolvedPath)),
-		};
-		const roots = collectLuauRootsFromRojo(resolved, config);
-		if (roots.length > 0) {
-			return roots;
-		}
-	} catch (err) {
-		// Expected: no project file found → fall through to tsconfig.
-		// Unexpected: malformed JSON → surface to help debugging.
-		if (err instanceof SyntaxError) {
-			throw new Error(`Malformed Rojo project JSON: ${err.message}`, { cause: err });
-		}
+	const rojoRoots = detectRootsFromRojo(loaded, config);
+	if (rojoRoots !== undefined) {
+		return rojoRoots;
 	}
 
 	const tsconfig = getTsconfig(config.rootDir) ?? undefined;
@@ -332,141 +428,106 @@ function resolveLuauRootsWithRojo(config: ResolvedConfig, rojoProjectPath?: stri
 	);
 }
 
-function validateRelativeRoots(luauRoots: Array<string>): void {
-	for (const root of luauRoots) {
-		if (path.isAbsolute(root)) {
-			throw new Error(
-				"luauRoots must be relative paths, got absolute path. " +
-					"Set a relative outDir in tsconfig or relative luauRoots in config.",
-			);
-		}
-	}
-}
-
-function buildRojoProject(
-	rojoProjectPath: string,
-	packageDirectory: string,
-	coverageRoots: Array<CoverageRoot>,
-	placeFile: string,
-): BuildManifestArtifact {
-	return buildPlace({
-		// The coverage place is shared by every backend. studio-cli opens it
-		// directly and drives the plugin's Run-mode runner, which refuses to run
-		// unless LoadString is enabled; enabling it here is benign for the
-		// open-cloud path (OCALE does not gate on it). Forcing it on at build
-		// time keeps "studio-cli only selects the coverage place" true.
-		loadStringEnabled: true,
-		packages: [
-			{
-				name: "jest-roblox-coverage",
-				coverageRoots,
-				packageDirectory: path.resolve(packageDirectory),
-				rojoProjectPath: path.resolve(rojoProjectPath),
-			},
-		],
-		placeFile,
-		projectFile: path.join(COVERAGE_DIR, path.basename(rojoProjectPath)),
-		wrap: false,
-	});
-}
-
-function loadCoverageManifest(manifestPath: string): CoverageManifest | undefined {
-	const result = readManifest(manifestPath);
-	switch (result.kind) {
-		case "invalid": {
-			process.stderr.write(
-				`Warning: Previous coverage manifest is invalid (cache discarded): ${result.summary}\n`,
-			);
-			return undefined;
-		}
-		case "malformed-json": {
-			process.stderr.write(
-				"Warning: Previous coverage manifest is malformed JSON (cache discarded)\n",
-			);
-			return undefined;
-		}
-		case "missing":
-		case "version-mismatch": {
-			return undefined;
-		}
-		case "ok": {
-			return result.manifest;
-		}
-	}
-}
-
-function canUseIncremental(
-	previousManifest: CoverageManifest | undefined,
-	config: ResolvedConfig,
-): boolean {
-	if (!config.coverageCache) {
-		return false;
-	}
-
-	if (previousManifest === undefined) {
-		return false;
-	}
-
-	if (previousManifest.instrumenterVersion !== INSTRUMENTER_VERSION) {
-		return false;
-	}
-
-	return true;
+/**
+ * Gets the luau roots for this run and corrects the spelling of each one. A
+ * user writes the config `luauRoots` and the tsconfig `outDir` by hand, thus
+ * their spelling can differ from the spelling the pipeline needs. The
+ * correction is here, and not in each source, so that a new source also gets
+ * it.
+ *
+ * Correcting the spelling is what makes the dedupe possible, and the dedupe is
+ * what the correction is for: two spellings of one directory reduce to one
+ * string, and the second is dropped rather than instrumented and mirrored into
+ * a shadow the first already holds. Workspace mode does the same in
+ * `discoverFromLuauRoots`.
+ */
+function resolveLuauRootsWithRojo(context: RojoContext): Array<PosixRoot> {
+	return [...new Set(selectRawLuauRoots(context).map(toPosixRoot))];
 }
 
 /**
- * Hash the rojo build inputs the per-luauRoot shadow diff never sees (include/,
- * vendored @rbxts, assets, the project files). Runs regardless of how luauRoots
- * resolved. A malformed/circular project throws; degrade to `resolved: false` so
- * the caller skips the inputs check (a project too broken to hash would also
- * fail the rebuild's own parse) rather than hard-failing a working run.
+ * The project with its nested `.project.json` mounts inlined, or `undefined`
+ * when there is none to read. Both the root auto-detect and the mount set the
+ * demote is judged against come from this one read.
  */
-function resolveRojoInputsHash(
-	config: ResolvedConfig,
-	rojoProjectPath: string,
-	luauRoots: Array<string>,
-): { hash: string; resolved: boolean } {
+function loadResolvedRojoProject(resolvedPath: string): RojoProjectRead {
 	try {
-		const hash = computeRojoInputsHash({
-			luauRoots,
-			rojoProjectPath,
-			rootDirectory: config.rootDir,
-		});
-		return { hash, resolved: true };
+		const validated = rojoProjectSchema(JSON.parse(fs.readFileSync(resolvedPath, "utf-8")));
+		if (validated instanceof type.errors) {
+			throw new Error(validated.summary);
+		}
+
+		const rojoDirectory = path.dirname(resolvedPath);
+
+		return {
+			failure: undefined,
+			loaded: {
+				project: {
+					...validated,
+					tree: resolveNestedProjects(validated.tree, rojoDirectory),
+				},
+				rojoDirectory,
+			},
+		};
 	} catch (err) {
-		process.stderr.write(`Warning: could not hash rojo build inputs: ${String(err)}\n`);
-		return { hash: "", resolved: false };
+		// Expected: nothing readable there → the caller falls through to the
+		// tsconfig outDir. Unexpected: malformed JSON → held for the caller
+		// that depends on the tree, to help debugging.
+		return {
+			failure:
+				err instanceof SyntaxError
+					? new Error(`Malformed Rojo project JSON: ${err.message}`, { cause: err })
+					: undefined,
+			loaded: undefined,
+		};
 	}
 }
 
-function buildAndWriteManifest(options: WriteManifestOptions): CoverageManifest {
-	const {
-		allFiles,
-		buildId,
-		luauRoots,
-		manifestPath,
-		nonInstrumentedFiles,
-		placeFile,
-		rojoInputsHash,
-	} = options;
+/** {@link loadResolvedRojoProject}, with the parse failure held for later. */
+function readRojoContext(config: ResolvedConfig, rojoProjectPath: string | undefined): RojoContext {
+	if (rojoProjectPath === undefined) {
+		// No project file at all: the caller falls through to tsconfig's outDir,
+		// and there are no mounts to judge a demote against.
+		return { config, failure: undefined, loaded: undefined };
+	}
 
-	const generatedAtDate = new Date();
-	const manifest: CoverageManifest = {
-		buildId,
-		files: allFiles,
-		generatedAt: generatedAtDate.toISOString(),
-		instrumenterVersion: INSTRUMENTER_VERSION,
-		luauRoots,
-		nonInstrumentedFiles,
-		placeFilePath: placeFile,
-		rojoInputsHash,
-		shadowDir: COVERAGE_DIR,
-		version: MANIFEST_VERSION,
-	};
+	return { ...loadResolvedRojoProject(rojoProjectPath), config };
+}
 
-	writeManifest(manifestPath, manifest);
+/**
+ * A non-luauRoot rojo input changed — the shadow diff can't see those, so force
+ * a rebuild rather than reuse a stale place built from the old include/ or
+ * vendored sources. When the inputs couldn't be hashed the check is skipped
+ * (not forced): a project too broken to hash would also fail the rebuild's own
+ * parse, so preserve the prior reuse behavior instead of converting it into a
+ * hard failure.
+ */
+function hasRojoInputDrift(
+	{ hasResolvedInputs, previousManifest, rojoInputsHash }: CoverageInputs,
+	isIncremental: boolean,
+): boolean {
+	return (
+		isIncremental && hasResolvedInputs && previousManifest?.rojoInputsHash !== rojoInputsHash
+	);
+}
 
-	return manifest;
+// Rebuild unless every input is unchanged: a non-incremental run always
+// rebuilds, and so does any drift in the shadow tree, the caller's bake hook, or
+// a rojo input.
+function hasCoverageChanges(
+	inputs: CoverageInputs,
+	{
+		hasExtraChanges,
+		isIncremental,
+		shadow,
+	}: { hasExtraChanges: boolean; isIncremental: boolean; shadow: ShadowRootsResult },
+): boolean {
+	return (
+		!isIncremental ||
+		shadow.changed ||
+		hasExtraChanges ||
+		hasRojoInputDrift(inputs, isIncremental)
+	);
 }
 
 function priorPlaceIsReusable(placeFilePath: string, buildManifestPath: string): PriorPlaceReuse {
@@ -496,14 +557,17 @@ function priorPlaceIsReusable(placeFilePath: string, buildManifestPath: string):
 }
 
 /**
- * Incremental no-change short-circuit: reuse the prior place only if it is still
- * on disk and its bytes match the prior build manifest's record. A missing or
- * drifted artifact (e.g. an interrupted prior build) returns `undefined` so the
- * caller does a full rebuild rather than publishing a manifest that points at a
- * stale or absent `.rbxl`.
+ * Incremental no-change short-circuit: reuse the prior place only if it is
+ * still on disk and its bytes match the prior build manifest's record. A
+ * missing or drifted artifact (e.g. an interrupted prior build) returns
+ * `undefined` so the caller does a full rebuild rather than publishing a
+ * manifest that points at a stale or absent `.rbxl`.
  */
-function reuseCoverageResult(options: ReuseCoverageOptions): PrepareCoverageResult | undefined {
-	const { buildManifestPath, files, hasChanges, previousManifest } = options;
+async function reuseCoverageResultAsync(
+	{ buildManifestPath, previousManifest }: CoverageInputs,
+	files: Record<string, BuildManifestFileRecord>,
+	hasChanges: boolean,
+): Promise<BakedCoveragePlace | undefined> {
 	if (hasChanges || previousManifest?.placeFilePath === undefined) {
 		return undefined;
 	}
@@ -519,7 +583,7 @@ function reuseCoverageResult(options: ReuseCoverageOptions): PrepareCoverageResu
 		// Reuse the hash `readBuildManifest` already computed; only a
 		// pre-BuildManifest cache (no recorded place) falls back to hashing.
 		coveragePlace: reuse.coveragePlace ?? {
-			hash: hashFile(placeFilePath),
+			hash: await hashFileAsync(placeFilePath),
 			path: placeFilePath,
 		},
 		files,
@@ -529,7 +593,398 @@ function reuseCoverageResult(options: ReuseCoverageOptions): PrepareCoverageResu
 	};
 }
 
+async function buildRojoProjectAsync({
+	packageDirectory,
+	placeFile,
+	rojoProjectPath,
+	shadow,
+}: BuildCoveragePlaceOptions): Promise<BuildManifestArtifact> {
+	return buildPlaceAsync({
+		// The coverage place is shared by every backend. studio-cli opens it
+		// directly and drives the plugin's Run-mode runner, which refuses to run
+		// unless LoadString is enabled; enabling it here is benign for the
+		// open-cloud path (OCALE does not gate on it). Forcing it on at build
+		// time keeps "studio-cli only selects the coverage place" true.
+		loadStringEnabled: true,
+		packages: [
+			{
+				name: "jest-roblox-coverage",
+				coverageRoots: shadow.coverageRoots,
+				coverageSpine: shadow.coverageSpine,
+				packageDirectory: path.resolve(packageDirectory),
+				rojoProjectPath: path.resolve(rojoProjectPath),
+			},
+		],
+		placeFile,
+		projectFile: path.join(COVERAGE_DIR, path.basename(rojoProjectPath)),
+		wrap: false,
+	});
+}
+
+function buildAndWriteManifest({
+	allFiles,
+	buildId,
+	copyIgnoreHash,
+	coverageUniverseHash,
+	luauRoots,
+	manifestPath,
+	nonInstrumentedFiles,
+	placeFile,
+	rojoInputsHash,
+}: WriteManifestOptions): CoverageManifest {
+	const generatedAtDate = new Date();
+	const manifest: CoverageManifest = {
+		buildId,
+		copyIgnoreHash,
+		coverageUniverseHash,
+		files: allFiles,
+		generatedAt: generatedAtDate.toISOString(),
+		instrumenterVersion: INSTRUMENTER_VERSION,
+		luauRoots,
+		nonInstrumentedFiles,
+		placeFilePath: placeFile,
+		rojoInputsHash,
+		shadowDir: COVERAGE_DIR,
+		version: MANIFEST_VERSION,
+	};
+
+	writeManifest(manifestPath, manifest);
+
+	return manifest;
+}
+
+/**
+ * Build the `.rbxl` first, then write the manifest. The order matters: a failed
+ * `buildRojoProject` throws before the coverage manifest is written, so an
+ * interrupted run never leaves a manifest claiming an artifact that isn't on
+ * disk. The caller owns Build Manifest emission (it alone knows the full place
+ * set), keeping that write a single atomic operation.
+ */
+async function buildPlaceAndManifestAsync(
+	config: ResolvedConfig,
+	inputs: CoverageInputs,
+	shadow: ShadowRootsResult,
+	placeFile: string,
+): Promise<Pick<PrepareCoverageResult, "buildId" | "coveragePlace" | "manifest">> {
+	const coveragePlace = await buildRojoProjectAsync({
+		packageDirectory: config.rootDir,
+		placeFile,
+		rojoProjectPath: inputs.rojoProjectPath,
+		shadow,
+	});
+
+	applyPlaceHook(placeFile, COVERAGE_PLACE_HOOK_ENV);
+
+	const buildId = crypto.randomUUID();
+	const manifest = buildAndWriteManifest({
+		allFiles: shadow.files,
+		buildId,
+		copyIgnoreHash: inputs.copyIgnoreHash,
+		coverageUniverseHash: inputs.universe?.digest,
+		luauRoots: inputs.luauRoots,
+		manifestPath: inputs.manifestPath,
+		nonInstrumentedFiles: shadow.nonInstrumentedFiles,
+		placeFile,
+		rojoInputsHash: inputs.rojoInputsHash,
+	});
+
+	return { buildId, coveragePlace, manifest };
+}
+
+/**
+ * Bake the run's stubs into the instrumented tree, decide whether the cached
+ * place still answers for it, and build one when it does not. Everything a
+ * non-coverage run would pay for over uninstrumented sources, which is why the
+ * caller reports it as staging rather than as coverage.
+ */
+async function bakeCoveragePlaceAsync({
+	bake,
+	config,
+	instrumented: { inputs, isIncremental, shadow },
+}: {
+	bake: PrepareCoverageOptions["bake"];
+	config: ResolvedConfig;
+	instrumented: InstrumentedCoverage;
+}): Promise<BakedCoveragePlace> {
+	// The layout stays inside the optional call: a run with no bake never
+	// builds one, and it is the only thing that would read it.
+	const hasExtraChanges = bake?.run(createShadowLayout(COVERAGE_DIR, inputs.narrowed)) === true;
+	const hasChanges = hasCoverageChanges(inputs, { hasExtraChanges, isIncremental, shadow });
+	const placeFile = path.join(COVERAGE_DIR, "game.rbxl");
+	const files = toBuildManifestFiles(shadow.files);
+	const reused = await reuseCoverageResultAsync(inputs, files, hasChanges);
+	if (reused !== undefined) {
+		// Nothing was built, but the gate that decided so re-hashed the cached
+		// place, so this phase still carries what the decision cost.
+		process.stderr.write(
+			`Reusing cached coverage place (built ${reused.manifest.generatedAt})\n`,
+		);
+		return reused;
+	}
+
+	const built = await buildPlaceAndManifestAsync(config, inputs, shadow, placeFile);
+	return {
+		buildId: built.buildId,
+		coveragePlace: built.coveragePlace,
+		files,
+		manifest: built.manifest,
+		placeFile,
+		rebuilt: true,
+	};
+}
+
+/**
+ * `isAbsolutePath`, not `path.isAbsolute`: the latter answers for the host it
+ * runs on, so `D:/repo/out` is an absolute root a developer's machine rejects
+ * and a plain relative filename Linux CI accepts and instruments outside the
+ * package. The roots arrive canonical, so the drive letter reads the same way
+ * on both.
+ */
+function validateRelativeRoots(luauRoots: ReadonlyArray<PosixRoot>): void {
+	for (const root of luauRoots) {
+		if (isAbsolutePath(root)) {
+			throw new Error(
+				"luauRoots must be relative paths, got absolute path. " +
+					"Set a relative outDir in tsconfig or relative luauRoots in config.",
+			);
+		}
+	}
+}
+
+/**
+ * Hash the rojo build inputs the per-luauRoot shadow diff never sees
+ * (include/, vendored @rbxts, assets, the project files). Runs regardless of
+ * how luauRoots resolved. A malformed/circular project throws; degrade to
+ * `resolved: false` so the caller skips the inputs check (a project too broken
+ * to hash would also fail the rebuild's own parse) rather than hard-failing a
+ * working run.
+ */
+async function resolveRojoInputsHashAsync(
+	config: ResolvedConfig,
+	rojoProjectPath: string,
+	luauRoots: Array<string>,
+): Promise<RojoInputsHashResult> {
+	const hash = await tryComputeRojoInputsHashAsync({
+		digestCacheFile: path.join(config.rootDir, INPUT_DIGEST_PATH),
+		luauRoots,
+		rojoProjectPath,
+		rootDirectory: config.rootDir,
+	});
+	return hash === undefined ? { hash: "", resolved: false } : { hash, resolved: true };
+}
+
+function loadCoverageManifest(manifestPath: string): CoverageManifest | undefined {
+	const result = readManifest(manifestPath);
+	switch (result.kind) {
+		case "invalid": {
+			process.stderr.write(
+				`Warning: Previous coverage manifest is invalid (cache discarded): ${result.summary}\n`,
+			);
+			return undefined;
+		}
+		case "malformed-json": {
+			process.stderr.write(
+				"Warning: Previous coverage manifest is malformed JSON (cache discarded)\n",
+			);
+			return undefined;
+		}
+		case "missing":
+		case "version-mismatch": {
+			return undefined;
+		}
+		case "ok": {
+			return result.manifest;
+		}
+	}
+}
+
+/**
+ * The run's instrument-time universe.
+ *
+ * No `rootDir`: the candidate paths these globs are matched against are
+ * cwd-relative here. `luauRoots` are walked from the invocation directory and
+ * `COVERAGE_DIR` hangs off it, so the manifest keys — and through them the
+ * mapped TS paths — are cwd-relative too. Anchoring the globs anywhere else
+ * would match none of them. Only workspace mode, whose candidates are absolute
+ * under a package, has an anchor worth preferring.
+ */
+function resolveUniverse(
+	config: ResolvedConfig,
+	coverageInclude: Array<string> | undefined,
+): InstrumentUniverse | undefined {
+	return createInstrumentUniverse({
+		ignore: config.coveragePathIgnorePatterns,
+		include: coverageInclude ?? config.collectCoverageFrom,
+	});
+}
+
+/**
+ * The project's `$path` mounts, in the frame `luauRoots` are written in.
+ *
+ * Only a mount is a directory the demote can rewrite, and a `luauRoot` need
+ * not be one — `places/main` names `out` while the project mounts
+ * `out/client` and `out/server`.
+ *
+ * Relativized against `rootDir` because that is what synthesis resolves a
+ * coverage root against, so a mount and a root agree here exactly when they
+ * agree there.
+ */
+function resolveRojoMounts({ config, loaded }: RojoContext): ReadonlySet<string> {
+	if (loaded === undefined) {
+		return new Set();
+	}
+
+	const mounts = collectRojoMounts(loaded.project.tree, loaded.rojoDirectory);
+	return new Set(
+		Array.from(mounts, (mount) => normalizeWindowsPath(path.relative(config.rootDir, mount))),
+	);
+}
+
+/**
+ * Resolve the rojo project, the luau roots, the non-luauRoot inputs hash and
+ * the prior manifest — everything the rest of the run reads but never mutates.
+ */
+async function resolveCoverageInputsAsync(
+	config: ResolvedConfig,
+	coverageInclude: Array<string> | undefined,
+): Promise<CoverageInputs> {
+	const rojoProjectPath = findRojoProject(config);
+	// One read: the root auto-detect and the mount set the demote is judged
+	// against both come from the same tree, nested projects included.
+	const rojo = readRojoContext(config, rojoProjectPath);
+	const mounts = resolveLuauRootsWithRojo(rojo);
+
+	validateRelativeRoots(mounts);
+
+	const isCopyIgnored = createCopyIgnoreMatcher(config.coverageCopyIgnorePatterns);
+	const universe = resolveUniverse(config, coverageInclude);
+	// Narrowed before anything is instrumented: the universe resolves off
+	// directory entries and source maps alone, so what comes back is what the
+	// shadow has to mirror rather than every file the mount holds.
+	const narrowed = narrowLuauRoots(mounts, {
+		isCopyIgnored,
+		rojoMounts: resolveRojoMounts(rojo),
+		universe,
+	});
+	const luauRoots = narrowed.flatMap((entry) => entry.roots);
+	const inputs = await resolveRojoInputsHashAsync(config, rojoProjectPath, luauRoots);
+	const manifestPath = path.join(COVERAGE_DIR, COVERAGE_MANIFEST);
+
+	return {
+		buildManifestPath: path.join(COVERAGE_DIR, BUILD_MANIFEST_FILE),
+		copyIgnoreHash: hashCopyIgnorePatterns(config.coverageCopyIgnorePatterns),
+		hasResolvedInputs: inputs.resolved,
+		isCopyIgnored,
+		luauRoots,
+		manifestPath,
+		narrowed,
+		previousManifest: loadCoverageManifest(manifestPath),
+		rojoInputsHash: inputs.hash,
+		rojoProjectPath,
+		universe,
+	};
+}
+
 function hasDroppedLuauRoot(previous: Array<string>, current: Array<string>): boolean {
 	const currentSet = new Set(current.map(normalizeWindowsPath));
 	return previous.some((root) => !currentSet.has(normalizeWindowsPath(root)));
+}
+
+/**
+ * Decide whether the cached shadow dirs can be reused, wiping the coverage dir
+ * when they can't so a cold run starts from nothing.
+ */
+function decideIncremental(
+	config: ResolvedConfig,
+	{ copyIgnoreHash, luauRoots, previousManifest, universe }: CoverageInputs,
+): boolean {
+	let isIncremental = canReuseCoverageManifest(previousManifest, {
+		copyIgnoreHash,
+		coverageCache: config.coverageCache,
+		universe,
+	});
+
+	// A dropped luauRoot is invisible to the per-root reconcile — it only walks
+	// the current roots — so the dropped root's instrumented shadow subtree and
+	// its stale manifest entries would survive a reuse. Force a cold rebuild so
+	// the rmSync below wipes them. An *added* root needs no cold rebuild: the
+	// existing roots stay cached and the new one is instrumented normally.
+	if (
+		isIncremental &&
+		previousManifest !== undefined &&
+		hasDroppedLuauRoot(previousManifest.luauRoots, luauRoots)
+	) {
+		isIncremental = false;
+	}
+
+	if (!isIncremental && fs.existsSync(COVERAGE_DIR)) {
+		fs.rmSync(COVERAGE_DIR, { recursive: true });
+	}
+
+	return isIncremental;
+}
+
+/**
+ * One narrowed root, instrumented into the shadow directory that mirrors it.
+ */
+function instrumentOneRoot(
+	{ isCopyIgnored, previousManifest, universe }: CoverageInputs,
+	{ isBakeOwned, isIncremental, luauRoot }: ShadowPassSettings & { luauRoot: PosixRoot },
+): ShadowRootResult {
+	return prepareShadowRoot({
+		isBakeOwned,
+		isCopyIgnored,
+		luauRoot,
+		previousManifest,
+		shadowDir: normalizeWindowsPath(path.join(COVERAGE_DIR, luauRoot)),
+		universe,
+		useIncremental: isIncremental,
+	});
+}
+
+/**
+ * The spine pass for single mode. The narrowed paths here are already the
+ * source's own — this mode walks them from the invocation directory — so a
+ * spine level names its own directory.
+ */
+function prepareSingleSpine(
+	inputs: CoverageInputs,
+	{ isBakeOwned }: ShadowPassSettings,
+): PreparedSpine {
+	return prepareSpine({
+		isBakeOwned,
+		isCopyIgnored: inputs.isCopyIgnored,
+		narrowed: inputs.narrowed,
+		previousNonInstrumented: inputs.previousManifest?.nonInstrumentedFiles,
+		shadowRoot: COVERAGE_DIR,
+		toSourcePath: (relativePath) => relativePath,
+	});
+}
+
+/** Instrument every luauRoot into its shadow dir and merge the results. */
+function prepareShadowRoots(inputs: CoverageInputs, pass: ShadowPassSettings): ShadowRootsResult {
+	const files: Record<string, InstrumentedFileRecord> = {};
+	const coverageRoots: Array<CoverageRoot> = [];
+	const spine = prepareSingleSpine(inputs, pass);
+	const nonInstrumentedFiles: Record<string, NonInstrumentedFileRecord> = { ...spine.files };
+	let hasChanges = spine.changed;
+
+	for (const luauRoot of inputs.luauRoots) {
+		const result = instrumentOneRoot(inputs, { ...pass, luauRoot });
+		hasChanges ||= result.changed;
+		Object.assign(files, result.files);
+		Object.assign(nonInstrumentedFiles, result.nonInstrumentedFiles);
+		coverageRoots.push({
+			luauRoot: result.luauRoot,
+			shadowDir: normalizeWindowsPath(path.resolve(result.shadowDir)),
+		});
+	}
+
+	return {
+		changed: hasChanges,
+		coverageRoots,
+		coverageSpine: spine.directories,
+		files,
+		nonInstrumentedFiles,
+	};
 }

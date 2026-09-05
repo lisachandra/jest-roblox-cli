@@ -4,11 +4,10 @@ export default isentinel({
 	name: "packages/shared/rojo-utils",
 	jsdoc: false,
 	namedConfigs: true,
+	naming: true,
 	roblox: false,
 	rules: {
-		"max-classes-per-file": "off",
-		"max-lines": "off",
-		"max-lines-per-function": "off",
+		"package-json/restrict-private-properties": "off",
 	},
 	test: {
 		vitest: {

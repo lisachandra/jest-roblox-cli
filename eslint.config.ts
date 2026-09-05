@@ -11,16 +11,17 @@ export default isentinel(
 			".standalone/**/*",
 			"plans/**/*",
 			"reference/**/*",
+			"reports/mutation/**/*",
+			"reports/stryker-incremental.json",
 			"spike/**/*",
 		],
 		jsdoc: false,
 		namedConfigs: true,
+		naming: true,
 		pnpm: false,
 		roblox: false,
 		rules: {
 			"max-lines": "off",
-			"max-lines-per-function": "off",
-			"test/require-hook": "off",
 		},
 		test: {
 			vitest: {
@@ -42,8 +43,8 @@ export default isentinel(
 		},
 	},
 	{
-		name: "project/luau-declaration",
-		files: ["src/luau.d.ts"],
+		name: "project/ambient-declarations",
+		files: ["src/luau.d.ts", "src/coverage-pipeline/istanbul-modules.d.ts"],
 		rules: {
 			"sonar/file-name-differ-from-class": "off",
 		},

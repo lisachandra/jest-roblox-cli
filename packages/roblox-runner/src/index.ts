@@ -1,13 +1,24 @@
 export { resolveCredentials } from "./credentials.ts";
 export type { ResolveCredentialsInput } from "./credentials.ts";
+export { flushMemoryStoreAsync } from "./memory-store-flush.ts";
+export type { FlushMemoryStoreOptions } from "./memory-store-flush.ts";
+export { createMemoryStoreJanitor } from "./memory-store-janitor.ts";
+export type { MemoryStoreJanitor, MemoryStoreJanitorOptions } from "./memory-store-janitor.ts";
+export { publishMessageAsync } from "./messaging-publish.ts";
+export type { PublishMessageOptions } from "./messaging-publish.ts";
 export { OcaleRunner } from "./ocale-runner.ts";
 export type { OcaleRunnerOptions } from "./ocale-runner.ts";
+export {
+	PLACE_CONTENT_ID_NAME,
+	PLACE_CONTENT_ID_SERVICE,
+	placeIdentityGuardSource,
+	readRefusedPlaceVersion,
+} from "./place-identity-guard.ts";
+export type { ExpectedPlaceIdentity } from "./place-identity-guard.ts";
 export { ProgressMap } from "./progress-map.ts";
 export type { ProgressMapOptions } from "./progress-map.ts";
-export { StudioRunner } from "./studio-runner.ts";
-export type { StudioRunnerOptions } from "./studio-runner.ts";
-export { runTaskPool } from "./task-pool.ts";
-export type { TaskPoolOptions, TaskPoolPlace } from "./task-pool.ts";
+export { runTaskPoolAsync as runTaskPool } from "./task-pool.ts";
+export type { TaskPoolBackoff, TaskPoolOptions, TaskPoolPlace } from "./task-pool.ts";
 export type {
 	ExecuteScriptOptions,
 	RemoteRunner,
@@ -16,5 +27,11 @@ export type {
 	UploadPlaceOptions,
 	UploadPlaceResult,
 } from "./types.ts";
-export type { ClaimedBatch, WorkQueueOptions } from "./work-queue.ts";
-export { WorkQueue } from "./work-queue.ts";
+export { createWorkQueueReader } from "./work-queue-reader.ts";
+export type { ClaimedBatch, WorkQueueReader, WorkQueueReaderOptions } from "./work-queue-reader.ts";
+export { createJsonWorkQueueWriter, createWorkQueueWriter } from "./work-queue-writer.ts";
+export type {
+	JsonWorkQueueWriterOptions,
+	WorkQueueWriter,
+	WorkQueueWriterOptions,
+} from "./work-queue-writer.ts";

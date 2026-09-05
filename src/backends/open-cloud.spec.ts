@@ -1,3 +1,5 @@
+import { PollTimeoutError } from "@bedrock-rbx/ocale";
+import { placeIdentityGuardSource } from "@isentinel/roblox-runner";
 import type {
 	ExecuteScriptOptions,
 	RemoteRunner,
@@ -5,9 +7,13 @@ import type {
 	UploadPlaceOptions,
 	UploadPlaceResult,
 } from "@isentinel/roblox-runner";
+import { formatPlaceMismatch, PLACE_MISMATCH } from "@isentinel/roblox-runner/testing";
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import process from "node:process";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { DEFAULT_CONFIG } from "../config/schema.ts";
 import type { ResolvedConfig } from "../config/schema.ts";
@@ -15,12 +21,17 @@ import type {
 	StreamingResultReader,
 	StreamingResultRecord,
 } from "../memory-store/sorted-map-client.ts";
+import type { TestProgressEntry } from "../memory-store/test-progress.ts";
+import type { JestResult } from "../types/jest-result.ts";
+import { errorMessage } from "../utils/error-message.ts";
 import type { BackendOptions, ProjectJob } from "./interface.ts";
 import {
+	BOOT_PROBE_SCRIPT,
 	createOpenCloudBackend,
 	OpenCloudBackend,
-	PLACE_VERSION_RACE_SENTINEL,
+	OWNED_BOOT_PROBE_SCRIPT,
 	resolveOcaleMaxRetries,
+	resolveOpenCloudBaseUrl,
 } from "./open-cloud.ts";
 
 interface StubStreamReader extends StreamingResultReader {
@@ -35,20 +46,25 @@ interface RunnerStubOptions {
 
 type ExecuteHandler = (options: ExecuteScriptOptions) => Promise<ScriptResult> | ScriptResult;
 
+type ExecuteStep = () => Promise<ScriptResult> | ScriptResult;
+
 interface RunnerStub {
 	executeCalls: Array<ExecuteScriptOptions>;
+	/** Boot-probe submits, kept apart so a test counts only its own tasks. */
+	probeCalls: Array<ExecuteScriptOptions>;
 	runner: RemoteRunner;
 	setExecute: (handler: ExecuteHandler) => void;
+	setProbe: (handler: ExecuteHandler) => void;
 	uploadCalls: Array<UploadPlaceOptions>;
 }
 
 function createStreamReader(pages: Array<Array<StreamingResultRecord>>): StubStreamReader {
 	const reader: StubStreamReader = {
-		delete: async (itemId: string): Promise<void> => {
+		deleteAsync: async (itemId): Promise<void> => {
 			reader.deleted.push(itemId);
 		},
 		deleted: [],
-		readAll: async (): Promise<Array<StreamingResultRecord>> => {
+		readAllAsync: async (): Promise<Array<StreamingResultRecord>> => {
 			const index = Math.min(reader.readCalls, pages.length - 1);
 			reader.readCalls += 1;
 			return pages[index] ?? [];
@@ -67,19 +83,41 @@ interface StderrCapture {
 
 function createRunnerStub(options: RunnerStubOptions = {}): RunnerStub {
 	const executeCalls: Array<ExecuteScriptOptions> = [];
+	const probeCalls: Array<ExecuteScriptOptions> = [];
 	const uploadCalls: Array<UploadPlaceOptions> = [];
-	async function defaultHandler(): Promise<ScriptResult> {
+	async function defaultHandlerAsync(): Promise<ScriptResult> {
 		return { durationMs: 0, outputs: ["{}"] };
 	}
 
-	let executeHandler: ExecuteHandler = defaultHandler;
+	// An owned probe reads head back, so the default has to answer as a place
+	// holding the version this stub just "uploaded" — otherwise every owned
+	// test would look like a broken lease.
+	async function defaultProbeAsync(probeOptions: ExecuteScriptOptions): Promise<ScriptResult> {
+		const uploaded = (options.uploadResult ?? DEFAULT_UPLOAD).versionNumber;
+		const output = probeOptions.script === OWNED_BOOT_PROBE_SCRIPT ? String(uploaded) : "1";
+		return { durationMs: 0, outputs: [output] };
+	}
 
-	async function executeScript(executeOptions: ExecuteScriptOptions): Promise<ScriptResult> {
+	let executeHandler: ExecuteHandler = defaultHandlerAsync;
+	let probeHandler: ExecuteHandler = defaultProbeAsync;
+
+	// The probe is infrastructure, not one of the run's tasks: routing it to
+	// its own list and its own handler keeps every other test written as
+	// though it did not exist.
+	async function executeScriptAsync(executeOptions: ExecuteScriptOptions): Promise<ScriptResult> {
+		if (
+			executeOptions.script === BOOT_PROBE_SCRIPT ||
+			executeOptions.script === OWNED_BOOT_PROBE_SCRIPT
+		) {
+			probeCalls.push(executeOptions);
+			return probeHandler(executeOptions);
+		}
+
 		executeCalls.push(executeOptions);
 		return executeHandler(executeOptions);
 	}
 
-	async function uploadPlace(uploadOptions: UploadPlaceOptions) {
+	async function uploadPlaceAsync(uploadOptions: UploadPlaceOptions) {
 		uploadCalls.push(uploadOptions);
 		if (options.uploadError !== undefined) {
 			throw options.uploadError;
@@ -92,15 +130,21 @@ function createRunnerStub(options: RunnerStubOptions = {}): RunnerStub {
 		executeHandler = handler;
 	}
 
+	function setProbe(handler: ExecuteHandler): void {
+		probeHandler = handler;
+	}
+
 	return {
 		executeCalls,
-		runner: { executeScript, uploadPlace },
+		probeCalls,
+		runner: { executeScriptAsync, uploadPlaceAsync },
 		setExecute,
+		setProbe,
 		uploadCalls,
 	};
 }
 
-function successJest(overrides: Record<string, unknown> = {}): string {
+function successJest(overrides: Partial<JestResult> = {}): string {
 	return JSON.stringify({
 		numFailedTests: 0,
 		numPassedTests: 1,
@@ -121,11 +165,12 @@ function envelope(
 		pkg?: string;
 		project?: string;
 	}>,
+	options: { bailed?: boolean; deferred?: boolean } = {},
 ): string {
-	return JSON.stringify({ entries });
+	return JSON.stringify({ ...options, entries });
 }
 
-function packageEntry(packageName: string): { jestOutput: string; pkg: string } {
+function packageEntry(packageName: string) {
 	return { jestOutput: successJest(), pkg: packageName };
 }
 
@@ -133,9 +178,110 @@ function scriptResult(jestOutput: string, gameOutput = "[]"): ScriptResult {
 	return { durationMs: 5, outputs: [jestOutput, gameOutput] };
 }
 
-/** The exact guard line `executeGuarded` prepends to unpinned first attempts. */
+/** A workspace script factory that spells out the jobs it was handed. */
+function scriptNaming(jobs: ReadonlyArray<ProjectJob>): string {
+	return `entries:${jobs.map((entry) => entry.displayName).join(",")}`;
+}
+
+/**
+ * The packages a {@link scriptNaming} script carries, read back off the
+ * submitted task — the guard prefix an unpinned attempt gains sits
+ * ahead of the marker, so the split survives it.
+ */
+function requestedNames(options: ExecuteScriptOptions): Array<string> {
+	return options.script.split("entries:", 2)[1]!.split(",");
+}
+
+/** An envelope answering exactly the packages a script asked for. */
+function scriptedEntries(options: ExecuteScriptOptions): ScriptResult {
+	return scriptResult(envelope(requestedNames(options).map(packageEntry)));
+}
+
+/**
+ * An execute handler that answers every script with the packages it asked
+ * for, except one carrying more than one entry and leading with
+ * `deferringHead` — that comes back deferred, having run only the head.
+ */
+function deferOnceExecute(deferringHead: string): ExecuteHandler {
+	return (options): ScriptResult => {
+		const requested = requestedNames(options);
+		return requested.length > 1 && requested[0] === deferringHead
+			? scriptResult(envelope([packageEntry(deferringHead)], { deferred: true }))
+			: scriptedEntries(options);
+	};
+}
+
+/**
+ * An execute handler where the bucket whose script leads with `bailingHead`
+ * stops on it: one entry back, flagged bailed and not deferred, so that
+ * bucket's chain ends there and the rest of its share never runs. Every
+ * other bucket answers in full.
+ */
+function bailingBucketExecute(bailingHead: string): ExecuteHandler {
+	return (options): ScriptResult => {
+		return requestedNames(options)[0] === bailingHead
+			? scriptResult(envelope([packageEntry(bailingHead)], { bailed: true }))
+			: scriptedEntries(options);
+	};
+}
+
+/**
+ * An execute handler that runs `steps[callIndex]`, repeating the final step
+ * once the list is exhausted. Keeps per-call-index dispatch out of `it` bodies.
+ */
+function stepExecute(steps: Array<ExecuteStep>): ExecuteHandler {
+	let callIndex = 0;
+	return (): Promise<ScriptResult> | ScriptResult => {
+		const step = steps[Math.min(callIndex, steps.length - 1)]!;
+		callIndex += 1;
+		return step();
+	};
+}
+
+/** What the injected guard returns from a task that booted another version. */
+function racedOnce(bootedVersion = 99): ScriptResult {
+	return {
+		durationMs: 3,
+		outputs: [formatPlaceMismatch(bootedVersion)],
+	};
+}
+
+function oneSuccessEntry(): ScriptResult {
+	return scriptResult(envelope([{ jestOutput: successJest() }]));
+}
+
+/**
+ * An execute handler that races each unpinned call in turn, booting the named
+ * versions in order — one per raced task, so a run can mix causes. Later
+ * unpinned calls, and every pinned retry, succeed.
+ */
+function raceBootedVersions(bootedVersions: Array<number>): ExecuteHandler {
+	let callIndex = 0;
+	return (options): ScriptResult => {
+		if (options.placeVersion !== undefined) {
+			return oneSuccessEntry();
+		}
+
+		const booted = bootedVersions[callIndex];
+		callIndex += 1;
+		return booted === undefined ? oneSuccessEntry() : racedOnce(booted);
+	};
+}
+
+/**
+ * An execute handler that races the first `raceCount` unpinned calls — all
+ * booting the same version — and succeeds on every other call, including a
+ * pinned retry (`placeVersion` set), which never races.
+ */
+function raceUnpinnedExecute(raceCount: number, bootedVersion = 99): ExecuteHandler {
+	return raceBootedVersions(Array.from<number>({ length: raceCount }).fill(bootedVersion));
+}
+
+/**
+ * The exact guard line `executeGuarded` prepends to unpinned first attempts.
+ */
 function guardPrefix(placeVersion: number): string {
-	return `if game.PlaceVersion ~= ${String(placeVersion)} then return "${PLACE_VERSION_RACE_SENTINEL}" end\n`;
+	return `${placeIdentityGuardSource({ placeVersion })}\n`;
 }
 
 function captureStderr(): StderrCapture {
@@ -158,7 +304,7 @@ function captureStderr(): StderrCapture {
 function job(
 	displayName: string,
 	overrides: Partial<ResolvedConfig> = {},
-	package_?: string,
+	packageName?: string,
 ): ProjectJob {
 	return {
 		config: {
@@ -168,7 +314,7 @@ function job(
 		},
 		displayColor: `${displayName}-color`,
 		displayName,
-		pkg: package_,
+		pkg: packageName,
 		testFiles: [`${displayName}/test.spec.ts`],
 	};
 }
@@ -178,6 +324,49 @@ function jobsOptions(
 	parallel?: BackendOptions["parallel"],
 ): BackendOptions {
 	return parallel === undefined ? { jobs } : { jobs, parallel };
+}
+
+/**
+ * A temp rootDir holding a real place file — the upload cache reads bytes off
+ * disk, and this spec deliberately does not mock `node:fs`.
+ */
+function temporaryRoot(): string {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jest-roblox-upload-cache-"));
+	fs.writeFileSync(path.join(directory, "place.rbxl"), "place-bytes");
+	onTestFinished(() => {
+		fs.rmSync(directory, { force: true, recursive: true });
+	});
+
+	return directory;
+}
+
+function cacheJob(rootDirectory: string, overrides: Partial<ResolvedConfig> = {}): ProjectJob {
+	return job("alpha", { placeFile: "place.rbxl", rootDir: rootDirectory, ...overrides });
+}
+
+/** The version an upload lands on wherever a spec drives {@link probeStub}. */
+const PROBED_VERSION = 42;
+
+/**
+ * A runner whose upload lands on {@link PROBED_VERSION} and whose tasks pass.
+ */
+function probeStub(): RunnerStub {
+	const stub = createRunnerStub({
+		uploadResult: { uploadMs: 12, versionNumber: PROBED_VERSION },
+	});
+	stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
+	return stub;
+}
+
+/** One passing run against `rootDirectory`, returning the stub it drove. */
+async function runProbedRunAsync(
+	rootDirectory: string,
+	overrides: Partial<ResolvedConfig> = {},
+): Promise<RunnerStub> {
+	const stub = probeStub();
+	const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+	await backend.runTestsAsync(jobsOptions([cacheJob(rootDirectory, overrides)]));
+	return stub;
 }
 
 const credentials = {
@@ -194,7 +383,7 @@ describe(OpenCloudBackend, () => {
 			const { runner } = createRunnerStub();
 			const backend = new OpenCloudBackend(credentials, { runner });
 
-			await expect(backend.runTests({ jobs: [] })).rejects.toThrow(
+			await expect(backend.runTestsAsync({ jobs: [] })).rejects.toThrow(
 				"OpenCloudBackend requires at least one job",
 			);
 		});
@@ -205,7 +394,7 @@ describe(OpenCloudBackend, () => {
 			const { runner } = createRunnerStub();
 			const backend = new OpenCloudBackend(credentials, { runner });
 
-			await expect(backend.runTests(jobsOptions([job("alpha")], 0))).rejects.toThrow(
+			await expect(backend.runTestsAsync(jobsOptions([job("alpha")], 0))).rejects.toThrow(
 				/--parallel must be >= 1/,
 			);
 		});
@@ -217,7 +406,7 @@ describe(OpenCloudBackend, () => {
 			const backend = new OpenCloudBackend(credentials, { runner });
 
 			await expect(
-				backend.runTests({ jobs: [job("alpha")], workStealing: true }),
+				backend.runTestsAsync({ jobs: [job("alpha")], workStealing: true }),
 			).rejects.toThrow(/work-stealing mode requires scriptOverride/);
 		});
 	});
@@ -238,7 +427,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests(
+			const { rawResults } = await backend.runTestsAsync(
 				jobsOptions([
 					job("alpha", { testNamePattern: "alpha-pattern" }),
 					job("beta", { testNamePattern: "beta-pattern" }),
@@ -270,7 +459,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests(
+			await backend.runTestsAsync(
 				jobsOptions([
 					job("alpha", {
 						snapshotFormat: { escapeString: true, printBasicPrototype: false },
@@ -302,7 +491,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests(
+			const { rawResults } = await backend.runTestsAsync(
 				jobsOptions([job("alpha"), job("beta"), job("gamma")], 1),
 			);
 
@@ -313,13 +502,22 @@ describe(OpenCloudBackend, () => {
 		it("should populate timing.executionMs on the BackendResult", async () => {
 			expect.assertions(1);
 
+			const now = vi
+				.spyOn(Date, "now")
+				.mockReturnValueOnce(100)
+				.mockReturnValueOnce(112)
+				.mockReturnValueOnce(200)
+				.mockReturnValueOnce(245);
+			onTestFinished(() => {
+				now.mockRestore();
+			});
 			const stub = createRunnerStub();
 			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { timing } = await backend.runTests(jobsOptions([job("alpha")]));
+			const { timing } = await backend.runTestsAsync(jobsOptions([job("alpha")]));
 
-			expect(timing.executionMs).toBeGreaterThanOrEqual(0);
+			expect(timing).toStrictEqual({ executionMs: 45, uploadMs: 12 });
 		});
 
 		it("should fan --parallel 3 out to three executeScript calls, one bucket each", async () => {
@@ -341,7 +539,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests(
+			const { rawResults } = await backend.runTestsAsync(
 				jobsOptions([job("alpha"), job("beta"), job("gamma")], 3),
 			);
 
@@ -383,7 +581,7 @@ describe(OpenCloudBackend, () => {
 				});
 			});
 
-			const { rawResults } = await backend.runTests(jobsOptions(jobs, 3));
+			const { rawResults } = await backend.runTestsAsync(jobsOptions(jobs, 3));
 
 			expect(stub.executeCalls).toHaveLength(3);
 			expect(bucketPatterns[0]).toStrictEqual([
@@ -417,7 +615,7 @@ describe(OpenCloudBackend, () => {
 				return job(`p${index.toString()}`, { testNamePattern: `auto-${index.toString()}` });
 			});
 
-			await backend.runTests(jobsOptions(jobs, "auto"));
+			await backend.runTestsAsync(jobsOptions(jobs, "auto"));
 
 			expect(stub.executeCalls).toHaveLength(3);
 		});
@@ -429,7 +627,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests(jobsOptions([job("alpha"), job("beta")], "auto"));
+			await backend.runTestsAsync(jobsOptions([job("alpha"), job("beta")], "auto"));
 
 			expect(stub.executeCalls).toHaveLength(2);
 		});
@@ -441,7 +639,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests(jobsOptions([job("alpha"), job("beta")], 10));
+			await backend.runTestsAsync(jobsOptions([job("alpha"), job("beta")], 10));
 
 			expect(stub.executeCalls).toHaveLength(2);
 		});
@@ -458,7 +656,7 @@ describe(OpenCloudBackend, () => {
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
 
-			await expect(backend.runTests(jobsOptions([job("alpha")]))).rejects.toThrow(
+			await expect(backend.runTestsAsync(jobsOptions([job("alpha")]))).rejects.toThrow(
 				/Open Cloud backend returned 2 entries but bucket had 1 jobs/,
 			);
 		});
@@ -466,22 +664,21 @@ describe(OpenCloudBackend, () => {
 		it("should reject the whole call when any parallel bucket fails first", async () => {
 			expect.assertions(1);
 
-			let bucketIndex = 0;
 			const stub = createRunnerStub();
-			stub.setExecute(() => {
-				const index = bucketIndex;
-				bucketIndex += 1;
-				if (index === 2) {
-					throw new Error("bucket two blew up");
-				}
-
-				return scriptResult(envelope([{ jestOutput: successJest() }]));
-			});
+			stub.setExecute(
+				stepExecute([
+					oneSuccessEntry,
+					oneSuccessEntry,
+					() => {
+						throw new Error("bucket two blew up");
+					},
+				]),
+			);
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
 
 			await expect(
-				backend.runTests(jobsOptions([job("alpha"), job("beta"), job("gamma")], 3)),
+				backend.runTestsAsync(jobsOptions([job("alpha"), job("beta"), job("gamma")], 3)),
 			).rejects.toThrowWithMessage(Error, "bucket two blew up");
 		});
 
@@ -495,7 +692,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({ jobs: [job("alpha")], scriptOverride: customScript });
+			await backend.runTestsAsync({ jobs: [job("alpha")], scriptOverride: customScript });
 
 			expect(stub.executeCalls[0]!.script).toBe(`${guardPrefix(1)}${customScript}`);
 			expect(stub.executeCalls[0]!.script).not.toContain("Jest.runCLI");
@@ -510,12 +707,12 @@ describe(OpenCloudBackend, () => {
 				{ message: "fallback", messageType: 0, timestamp: 0 },
 			]);
 			const stub = createRunnerStub();
-			stub.setExecute(() =>
-				scriptResult(envelope([{ jestOutput: successJest() }]), fallback),
-			);
+			stub.setExecute(() => {
+				return scriptResult(envelope([{ jestOutput: successJest() }]), fallback);
+			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests(jobsOptions([job("alpha")]));
+			const { rawResults } = await backend.runTestsAsync(jobsOptions([job("alpha")]));
 
 			expect(rawResults[0]!.fallbackGameOutput).toBe(fallback);
 		});
@@ -528,7 +725,7 @@ describe(OpenCloudBackend, () => {
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
 
-			await expect(backend.runTests(jobsOptions([job("alpha")]))).rejects.toThrow(
+			await expect(backend.runTestsAsync(jobsOptions([job("alpha")]))).rejects.toThrow(
 				/No test results in output/,
 			);
 		});
@@ -548,7 +745,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests(
+			const { rawResults } = await backend.runTestsAsync(
 				jobsOptions([job("@halcyon/foo"), job("@halcyon/bar"), job("@halcyon/baz")]),
 			);
 
@@ -558,14 +755,14 @@ describe(OpenCloudBackend, () => {
 	});
 
 	describe("upload integration", () => {
-		it("should call runner.uploadPlace exactly once regardless of bucket count", async () => {
+		it("should call runner.uploadPlaceAsync exactly once regardless of bucket count", async () => {
 			expect.assertions(1);
 
 			const stub = createRunnerStub();
 			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests(
+			await backend.runTestsAsync(
 				jobsOptions([job("alpha"), job("beta"), job("gamma"), job("delta")], 4),
 			);
 
@@ -581,7 +778,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests(jobsOptions([job("alpha"), job("beta"), job("gamma")], 3));
+			await backend.runTestsAsync(jobsOptions([job("alpha"), job("beta"), job("gamma")], 3));
 
 			// 3 jobs at parallel 3 ⇒ one bucket each ⇒ exactly 3 calls. An exact
 			// count catches a regression that re-executes between buckets.
@@ -601,7 +798,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				scriptOverride: "stealing-script",
 				workStealing: true,
@@ -613,6 +810,31 @@ describe(OpenCloudBackend, () => {
 			expect(stub.executeCalls[0]!.script).toBe(`${guardPrefix(7)}stealing-script`);
 		});
 
+		/**
+		 * One writer means head already holds this run's version, so the guard
+		 * could only ever pass. Leaving it in would cost nothing at runtime but
+		 * would keep a race branch alive that cannot be reached, and the script
+		 * the runtime sees would no longer be the script the caller wrote.
+		 */
+		it("should run unguarded and unpinned when the place is owned", async () => {
+			expect.assertions(2);
+
+			const stub = createRunnerStub({
+				uploadResult: { uploadMs: 12, versionNumber: 7 },
+			});
+			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			await backend.runTestsAsync({
+				jobs: [job("alpha", { ownedPlace: true })],
+				scriptOverride: "stealing-script",
+				workStealing: true,
+			});
+
+			expect(stub.executeCalls[0]!.placeVersion).toBeUndefined();
+			expect(stub.executeCalls[0]!.script).toBe("stealing-script");
+		});
+
 		it("should inject the guard after leading Luau directives", async () => {
 			expect.assertions(1);
 
@@ -620,7 +842,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				scriptOverride: "--!strict\n--!optimize 2\nreturn nil",
 			});
@@ -632,25 +854,59 @@ describe(OpenCloudBackend, () => {
 			);
 		});
 
+		it("should inject the guard behind a directive that follows a comment", async () => {
+			expect.assertions(1);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			await backend.runTestsAsync({
+				jobs: [job("alpha")],
+				scriptOverride: "-- boot notes\n--!native\nreturn nil",
+			});
+
+			// The comment is no token, so the `--!native` behind it is still a
+			// directive — and the guard ahead of it would end that.
+			expect(stub.executeCalls[0]!.script).toBe(
+				`-- boot notes\n--!native\n${guardPrefix(1)}return nil`,
+			);
+		});
+
+		it("should inject the guard after a directive Luau does not act on", async () => {
+			expect.assertions(1);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			await backend.runTestsAsync({
+				jobs: [job("alpha")],
+				scriptOverride: "--!Native\n--!strict\nreturn nil",
+			});
+
+			// `--!Native` is a hot comment Luau ignores, not the end of the
+			// block, so the guard goes behind the `--!strict` it shields.
+			expect(stub.executeCalls[0]!.script).toBe(
+				`--!Native\n--!strict\n${guardPrefix(1)}return nil`,
+			);
+		});
+
 		it("should retry a raced bucket once, pinned to the uploaded version", async () => {
 			expect.assertions(5);
 
-			let callIndex = 0;
 			const stub = createRunnerStub({
 				uploadResult: { uploadMs: 12, versionNumber: 42 },
 			});
-			stub.setExecute(() => {
-				const index = callIndex;
-				callIndex += 1;
-				if (index === 0) {
-					return { durationMs: 3, outputs: [PLACE_VERSION_RACE_SENTINEL] };
-				}
-
-				return scriptResult(envelope([{ elapsedMs: 55, jestOutput: successJest() }]));
-			});
+			stub.setExecute(
+				stepExecute([
+					racedOnce,
+					() => scriptResult(envelope([{ elapsedMs: 55, jestOutput: successJest() }])),
+				]),
+			);
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests(jobsOptions([job("alpha")]));
+			const { rawResults } = await backend.runTestsAsync(jobsOptions([job("alpha")]));
 
 			expect(stub.executeCalls).toHaveLength(2);
 
@@ -667,22 +923,18 @@ describe(OpenCloudBackend, () => {
 		it("should retry only the raced work-stealing task", async () => {
 			expect.assertions(3);
 
-			let callIndex = 0;
 			const stub = createRunnerStub({
 				uploadResult: { uploadMs: 12, versionNumber: 9 },
 			});
-			stub.setExecute(() => {
-				const index = callIndex;
-				callIndex += 1;
-				if (index === 0) {
-					return { durationMs: 3, outputs: [PLACE_VERSION_RACE_SENTINEL] };
-				}
-
-				return scriptResult(envelope([packageEntry("alpha"), packageEntry("beta")]));
-			});
+			stub.setExecute(
+				stepExecute([
+					racedOnce,
+					() => scriptResult(envelope([packageEntry("alpha"), packageEntry("beta")])),
+				]),
+			);
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha"), job("beta")],
 				parallel: 2,
 				scriptOverride: "stealing-script",
@@ -704,7 +956,7 @@ describe(OpenCloudBackend, () => {
 			});
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
 
-			await expect(backend.runTests(jobsOptions([job("alpha")]))).rejects.toThrow(
+			await expect(backend.runTestsAsync(jobsOptions([job("alpha")]))).rejects.toThrow(
 				/Failed to upload place/,
 			);
 		});
@@ -714,28 +966,38 @@ describe(OpenCloudBackend, () => {
 
 			const { restore, writes } = captureStderr();
 
-			let callIndex = 0;
 			const stub = createRunnerStub();
-			stub.setExecute((options) => {
-				const index = callIndex;
-				callIndex += 1;
-				// Both buckets' unpinned first attempts race; the pinned
-				// retries (recognizable by placeVersion) succeed.
-				if (options.placeVersion === undefined && index < 2) {
-					return { durationMs: 3, outputs: [PLACE_VERSION_RACE_SENTINEL] };
-				}
-
-				return scriptResult(envelope([{ jestOutput: successJest() }]));
-			});
+			// Both buckets' unpinned first attempts race; the pinned retries
+			// (recognizable by placeVersion) succeed.
+			stub.setExecute(raceUnpinnedExecute(2));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests(jobsOptions([job("alpha"), job("beta")], 2));
+			await backend.runTestsAsync(jobsOptions([job("alpha"), job("beta")], 2));
 			restore();
 
-			const warnings = writes.filter((line) => line.includes("place version raced"));
+			const warnings = writes.filter((line) => line.includes("Tasks retried pinned"));
 
 			expect(warnings).toHaveLength(1);
-			expect(warnings[0]).toContain("retried pinned");
+			expect(warnings[0]).toContain("raced by a concurrent upload");
+		});
+
+		it("should reset the one-shot race warning for each run", async () => {
+			expect.assertions(1);
+
+			const { restore, writes } = captureStderr();
+			const stub = createRunnerStub({ uploadResult: { uploadMs: 3, versionNumber: 42 } });
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			stub.setExecute(raceUnpinnedExecute(1));
+			await backend.runTestsAsync(jobsOptions([job("alpha")]));
+			stub.setExecute(raceUnpinnedExecute(1));
+			await backend.runTestsAsync(jobsOptions([job("alpha")]));
+			restore();
+
+			expect(writes).toStrictEqual([
+				"Warning: place version 42 raced by a concurrent upload — a task booted 99. Tasks retried pinned (slower, cold place boot).\n",
+				"Warning: place version 42 raced by a concurrent upload — a task booted 99. Tasks retried pinned (slower, cold place boot).\n",
+			]);
 		});
 
 		it("should not warn when no task races", async () => {
@@ -747,10 +1009,54 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests(jobsOptions([job("alpha")]));
+			await backend.runTestsAsync(jobsOptions([job("alpha")]));
 			restore();
 
-			expect(writes.filter((line) => line.includes("place version raced"))).toHaveLength(0);
+			expect(writes.filter((line) => line.includes("Tasks retried pinned"))).toHaveLength(0);
+		});
+
+		/**
+		 * The guard reports which version the task actually booted, so the
+		 * warning can name a cause instead of guessing one. A version ahead of
+		 * this run's fresh upload is the genuine race: someone published
+		 * between the upload and the boot.
+		 */
+		it("should name the version a concurrent upload booted", async () => {
+			expect.assertions(1);
+
+			const { restore, writes } = captureStderr();
+
+			const stub = createRunnerStub({ uploadResult: { uploadMs: 3, versionNumber: 42 } });
+			stub.setExecute(raceUnpinnedExecute(1));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			await backend.runTestsAsync(jobsOptions([job("alpha")]));
+			restore();
+
+			expect(writes.join("")).toContain(
+				"place version 42 raced by a concurrent upload — a task booted 99",
+			);
+		});
+
+		/**
+		 * A booted version *behind* the upload is the opposite problem: nothing
+		 * raced, the save has yet to reach the boot pool.
+		 */
+		it("should report a version the boot pool has not picked up yet", async () => {
+			expect.assertions(1);
+
+			const { restore, writes } = captureStderr();
+
+			const stub = createRunnerStub({ uploadResult: { uploadMs: 3, versionNumber: 42 } });
+			stub.setExecute(raceUnpinnedExecute(1, 41));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			await backend.runTestsAsync(jobsOptions([job("alpha")]));
+			restore();
+
+			expect(writes.join("")).toContain(
+				"place version 42 is not in the boot pool yet — a task booted 41",
+			);
 		});
 	});
 
@@ -764,16 +1070,17 @@ describe(OpenCloudBackend, () => {
 				["beta", "epsilon"],
 				["gamma", "zeta"],
 			] as const;
-			let taskIndex = 0;
 			const stub = createRunnerStub();
-			stub.setExecute(() => {
-				const handledPkgs = taskPkgs[taskIndex] ?? [];
-				taskIndex += 1;
-				return scriptResult(envelope(handledPkgs.map(packageEntry)));
-			});
+			stub.setExecute(
+				stepExecute(
+					taskPkgs.map((handledPkgs) => {
+						return () => scriptResult(envelope(handledPkgs.map(packageEntry)));
+					}),
+				),
+			);
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [
 					job("alpha"),
 					job("beta"),
@@ -806,23 +1113,21 @@ describe(OpenCloudBackend, () => {
 			// pool would relaunch the freed slot if jest didn't pass a no-op
 			// replenishment; single-wave must fire exactly `parallel` tasks total
 			// and never start a replacement when a slot drains early.
-			let taskIndex = 0;
 			const stub = createRunnerStub();
-			stub.setExecute(async () => {
-				const index = taskIndex;
-				taskIndex += 1;
-				if (index === 0) {
-					return scriptResult(envelope([packageEntry("alpha")]));
-				}
-
-				await new Promise<void>((resolve) => {
-					setTimeout(resolve, 10);
-				});
-				return scriptResult(envelope([packageEntry("beta")]));
-			});
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha")])),
+					async () => {
+						await new Promise<void>((resolve) => {
+							setTimeout(resolve, 10);
+						});
+						return scriptResult(envelope([packageEntry("beta")]));
+					},
+				]),
+			);
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha"), job("beta")],
 				parallel: 2,
 				scriptOverride: "stealing-script",
@@ -832,6 +1137,364 @@ describe(OpenCloudBackend, () => {
 			expect(stub.executeCalls).toHaveLength(2);
 		});
 
+		it("should shard a workspace run across one task per bucket", async () => {
+			expect.assertions(2);
+
+			// A workspace run knows every entry up front, so the factory can
+			// carve them into one script per bucket. Without the queue that
+			// is the only concurrency left, and multi mode already gets it.
+			const stub = createRunnerStub();
+			stub.setExecute(scriptedEntries);
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			const results = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma")],
+				parallel: 3,
+				scriptFactory: scriptNaming,
+			});
+
+			expect(results.rawResults).toHaveLength(3);
+			expect(stub.executeCalls.map(requestedNames)).toStrictEqual([
+				["alpha"],
+				["beta"],
+				["gamma"],
+			]);
+		});
+
+		it("should re-send a deferring bucket's leftovers to that bucket alone", async () => {
+			expect.assertions(2);
+
+			// Each bucket owns its own deferral chain: the one that filled its
+			// envelope re-sends only what it left behind, and its sibling is
+			// untouched by the extra round.
+			const stub = createRunnerStub();
+			stub.setExecute(deferOnceExecute("alpha"));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			const results = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma"), job("delta")],
+				parallel: 2,
+				scriptFactory: scriptNaming,
+			});
+
+			expect(results.rawResults).toHaveLength(4);
+			expect(stub.executeCalls.map(requestedNames)).toStrictEqual([
+				["alpha", "gamma"],
+				["beta", "delta"],
+				["gamma"],
+			]);
+		});
+
+		it("should keep a sibling bucket's results when one bucket bails", async () => {
+			expect.assertions(2);
+
+			// A bail is task-local on this path — there is no signal map to
+			// broadcast it — so it stops the bucket that hit it and no other.
+			// The sibling still runs its whole share, and the only jobs
+			// reported skipped are the tail the bailing bucket never reached.
+			const stub = createRunnerStub();
+			stub.setExecute(bailingBucketExecute("alpha"));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			const results = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma"), job("delta")],
+				parallel: 2,
+				scriptFactory: scriptNaming,
+			});
+
+			// gamma alone: it shared alpha's bucket and never ran, while beta
+			// and delta came back from the sibling that carried on.
+			expect(results.bailedJobIndices).toStrictEqual([2]);
+			expect(results.rawResults).toHaveLength(3);
+		});
+
+		it("should re-send the entries a deferring task left behind", async () => {
+			expect.assertions(3);
+
+			// A task that fills its envelope has no queue to leave the rest in
+			// once work-stealing is out of reach. The backend has to rebuild a
+			// script from what did not come back, or those packages are lost.
+			const stub = createRunnerStub();
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha")], { deferred: true })),
+					() => scriptResult(envelope([packageEntry("beta"), packageEntry("gamma")])),
+				]),
+			);
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			const jobs = [job("alpha"), job("beta"), job("gamma")];
+			const results = await backend.runTestsAsync({ jobs, scriptFactory: scriptNaming });
+
+			expect(results.rawResults).toHaveLength(3);
+			expect(stub.executeCalls).toHaveLength(2);
+			// Only the two that did not come back the first time.
+			expect(requestedNames(stub.executeCalls[1]!)).toStrictEqual(["beta", "gamma"]);
+		});
+
+		it("should stop after a non-deferred workspace envelope", async () => {
+			expect.assertions(2);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => {
+				return scriptResult(envelope([packageEntry("alpha"), packageEntry("beta")]));
+			});
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			const result = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta")],
+				scriptFactory: () => "workspace-script",
+			});
+
+			expect(stub.executeCalls).toHaveLength(1);
+			expect(result.rawResults).toHaveLength(2);
+		});
+
+		it("should stop when a deferred workspace envelope covered every job", async () => {
+			expect.assertions(2);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => {
+				return scriptResult(
+					envelope([packageEntry("alpha"), packageEntry("beta")], { deferred: true }),
+				);
+			});
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			const result = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta")],
+				scriptFactory: () => "workspace-script",
+			});
+
+			expect(stub.executeCalls).toHaveLength(1);
+			expect(result.rawResults).toHaveLength(2);
+		});
+
+		it("should preserve bail evidence across deferred workspace envelopes", async () => {
+			expect.assertions(2);
+
+			const stub = createRunnerStub();
+			stub.setExecute(
+				stepExecute([
+					() => {
+						return scriptResult(
+							envelope([packageEntry("alpha")], { bailed: true, deferred: true }),
+						);
+					},
+					() => scriptResult(envelope([packageEntry("beta")])),
+				]),
+			);
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			const result = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma")],
+				scriptFactory: () => "workspace-script",
+			});
+
+			expect(stub.executeCalls).toHaveLength(2);
+			expect(result.bailedJobIndices).toStrictEqual([2]);
+		});
+
+		it("should stop re-sending when a task covers nothing new", async () => {
+			expect.assertions(2);
+
+			// A task that defers without running anything cannot be answered by
+			// sending it the same work again. Failing on the missing packages
+			// beats spending one task per job to reach the same place.
+			const stub = createRunnerStub();
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha")], { deferred: true })),
+				]),
+			);
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			await expect(
+				backend.runTestsAsync({
+					jobs: [job("alpha"), job("beta")],
+					scriptFactory: () => "retry-script",
+				}),
+			).rejects.toThrow("beta");
+
+			expect(stub.executeCalls).toHaveLength(2);
+		});
+
+		it("should build the first script from the factory", async () => {
+			expect.assertions(1);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			await backend.runTestsAsync({
+				jobs: [job("alpha")],
+				scriptFactory: () => "factory-built",
+			});
+
+			expect(stub.executeCalls[0]!.script).toContain("factory-built");
+		});
+
+		it("should fail a workspace task that returns no output at all", async () => {
+			expect.assertions(1);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => ({ durationMs: 1, outputs: [] }));
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			await expect(
+				backend.runTestsAsync({
+					jobs: [job("alpha")],
+					scriptFactory: () => "factory-built",
+				}),
+			).rejects.toThrow("No test results in output");
+		});
+
+		it("should explain an oversized return that splitting cannot fix", async () => {
+			expect.assertions(2);
+
+			// Open Cloud names neither the cause nor a way out, and it rejects
+			// the whole task — every package that task ran is lost with it. A
+			// run reaching here is either single-task or has one package whose
+			// own results exceed the cap, so the remedy has to be spelled out.
+			const stub = createRunnerStub();
+			const cause = new Error(
+				"Return results too large. Please reduce return result length to 4194304. Current size: 5908004",
+			);
+			stub.setExecute(() => {
+				throw cause;
+			});
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			const thrown = await backend
+				.runTestsAsync({
+					jobs: [job("alpha")],
+					parallel: 2,
+					scriptOverride: "stealing-script",
+					workStealing: true,
+				})
+				.catch((err: unknown) => err);
+
+			assert(thrown instanceof Error);
+
+			expect(thrown.message).toBe(
+				[
+					cause.message,
+					"One task returned more Jest output than Open Cloud accepts (4 MiB).",
+					"Coverage is usually the bulk of it — try --no-coverage to confirm.",
+					"Only files in the coverage universe are probed, so narrowing `collectCoverageFrom` to what you actually report on shrinks the payload with it.",
+					'Otherwise set `parallel: "auto"` (or --parallel 2+) so results come back split across tasks, or narrow the run with --packages / --project.',
+				].join("\n"),
+			);
+			expect(thrown.cause).toBe(cause);
+		});
+
+		it("should leave an unrelated task failure untouched", async () => {
+			expect.assertions(1);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => {
+				throw new Error("open cloud task crashed");
+			});
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			await expect(
+				backend.runTestsAsync({
+					jobs: [job("alpha")],
+					parallel: 2,
+					scriptOverride: "stealing-script",
+					workStealing: true,
+				}),
+			).rejects.toThrow("open cloud task crashed");
+		});
+
+		it("should launch a replacement task when a worker defers queued work", async () => {
+			expect.assertions(2);
+
+			// Open Cloud rejects a task returning over 4 MiB, so a worker whose
+			// envelope fills up stops early and leaves the rest of the queue.
+			// The deferral must earn exactly one replacement launch, or the
+			// packages it left behind never come back.
+			const stub = createRunnerStub();
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha")], { deferred: true })),
+					() => scriptResult(envelope([packageEntry("beta")])),
+					() => scriptResult(envelope([packageEntry("gamma")])),
+				]),
+			);
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			const results = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma")],
+				parallel: 2,
+				scriptOverride: "stealing-script",
+				workStealing: true,
+			});
+
+			expect(stub.executeCalls).toHaveLength(3);
+			expect(results.rawResults).toHaveLength(3);
+		});
+
+		it("should stop relaunching once every deferral has been answered", async () => {
+			expect.assertions(1);
+
+			// A replacement that drains the queue ends the chain. Without the
+			// claim on launch, the same deferral could be answered twice and
+			// the wave would keep firing tasks that have nothing left to do.
+			const stub = createRunnerStub();
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha")], { deferred: true })),
+					() => scriptResult(envelope([packageEntry("beta")])),
+					() => scriptResult(envelope([packageEntry("gamma")])),
+					() => scriptResult(envelope([])),
+				]),
+			);
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma")],
+				parallel: 2,
+				scriptOverride: "stealing-script",
+				workStealing: true,
+			});
+
+			expect(stub.executeCalls).toHaveLength(3);
+		});
+
+		it("should bound the replacement chain when every task keeps deferring", async () => {
+			expect.assertions(2);
+
+			// A worker always takes at least one item, so a run can never need
+			// more than one extra task per job. A producer that defers forever
+			// must hit that bound and fail on the missing package rather than
+			// launching tasks without end.
+			const stub = createRunnerStub();
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha")], { deferred: true })),
+				]),
+			);
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			await expect(
+				backend.runTestsAsync({
+					jobs: [job("alpha"), job("beta")],
+					parallel: 2,
+					scriptOverride: "stealing-script",
+					workStealing: true,
+				}),
+			).rejects.toThrow("beta");
+
+			// parallel (2) + one launch per job (2).
+			expect(stub.executeCalls).toHaveLength(4);
+		});
+
 		it("should fail the run when a task errors even if a sibling covers every package", async () => {
 			expect.assertions(1);
 
@@ -839,22 +1502,20 @@ describe(OpenCloudBackend, () => {
 			// resolves, so without a post-pool guard an infrastructure/script
 			// failure would be masked whenever a sibling task happens to drain
 			// the whole queue and cover every package. The run must still fail.
-			let taskIndex = 0;
 			const stub = createRunnerStub();
-			stub.setExecute(() => {
-				const index = taskIndex;
-				taskIndex += 1;
-				if (index === 0) {
-					return scriptResult(envelope([packageEntry("alpha"), packageEntry("beta")]));
-				}
-
-				throw new Error("open cloud task crashed");
-			});
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha"), packageEntry("beta")])),
+					() => {
+						throw new Error("open cloud task crashed");
+					},
+				]),
+			);
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
 
 			await expect(
-				backend.runTests({
+				backend.runTestsAsync({
 					jobs: [job("alpha"), job("beta")],
 					parallel: 2,
 					scriptOverride: "stealing-script",
@@ -866,23 +1527,27 @@ describe(OpenCloudBackend, () => {
 		it("should drop duplicate-pkg entries from fault-recovery and keep the first occurrence", async () => {
 			expect.assertions(2);
 
-			let taskIndex = 0;
 			const stub = createRunnerStub();
-			stub.setExecute(() => {
-				const index = taskIndex;
-				taskIndex += 1;
-				const entries =
-					index === 0
-						? [
+			stub.setExecute(
+				stepExecute([
+					() => {
+						return scriptResult(
+							envelope([
 								{ elapsedMs: 1, jestOutput: successJest(), pkg: "alpha" },
 								{ elapsedMs: 2, jestOutput: successJest(), pkg: "beta" },
-							]
-						: [{ elapsedMs: 99, jestOutput: successJest(), pkg: "alpha" }];
-				return scriptResult(envelope(entries));
-			});
+							]),
+						);
+					},
+					() => {
+						return scriptResult(
+							envelope([{ elapsedMs: 99, jestOutput: successJest(), pkg: "alpha" }]),
+						);
+					},
+				]),
+			);
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests({
+			const { rawResults } = await backend.runTestsAsync({
 				jobs: [job("alpha"), job("beta")],
 				parallel: 2,
 				scriptOverride: "stealing-script",
@@ -899,14 +1564,14 @@ describe(OpenCloudBackend, () => {
 			expect.assertions(1);
 
 			const stub = createRunnerStub();
-			stub.setExecute(() =>
-				scriptResult(envelope([{ jestOutput: successJest(), pkg: "alpha" }])),
-			);
+			stub.setExecute(() => {
+				return scriptResult(envelope([{ jestOutput: successJest(), pkg: "alpha" }]));
+			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
 
 			await expect(
-				backend.runTests({
+				backend.runTestsAsync({
 					jobs: [job("alpha"), job("beta")],
 					parallel: 1,
 					scriptOverride: "stealing-script",
@@ -915,8 +1580,83 @@ describe(OpenCloudBackend, () => {
 			).rejects.toThrow(/no entries for 1 package\(s\): beta/);
 		});
 
-		it("should aggregate entries from all task envelopes in input order", async () => {
+		// --bail stops the run on the first failing package, so the packages
+		// after it have no entry by design. Reporting them as bailed is what
+		// separates that from a task that broke and lost its results.
+		it("should report the jobs a bailed task never reached", async () => {
 			expect.assertions(2);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => {
+				return scriptResult(
+					envelope([{ jestOutput: successJest(), pkg: "alpha" }], { bailed: true }),
+				);
+			});
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			const { bailedJobIndices, rawResults } = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma")],
+				parallel: 1,
+				scriptOverride: "stealing-script",
+				workStealing: true,
+			});
+
+			expect(rawResults).toHaveLength(1);
+			expect(bailedJobIndices).toStrictEqual([1, 2]);
+		});
+
+		it("should report no bailed jobs when a bailed task still covered them all", async () => {
+			expect.assertions(2);
+
+			const stub = createRunnerStub();
+			stub.setExecute(() => {
+				return scriptResult(
+					envelope(
+						[
+							{ jestOutput: successJest(), pkg: "alpha" },
+							{ jestOutput: successJest(), pkg: "beta" },
+						],
+						{ bailed: true },
+					),
+				);
+			});
+
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+			const { bailedJobIndices, rawResults } = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta")],
+				parallel: 1,
+				scriptOverride: "stealing-script",
+				workStealing: true,
+			});
+
+			expect(rawResults).toHaveLength(2);
+			expect(bailedJobIndices).toStrictEqual([]);
+		});
+
+		it("should preserve bail evidence when only one work-stealing task bails", async () => {
+			expect.assertions(1);
+
+			const stub = createRunnerStub();
+			stub.setExecute(
+				stepExecute([
+					() => scriptResult(envelope([packageEntry("alpha")], { bailed: true })),
+					() => scriptResult(envelope([packageEntry("beta")])),
+				]),
+			);
+			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+			const result = await backend.runTestsAsync({
+				jobs: [job("alpha"), job("beta"), job("gamma")],
+				parallel: 2,
+				scriptOverride: "stealing-script",
+				workStealing: true,
+			});
+
+			expect(result.bailedJobIndices).toStrictEqual([2]);
+		});
+
+		it("should aggregate entries from all task envelopes in input order", async () => {
+			expect.assertions(3);
 
 			const taskPkgs = [
 				["alpha", "gamma"],
@@ -925,18 +1665,22 @@ describe(OpenCloudBackend, () => {
 			let taskIndex = 0;
 			const stub = createRunnerStub();
 			stub.setExecute(() => {
-				const pkgs = taskPkgs[taskIndex] ?? [];
+				const pkgs = taskPkgs[taskIndex]!;
 				taskIndex += 1;
 				return scriptResult(envelope(pkgs.map(packageEntry)));
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests({
+			const { rawResults } = await backend.runTestsAsync({
 				jobs: [job("alpha"), job("beta"), job("gamma"), job("delta")],
 				parallel: 2,
 				scriptOverride: "stealing-script",
 				workStealing: true,
 			});
+
+			// These results cross the backend boundary; pin every job/entry field
+			// while retaining the readable ordering assertions below.
+			expect(rawResults).toMatchSnapshot();
 
 			expect(rawResults).toHaveLength(4);
 			expect(rawResults.map((raw) => raw.entry.pkg)).toStrictEqual([
@@ -961,7 +1705,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests({
+			const { rawResults } = await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -996,7 +1740,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests({
+			const { rawResults } = await backend.runTestsAsync({
 				jobs: [job("client", {}, "@halcyon/foo"), job("server", {}, "@halcyon/foo")],
 				parallel: 2,
 				scriptOverride: "stealing-script",
@@ -1043,7 +1787,7 @@ describe(OpenCloudBackend, () => {
 			});
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("client", {}, "alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1064,6 +1808,11 @@ describe(OpenCloudBackend, () => {
 
 		it("should default pollMs when streaming hooks omit it", async () => {
 			expect.assertions(2);
+
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			onTestFinished(() => {
+				vi.useRealTimers();
+			});
 
 			const reader = createStreamReader([
 				[
@@ -1088,7 +1837,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			const promise = backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1100,6 +1849,8 @@ describe(OpenCloudBackend, () => {
 				},
 				workStealing: true,
 			});
+			await vi.runAllTimersAsync();
+			await promise;
 
 			expect(seen).toContain("alpha");
 			expect(reader.deleted).toContain("alpha::alpha");
@@ -1112,11 +1863,11 @@ describe(OpenCloudBackend, () => {
 			const { restore, writes } = captureStderr();
 
 			const reader = {
-				delete: async (): Promise<void> => {
+				deleteAsync: async (): Promise<void> => {
 					/* unused */
 				},
-				deleted: [] as Array<string>,
-				readAll: async (): Promise<never> => {
+				deleted: [],
+				readAllAsync: async (): Promise<never> => {
 					reader.readCalls += 1;
 					throw new Error("Failed to read streaming results: forbidden", {
 						cause: new PermissionError("forbidden", {
@@ -1133,7 +1884,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1163,11 +1914,11 @@ describe(OpenCloudBackend, () => {
 			const { restore, writes } = captureStderr();
 
 			const reader = {
-				delete: async (): Promise<void> => {
+				deleteAsync: async (): Promise<void> => {
 					/* unused */
 				},
-				deleted: [] as Array<string>,
-				readAll: async (): Promise<never> => {
+				deleted: [],
+				readAllAsync: async (): Promise<never> => {
 					reader.readCalls += 1;
 					throw new Error("forbidden", {
 						cause: new PermissionError("forbidden", {
@@ -1184,7 +1935,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1208,11 +1959,11 @@ describe(OpenCloudBackend, () => {
 			const { restore, writes } = captureStderr();
 
 			const reader = {
-				delete: async (): Promise<void> => {
+				deleteAsync: async (): Promise<void> => {
 					/* unused */
 				},
-				deleted: [] as Array<string>,
-				readAll: async (): Promise<never> => {
+				deleted: [],
+				readAllAsync: async (): Promise<never> => {
 					reader.readCalls += 1;
 
 					// eslint-disable-next-line ts/only-throw-error -- exercising the non-Error branch in drainOnce's catch.
@@ -1225,7 +1976,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1244,16 +1995,16 @@ describe(OpenCloudBackend, () => {
 		});
 
 		it("should emit a one-shot stderr warning for non-permission streaming reader errors", async () => {
-			expect.assertions(1);
+			expect.assertions(2);
 
 			const { restore, writes } = captureStderr();
 
 			const reader = {
-				delete: async (): Promise<void> => {
+				deleteAsync: async (): Promise<void> => {
 					/* unused */
 				},
-				deleted: [] as Array<string>,
-				readAll: async (): Promise<never> => {
+				deleted: [],
+				readAllAsync: async (): Promise<never> => {
 					reader.readCalls += 1;
 					throw new Error("network broke");
 				},
@@ -1264,7 +2015,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			await backend.runTests({
+			await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1279,18 +2030,22 @@ describe(OpenCloudBackend, () => {
 			});
 			restore();
 
-			expect(writes.filter((line) => line.includes("streaming disabled"))).toHaveLength(1);
+			expect(reader.readCalls).toBe(2);
+			expect(writes).toStrictEqual([
+				"Warning: live per-package streaming disabled — network broke\n",
+				"  Tests still run; results print as usual once each task finishes.\n",
+			]);
 		});
 
 		it("should swallow streaming reader errors so they don't fail the run", async () => {
 			expect.assertions(1);
 
 			const reader = {
-				delete: async () => {
+				deleteAsync: async () => {
 					/* unused */
 				},
-				deleted: [] as Array<string>,
-				readAll: async () => {
+				deleted: [],
+				readAllAsync: async () => {
 					reader.readCalls += 1;
 					throw new Error("read failed");
 				},
@@ -1301,7 +2056,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests({
+			const { rawResults } = await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1319,15 +2074,18 @@ describe(OpenCloudBackend, () => {
 		});
 
 		it("should swallow streaming delete errors after forwarding the entry", async () => {
-			expect.assertions(2);
+			expect.assertions(4);
 
 			const seen: Array<string> = [];
+			const { restore, writes } = captureStderr();
+			let deletionCount = 0;
 			const reader = {
-				delete: async () => {
+				deleteAsync: async () => {
+					deletionCount += 1;
 					throw new Error("delete failed");
 				},
-				deleted: [] as Array<string>,
-				readAll: async () => {
+				deleted: [],
+				readAllAsync: async () => {
 					reader.readCalls += 1;
 					return [
 						{
@@ -1351,7 +2109,7 @@ describe(OpenCloudBackend, () => {
 			stub.setExecute(() => scriptResult(envelope([packageEntry("alpha")])));
 
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
-			const { rawResults } = await backend.runTests({
+			const { rawResults } = await backend.runTestsAsync({
 				jobs: [job("alpha")],
 				parallel: 1,
 				scriptOverride: "stealing-script",
@@ -1364,9 +2122,15 @@ describe(OpenCloudBackend, () => {
 				},
 				workStealing: true,
 			});
+			restore();
 
 			expect(seen).toContain("alpha");
 			expect(rawResults).toHaveLength(1);
+			expect(deletionCount).toBeGreaterThanOrEqual(1);
+			expect(writes).toStrictEqual([
+				"Warning: live per-package streaming disabled — delete failed\n",
+				"  Tests still run; results print as usual once each task finishes.\n",
+			]);
 		});
 
 		it("should throw when work-stealing executeScript returns no outputs", async () => {
@@ -1378,7 +2142,7 @@ describe(OpenCloudBackend, () => {
 			const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
 
 			await expect(
-				backend.runTests({
+				backend.runTestsAsync({
 					jobs: [job("alpha")],
 					parallel: 1,
 					scriptOverride: "stealing-script",
@@ -1419,6 +2183,28 @@ describe(createOpenCloudBackend, () => {
 	});
 });
 
+describe(resolveOpenCloudBaseUrl, () => {
+	it("should return undefined when the env var is unset", () => {
+		expect.assertions(1);
+
+		expect(resolveOpenCloudBaseUrl()).toBeUndefined();
+	});
+
+	it.for([
+		["", undefined],
+		[" ".repeat(3), undefined],
+		["///", ""],
+		["https://apis.example.test", "https://apis.example.test"],
+		["  https://apis.example.test/path///  ", "https://apis.example.test/path"],
+	] as const)("should normalize %j to %j", ([raw, expected]) => {
+		expect.assertions(1);
+
+		vi.stubEnv("JEST_ROBLOX_OPEN_CLOUD_BASE_URL", raw);
+
+		expect(resolveOpenCloudBaseUrl()).toBe(expected);
+	});
+});
+
 describe(resolveOcaleMaxRetries, () => {
 	it("should return undefined when the env var is unset", () => {
 		expect.assertions(1);
@@ -1429,17 +2215,21 @@ describe(resolveOcaleMaxRetries, () => {
 	it("should return undefined for an empty/whitespace value", () => {
 		expect.assertions(1);
 
-		vi.stubEnv("JEST_ROBLOX_OCALE_MAX_RETRIES", "   ");
+		vi.stubEnv("JEST_ROBLOX_OCALE_MAX_RETRIES", " ".repeat(3));
 
 		expect(resolveOcaleMaxRetries()).toBeUndefined();
 	});
 
 	it("should parse a valid non-negative integer", () => {
-		expect.assertions(1);
+		expect.assertions(2);
 
 		vi.stubEnv("JEST_ROBLOX_OCALE_MAX_RETRIES", "8");
 
 		expect(resolveOcaleMaxRetries()).toBe(8);
+
+		vi.stubEnv("JEST_ROBLOX_OCALE_MAX_RETRIES", "0");
+
+		expect(resolveOcaleMaxRetries()).toBe(0);
 	});
 
 	it("should return undefined for a partial-numeric value (parseInt trap)", () => {
@@ -1465,5 +2255,648 @@ describe(resolveOcaleMaxRetries, () => {
 		vi.stubEnv("JEST_ROBLOX_OCALE_MAX_RETRIES", "-1");
 
 		expect(resolveOcaleMaxRetries()).toBeUndefined();
+	});
+});
+
+// Real tmpdir I/O per test (the cache reads place bytes off disk), so the
+// suite-wide per-test budget cannot hold this describe under parallel load.
+describe("upload cache", { timeout: 1000 }, () => {
+	/**
+	 * Run against a seeded cache with one task per entry in `bootedVersions`,
+	 * each booting the version named instead of the reused one. Stderr is
+	 * captured throughout, so a caller asserts on the warning, on the calls the
+	 * runner saw, or on what a later {@link runOnceAsync} has to upload.
+	 */
+	async function raceCachedRunAsync(
+		rootDirectory: string,
+		bootedVersions: Array<number>,
+	): Promise<{ capture: StderrCapture; stub: RunnerStub }> {
+		const capture = captureStderr();
+		const stub = createRunnerStub();
+		stub.setExecute(raceBootedVersions(bootedVersions));
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		const jobs = bootedVersions.map(() => cacheJob(rootDirectory));
+		await backend.runTestsAsync(jobsOptions(jobs, jobs.length));
+		capture.restore();
+
+		return { capture, stub };
+	}
+
+	/** How many uploads one passing run made. */
+	async function runOnceAsync(
+		rootDirectory: string,
+		overrides: Partial<ResolvedConfig> = {},
+	): Promise<number> {
+		const { uploadCalls } = await runProbedRunAsync(rootDirectory, overrides);
+		return uploadCalls.length;
+	}
+
+	function apiError(statusCode: number): Error {
+		const cause = Object.assign(new Error(`HTTP ${String(statusCode)}`), { statusCode });
+		return new Error("execute failed", { cause });
+	}
+
+	it("should upload on the first run and skip it on the second", async () => {
+		expect.assertions(2);
+
+		const rootDirectory = temporaryRoot();
+		const first = await runOnceAsync(rootDirectory);
+		const second = await runOnceAsync(rootDirectory);
+
+		expect(first).toBe(1);
+		expect(second).toBe(0);
+	});
+
+	it("should guard the reused version so a stale entry can only race", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+
+		const stub = createRunnerStub();
+		stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([cacheJob(rootDirectory)]));
+
+		expect(stub.executeCalls[0]!.script.startsWith(guardPrefix(42))).toBeTrue();
+	});
+
+	it("should retry pinned to the cached version when the guard races", async () => {
+		expect.assertions(3);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		const { stub } = await raceCachedRunAsync(rootDirectory, [99]);
+
+		// The whole safety argument for reusing a version: when another upload
+		// moved the head, the raced task re-runs pinned to the version whose
+		// bytes the cache hashed — never against whatever is live now.
+		expect(stub.uploadCalls).toHaveLength(0);
+		expect(stub.executeCalls[0]!.placeVersion).toBeUndefined();
+		expect(stub.executeCalls[1]!.placeVersion).toBe(42);
+	});
+
+	/**
+	 * The guard proving the head moved on is the only evidence available that a
+	 * reused version is stale — Open Cloud exposes no way to ask. Dropping the
+	 * entry there is what stops the slow path from becoming permanent: a cache
+	 * hit never uploads, so without this the entry can never become head again
+	 * and every later run pays a pinned cold boot.
+	 */
+	it("should drop a cached version once the guard proves it is behind head", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		await raceCachedRunAsync(rootDirectory, [99]);
+
+		await expect(runOnceAsync(rootDirectory)).resolves.toBe(1);
+	});
+
+	/**
+	 * The ordinary warning is one-shot per run; the drop must not be. The task
+	 * that booted an older version reports first here, and only the second task
+	 * carries the proof that head moved on — discarding that proof along with
+	 * the duplicate warning would leave the stale entry in place for good, and
+	 * leave the next run's upload unexplained.
+	 */
+	it("should drop a stale cached version proved after the first warning", async () => {
+		expect.assertions(3);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		const { capture } = await raceCachedRunAsync(rootDirectory, [41, 99]);
+		const warnings = capture.writes.filter((line) => line.includes("Tasks retried pinned"));
+
+		expect(warnings).toHaveLength(2);
+		expect(warnings[1]).toContain("no longer head");
+		await expect(runOnceAsync(rootDirectory)).resolves.toBe(1);
+	});
+
+	it("should say a cached version is no longer head only once", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		const { capture } = await raceCachedRunAsync(rootDirectory, [99, 99]);
+
+		expect(capture.writes.filter((line) => line.includes("no longer head"))).toHaveLength(1);
+	});
+
+	it("should say the cached version is no longer head", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		const { capture } = await raceCachedRunAsync(rootDirectory, [99]);
+
+		expect(capture.writes.join("")).toContain(
+			"cached place version 42 is no longer head — a task booted 99",
+		);
+	});
+
+	/**
+	 * A booted version behind the cached one says the boot pool lags, not that
+	 * the entry is wrong. Dropping it there would trade a correct fast path for
+	 * an upload on every run.
+	 */
+	it("should keep the cached version when the booted version is older", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		await raceCachedRunAsync(rootDirectory, [41]);
+
+		await expect(runOnceAsync(rootDirectory)).resolves.toBe(0);
+	});
+
+	it("should upload again when the place bytes change", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		fs.writeFileSync(path.join(rootDirectory, "place.rbxl"), "different-bytes");
+		const uploads = await runOnceAsync(rootDirectory);
+
+		expect(uploads).toBe(1);
+	});
+
+	it("should always upload when the cache is disabled", async () => {
+		expect.assertions(2);
+
+		const rootDirectory = temporaryRoot();
+		const first = await runOnceAsync(rootDirectory, { uploadCache: false });
+		const second = await runOnceAsync(rootDirectory, { uploadCache: false });
+
+		expect(first).toBe(1);
+		expect(second).toBe(1);
+	});
+
+	it("should not write a cache file when the cache is disabled", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory, { uploadCache: false });
+
+		expect(
+			fs.existsSync(path.join(rootDirectory, ".jest-roblox", "upload-cache.json")),
+		).toBeFalse();
+	});
+
+	it("should re-upload and retry when the cached version is gone", async () => {
+		expect.assertions(4);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+		const now = vi
+			.spyOn(Date, "now")
+			.mockReturnValueOnce(100)
+			.mockReturnValueOnce(101)
+			.mockReturnValueOnce(200)
+			.mockReturnValueOnce(210)
+			.mockReturnValueOnce(222)
+			.mockReturnValueOnce(260);
+		onTestFinished(() => {
+			now.mockRestore();
+		});
+
+		const capture = captureStderr();
+		const stub = createRunnerStub({ uploadResult: { uploadMs: 12, versionNumber: 43 } });
+		stub.setExecute(
+			stepExecute([
+				() => {
+					throw apiError(404);
+				},
+				() => scriptResult(envelope([{ jestOutput: successJest() }])),
+			]),
+		);
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		const { timing } = await backend.runTestsAsync(jobsOptions([cacheJob(rootDirectory)]));
+		capture.restore();
+
+		expect(stub.uploadCalls).toHaveLength(1);
+		expect(stub.executeCalls[1]!.script.startsWith(guardPrefix(43))).toBeTrue();
+		expect(capture.writes.join("")).toContain("cached place version is gone");
+		expect(timing).toStrictEqual({ executionMs: 48, uploadMs: 13 });
+	});
+
+	it("should not re-upload for a failure that is not a missing version", async () => {
+		expect.assertions(2);
+
+		const rootDirectory = temporaryRoot();
+		await runOnceAsync(rootDirectory);
+
+		const stub = createRunnerStub();
+		stub.setExecute(() => {
+			throw apiError(500);
+		});
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+		await expect(backend.runTestsAsync(jobsOptions([cacheJob(rootDirectory)]))).rejects.toThrow(
+			"execute failed",
+		);
+		expect(stub.uploadCalls).toHaveLength(0);
+	});
+});
+
+describe("boot probe", { timeout: 1000 }, () => {
+	/** What the runner throws when a task never reaches a terminal state. */
+	function probeTimeout(): Error {
+		return new Error("Execution timed out: Roblox never reported a terminal state", {
+			cause: new PollTimeoutError("poll budget exhausted", { timeoutMs: 135_000 }),
+		});
+	}
+
+	it("should probe a freshly uploaded version with a trivial pinned task", async () => {
+		expect.assertions(3);
+
+		const stub = probeStub();
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([job("alpha")]));
+
+		expect(stub.probeCalls).toHaveLength(1);
+		expect(stub.probeCalls[0]!.script).toBe(BOOT_PROBE_SCRIPT);
+		expect(stub.probeCalls[0]!.placeVersion).toBe(PROBED_VERSION);
+	});
+
+	/**
+	 * The pin is what makes the probe expensive, and on an owned place it buys
+	 * nothing: head is this run's version, so an unpinned probe proves the same
+	 * thing without missing the warm pool.
+	 */
+	it("should probe on head when the place is owned", async () => {
+		expect.assertions(3);
+
+		const stub = probeStub();
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([job("alpha", { ownedPlace: true })]));
+
+		expect(stub.probeCalls).toHaveLength(1);
+		expect(stub.probeCalls[0]!.script).toBe(OWNED_BOOT_PROBE_SCRIPT);
+		expect(stub.probeCalls[0]!.placeVersion).toBeUndefined();
+	});
+
+	/**
+	 * `ownedPlace` is a claim the CLI cannot verify from config alone, so the
+	 * probe checks it instead of trusting it. Head answering with someone
+	 * else's version means the lease is broken: the guard has to come back, and
+	 * the run must not record that its own bytes booted when they never ran.
+	 */
+	it("should keep the guard and skip the cache when an owned head is not ours", async () => {
+		expect.assertions(3);
+
+		const stub = probeStub();
+		stub.setProbe(() => ({ durationMs: 0, outputs: [String(PROBED_VERSION + 1)] }));
+		const capture = captureStderr();
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		const rootDirectory = temporaryRoot();
+		await backend.runTestsAsync(jobsOptions([cacheJob(rootDirectory, { ownedPlace: true })]));
+
+		capture.restore();
+
+		expect(stub.executeCalls[0]!.script).toContain(
+			placeIdentityGuardSource({ placeVersion: PROBED_VERSION }),
+		);
+		expect(capture.writes.join("")).toContain("another run wrote this place");
+
+		// A second run must upload again: nothing was cached, because the bytes
+		// this run uploaded are not the bytes that booted.
+		const second = await runProbedRunAsync(rootDirectory, { ownedPlace: true });
+
+		expect(second.probeCalls).toHaveLength(1);
+	});
+
+	/**
+	 * A probe that prints nothing leaves the claim unproven, which is not the
+	 * same as disproven — but it is just as far from the fact the fast path
+	 * needs, so it is treated the same way.
+	 */
+	it("should keep the guard when an owned probe reports no version", async () => {
+		expect.assertions(2);
+
+		const stub = probeStub();
+		stub.setProbe(() => ({ durationMs: 0, outputs: [] }));
+		const capture = captureStderr();
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([job("alpha", { ownedPlace: true })]));
+		capture.restore();
+
+		expect(stub.executeCalls[0]!.script).toContain(
+			placeIdentityGuardSource({ placeVersion: PROBED_VERSION }),
+		);
+		expect(capture.writes.join("")).toContain("head is unreadable");
+	});
+
+	/**
+	 * Ownership says no other run writes this place *now*; it says nothing
+	 * about who wrote it before this run held the lease. A cached version is a
+	 * claim about the past, so head may hold a previous holder's bytes — the
+	 * one case where dropping the guard would run the tests against code from
+	 * another checkout and report a pass. Only a version this run uploaded is
+	 * head by construction.
+	 */
+	it("should keep the guard on an owned place when the version came from cache", async () => {
+		expect.assertions(2);
+
+		const rootDirectory = temporaryRoot();
+		const first = await runProbedRunAsync(rootDirectory, { ownedPlace: true });
+		const second = await runProbedRunAsync(rootDirectory, { ownedPlace: true });
+
+		// Version-agnostic: a guard pinned to any other version is still a
+		// guard, and this asserts there is none.
+		expect(first.executeCalls[0]!.script).not.toContain(PLACE_MISMATCH);
+		expect(second.executeCalls[0]!.script).toContain(
+			placeIdentityGuardSource({ placeVersion: PROBED_VERSION }),
+		);
+	});
+
+	/**
+	 * The cache entry is written only once the probe passes, so a hit already
+	 * carries the proof. Re-probing would spend a boot on a question already
+	 * answered, on every run that reuses a version.
+	 */
+	it("should skip the probe when the version came from the upload cache", async () => {
+		expect.assertions(2);
+
+		const rootDirectory = temporaryRoot();
+		const first = await runProbedRunAsync(rootDirectory);
+		const second = await runProbedRunAsync(rootDirectory);
+
+		expect(first.probeCalls).toHaveLength(1);
+		expect(second.probeCalls).toHaveLength(0);
+	});
+
+	/**
+	 * Zero is the off switch, for a suite that has proved the probe elsewhere
+	 * and would rather spend the boot on tests. The version then earns no cache
+	 * entry: an entry means "these bytes boot", and nothing proved it.
+	 */
+	it("should skip the probe, and cache nothing, when the budget is zero", async () => {
+		expect.assertions(3);
+
+		const rootDirectory = temporaryRoot();
+		const first = await runProbedRunAsync(rootDirectory, { bootProbeTimeout: 0 });
+		const second = await runProbedRunAsync(rootDirectory, { bootProbeTimeout: 0 });
+
+		expect(first.probeCalls).toHaveLength(0);
+		expect(second.probeCalls).toHaveLength(0);
+		expect(second.uploadCalls).toHaveLength(1);
+	});
+
+	/**
+	 * The runner falls back to naming a place Roblox cannot load when a task
+	 * never settles. The probe has just disproved that for these bytes, so a
+	 * later timeout must not send the reader to Studio over it.
+	 */
+	it("should tell the runner the place boots once the probe has passed", async () => {
+		expect.assertions(2);
+
+		const stub = probeStub();
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([job("alpha")]));
+
+		expect(stub.executeCalls).toHaveLength(1);
+		expect(stub.executeCalls[0]!.bootProven).toBeTrue();
+	});
+
+	/**
+	 * A cache entry says the bytes booted when it was written, which is not the
+	 * same claim, so a reused version leaves the runner its own reading.
+	 */
+	it("should leave the runner to guess when the version came from the cache", async () => {
+		expect.assertions(1);
+
+		const rootDirectory = temporaryRoot();
+		await runProbedRunAsync(rootDirectory);
+		const second = await runProbedRunAsync(rootDirectory);
+
+		expect(second.executeCalls[0]!.bootProven).not.toBeTrue();
+	});
+
+	it("should fail the run at once when the probe never completes", async () => {
+		expect.assertions(2);
+
+		const stub = probeStub();
+		stub.setProbe(() => {
+			throw probeTimeout();
+		});
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		const caught = await backend
+			.runTestsAsync(jobsOptions([job("alpha")]))
+			.catch((err: unknown) => err);
+
+		expect(errorMessage(caught)).toBe(
+			[
+				`Place version ${String(PROBED_VERSION)} cannot be started by Open Cloud.`,
+				"A trivial script against it also never ran (90s).",
+				"Roblox reports no state, no error, and no log for a place it cannot load.",
+				`Open ${path.resolve(DEFAULT_CONFIG.rootDir, "./test.rbxl")} in Studio, or run with`,
+				"--backend=studio-cli, to see why it will not load.",
+			].join("\n"),
+		);
+		expect(stub.executeCalls).toHaveLength(0);
+	});
+
+	/**
+	 * A version that failed its probe must never be recorded as verified —
+	 * a hit skips the probe, so caching it would hand every later run of the
+	 * same bytes the full-budget hang the probe exists to prevent.
+	 */
+	it("should not cache a version whose probe never completed", async () => {
+		expect.assertions(3);
+
+		const rootDirectory = temporaryRoot();
+		const failing = probeStub();
+		failing.setProbe(() => {
+			throw probeTimeout();
+		});
+
+		const backend = new OpenCloudBackend(credentials, { runner: failing.runner });
+
+		await expect(backend.runTestsAsync(jobsOptions([cacheJob(rootDirectory)]))).rejects.toThrow(
+			"cannot be started by Open Cloud",
+		);
+
+		const next = await runProbedRunAsync(rootDirectory);
+
+		expect(next.uploadCalls).toHaveLength(1);
+		expect(next.probeCalls).toHaveLength(1);
+	});
+
+	/**
+	 * The probe body cannot fail on its own, but the call still rides the same
+	 * API as everything else. A throttle or a bad key says something about the
+	 * request, not about the place, and must not be reported as one.
+	 */
+	it("should pass a probe failure that is not a timeout through untouched", async () => {
+		expect.assertions(1);
+
+		const stub = probeStub();
+		stub.setProbe(() => {
+			throw new Error("HTTP 429: Too Many Requests");
+		});
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+		await expect(backend.runTestsAsync(jobsOptions([job("alpha")]))).rejects.toThrow(
+			"HTTP 429: Too Many Requests",
+		);
+	});
+
+	/**
+	 * The budget is wall clock, not a task deadline: the poll must stop asking
+	 * at the budget, or a 90s probe waits out the runner's boot-lag allowance
+	 * on top and the failure arrives 45s after it was known.
+	 *
+	 * The deadline stays short and separate. Set to the whole budget the two
+	 * would expire together, so a place that booted just inside the budget
+	 * would be reported as one Roblox cannot start while its script ran — the
+	 * one verdict that has to be trustworthy.
+	 */
+	it("should give the probe its own budget, 90s by default", async () => {
+		expect.assertions(3);
+
+		const stub = createRunnerStub();
+		stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([job("alpha")]));
+
+		expect(stub.probeCalls[0]!.pollBudget).toBe(90_000);
+		expect(stub.probeCalls[0]!.timeout).toBeLessThan(90_000);
+		expect(stub.executeCalls[0]!.timeout).toBe(DEFAULT_CONFIG.timeout);
+	});
+
+	it("should honour a bootProbeTimeout override", async () => {
+		expect.assertions(1);
+
+		const stub = createRunnerStub();
+		stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([job("alpha", { bootProbeTimeout: 30_000 })]));
+
+		expect(stub.probeCalls[0]!.pollBudget).toBe(30_000);
+	});
+
+	/**
+	 * A budget under the probe's own deadline is still the whole answer: the
+	 * task may not be given longer to run than the caller will wait for it.
+	 */
+	it("should never give the probe a deadline past its budget", async () => {
+		expect.assertions(2);
+
+		const stub = createRunnerStub();
+		stub.setExecute(() => scriptResult(envelope([{ jestOutput: successJest() }])));
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+		await backend.runTestsAsync(jobsOptions([job("alpha", { bootProbeTimeout: 1000 })]));
+
+		expect(stub.probeCalls[0]!.pollBudget).toBe(1000);
+		expect(stub.probeCalls[0]!.timeout).toBe(1000);
+	});
+});
+
+describe("wedge reporting", () => {
+	/** What the runner throws when a task never reaches a terminal state. */
+	function wedgeTimeout(): Error {
+		return new Error("Execution timed out: Roblox never reported a terminal state", {
+			cause: new PollTimeoutError("poll budget exhausted", { timeoutMs: 300_000 }),
+		});
+	}
+
+	function progressEntry(): TestProgressEntry {
+		return {
+			elapsedMs: 42_000,
+			state: "started",
+			testFilePath: "ReplicatedStorage/shared/wedge.spec",
+			testName: "wedges > never returns",
+		};
+	}
+
+	it("should name the last test the runtime reported when a task wedges", async () => {
+		expect.assertions(2);
+
+		const stub = probeStub();
+		stub.setExecute(() => {
+			throw wedgeTimeout();
+		});
+
+		const mapIds: Array<string> = [];
+		const backend = new OpenCloudBackend(credentials, {
+			progressReaderFactory: (mapId) => {
+				mapIds.push(mapId);
+				return { readAllAsync: async () => [progressEntry()] };
+			},
+			runner: stub.runner,
+		});
+
+		await expect(
+			backend.runTestsAsync({ jobs: [job("alpha")], testProgressMapId: "progress-uuid" }),
+		).rejects.toThrow("wedges > never returns");
+		expect(mapIds).toStrictEqual(["progress-uuid"]);
+	});
+
+	it("should leave the failure alone when the run kept no progress map", async () => {
+		expect.assertions(2);
+
+		const stub = probeStub();
+		stub.setExecute(() => {
+			throw wedgeTimeout();
+		});
+
+		let built = 0;
+		const backend = new OpenCloudBackend(credentials, {
+			progressReaderFactory: () => {
+				built += 1;
+				return { readAllAsync: async () => [progressEntry()] };
+			},
+			runner: stub.runner,
+		});
+
+		await expect(backend.runTestsAsync(jobsOptions([job("alpha")]))).rejects.toThrow(
+			"Execution timed out",
+		);
+		expect(built).toBe(0);
+	});
+
+	it("should reach for its own reader when none is injected", async () => {
+		expect.assertions(1);
+
+		const stub = probeStub();
+		stub.setExecute(() => {
+			throw new Error("permission denied");
+		});
+
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+		// Not a wedge, so the reader is built and never read: the assertion is
+		// that reaching for one costs nothing on a failure it cannot explain.
+		await expect(
+			backend.runTestsAsync({ jobs: [job("alpha")], testProgressMapId: "progress-uuid" }),
+		).rejects.toThrow("permission denied");
+	});
+
+	it("should hand the progress map id to the script it generates", async () => {
+		expect.assertions(1);
+
+		const stub = probeStub();
+		const backend = new OpenCloudBackend(credentials, { runner: stub.runner });
+
+		await backend.runTestsAsync({
+			jobs: [job("alpha")],
+			testProgressMapId: "progress-uuid",
+		});
+
+		expect(stub.executeCalls[0]!.script).toContain("progress-uuid");
 	});
 });

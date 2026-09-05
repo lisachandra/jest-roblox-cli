@@ -15,7 +15,7 @@ export interface LuteSpawnOptions {
 	/** Path to the Luau script to run. */
 	scriptPath: string;
 	/** Timeout in ms (default: 30_000). */
-	timeout?: number;
+	timeout?: number | undefined;
 }
 
 /**
@@ -24,14 +24,18 @@ export interface LuteSpawnOptions {
  * @param options - Spawn configuration.
  * @returns The stdout output from lute.
  */
-export function spawnLute(options: LuteSpawnOptions): string {
-	const { args, maxBuffer = DEFAULT_MAX_BUFFER, scriptPath, timeout = DEFAULT_TIMEOUT } = options;
-
+export function spawnLute({
+	args,
+	maxBuffer = DEFAULT_MAX_BUFFER,
+	scriptPath,
+	timeout = DEFAULT_TIMEOUT,
+}: LuteSpawnOptions): string {
 	try {
 		return cp.execFileSync("lute", ["run", scriptPath, "--", ...args], {
 			encoding: "utf-8",
 			maxBuffer,
 			timeout,
+			windowsHide: true,
 		});
 	} catch (err) {
 		if (err instanceof Error && "code" in err && err.code === "ENOENT") {

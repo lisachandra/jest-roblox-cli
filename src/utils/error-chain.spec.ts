@@ -1,4 +1,4 @@
-import { PermissionError } from "@bedrock-rbx/ocale";
+import { ApiError, PermissionError } from "@bedrock-rbx/ocale";
 
 import { describe, expect, it } from "vitest";
 
@@ -7,6 +7,7 @@ import { formatMissingScopes, walkErrorChain } from "./error-chain.ts";
 describe(formatMissingScopes, () => {
 	it("should list a single scope in the singular", () => {
 		expect.assertions(1);
+
 		expect(formatMissingScopes(["universe-places:write"])).toBe(
 			"API key missing scope universe-places:write. Add via Creator Dashboard.",
 		);
@@ -14,6 +15,7 @@ describe(formatMissingScopes, () => {
 
 	it("should list multiple scopes in the plural", () => {
 		expect.assertions(1);
+
 		expect(formatMissingScopes(["a", "b"])).toBe(
 			"API key missing scopes a, b. Add via Creator Dashboard.",
 		);
@@ -21,6 +23,7 @@ describe(formatMissingScopes, () => {
 
 	it("should fall back to a scope-less hint when no scopes are carried", () => {
 		expect.assertions(1);
+
 		expect(formatMissingScopes([])).toBe(
 			"API key has insufficient scopes. Add via Creator Dashboard.",
 		);
@@ -54,9 +57,9 @@ describe(walkErrorChain, () => {
 
 		const [entry] = walkErrorChain(cause);
 
-		expect(entry?.code).toBeUndefined();
-		expect(entry?.errno).toBeUndefined();
-		expect(entry?.syscall).toBeUndefined();
+		expect(entry!.code).toBeUndefined();
+		expect(entry!.errno).toBeUndefined();
+		expect(entry!.syscall).toBeUndefined();
 	});
 
 	it("should walk Error.cause and emit entries in nest order", () => {
@@ -95,7 +98,7 @@ describe(walkErrorChain, () => {
 	it("should cap output at five entries when the cause chain runs deeper", () => {
 		expect.assertions(3);
 
-		let chain: Error = new Error("level 0");
+		let chain = new Error("level 0");
 		for (let level = 1; level <= 6; level += 1) {
 			chain = new Error(`level ${level.toString()}`, { cause: chain });
 		}
@@ -105,6 +108,58 @@ describe(walkErrorChain, () => {
 		expect(entries).toHaveLength(5);
 		expect(entries[0]).toMatchObject({ message: "level 6" });
 		expect(entries[4]).toMatchObject({ message: "level 2" });
+	});
+
+	it("should capture the failing request and status from an ApiError link", () => {
+		expect.assertions(1);
+
+		const cause = new ApiError("HTTP 500: Internal", {
+			method: "GET",
+			statusCode: 500,
+			url: "https://apis.roblox.com/cloud/v2/universes/1/places/2",
+		});
+
+		const [entry] = walkErrorChain(cause);
+
+		expect(entry).toMatchObject({
+			method: "GET",
+			statusCode: 500,
+			url: "https://apis.roblox.com/cloud/v2/universes/1/places/2",
+		});
+	});
+
+	it("should carry a string details body through verbatim", () => {
+		expect.assertions(1);
+
+		const cause = new ApiError("Failed to parse response body", {
+			details: '{"path":"universes/1/luau-execution-session-tasks/abc","sta',
+			statusCode: 200,
+		});
+
+		const [entry] = walkErrorChain(cause);
+
+		expect(entry!.details).toBe('{"path":"universes/1/luau-execution-session-tasks/abc","sta');
+	});
+
+	it("should encode a structured details body as JSON", () => {
+		expect.assertions(1);
+
+		const cause = new ApiError("HTTP 400: Bad Request", {
+			details: { code: "INVALID_ARGUMENT", message: "place is too large" },
+			statusCode: 400,
+		});
+
+		const [entry] = walkErrorChain(cause);
+
+		expect(entry!.details).toBe('{"code":"INVALID_ARGUMENT","message":"place is too large"}');
+	});
+
+	it("should leave details undefined for a plain Error", () => {
+		expect.assertions(1);
+
+		const [entry] = walkErrorChain(new Error("plain"));
+
+		expect(entry!.details).toBeUndefined();
 	});
 
 	it("should capture requiredScopes from a PermissionError link", () => {
@@ -118,7 +173,7 @@ describe(walkErrorChain, () => {
 
 		const [entry] = walkErrorChain(cause);
 
-		expect(entry?.requiredScopes).toStrictEqual(["universe-places:write"]);
+		expect(entry!.requiredScopes).toStrictEqual(["universe-places:write"]);
 	});
 
 	it("should leave requiredScopes undefined for a plain Error", () => {
@@ -126,7 +181,7 @@ describe(walkErrorChain, () => {
 
 		const [entry] = walkErrorChain(new Error("plain"));
 
-		expect(entry?.requiredScopes).toBeUndefined();
+		expect(entry!.requiredScopes).toBeUndefined();
 	});
 
 	it("should terminate at the first non-Error link mid-chain", () => {

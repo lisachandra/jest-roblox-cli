@@ -1,9 +1,13 @@
 export interface TimingResult {
-	coverageMs?: number;
+	coverageMs?: number | undefined;
 	executionMs: number;
-	setupMs?: number;
+	setupMs?: number | undefined;
+	/**
+	 * The run's `PreDispatchTiming.stagingMs`, already folded into `totalMs`.
+	 */
+	stagingMs?: number | undefined;
 	startTime: number;
 	testsMs: number;
 	totalMs: number;
-	uploadMs?: number;
+	uploadMs?: number | undefined;
 }

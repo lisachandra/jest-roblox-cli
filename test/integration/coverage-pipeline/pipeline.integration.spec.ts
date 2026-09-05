@@ -16,7 +16,7 @@ import { MANIFEST_VERSION } from "../../../src/coverage-pipeline/manifest.ts";
 import { mapCoverageToTypeScript } from "../../../src/coverage-pipeline/mapper.ts";
 import { generateReports } from "../../../src/coverage-pipeline/reporter.ts";
 import type { RawCoverageData } from "../../../src/coverage-pipeline/types.ts";
-import { normalizeWindowsPath } from "../../../src/utils/normalize-windows-path.ts";
+import { normalizeWindowsPath, toPosixRoot } from "../../../src/utils/normalize-windows-path.ts";
 import { createRbxtsFixtureSandbox } from "../../e2e/cli/helpers.ts";
 
 const normalize = normalizeWindowsPath;
@@ -101,7 +101,15 @@ function normalizePath(filePath: string): string {
 	return filePath.replaceAll("\\", "/");
 }
 
-describe("coverage pipeline (mapper -> istanbul json reporter)", () => {
+/**
+ * A report key the mapper resolved back to TypeScript. The generated
+ * `jest.config.luau` has no TS twin, so it is expected to stay Luau.
+ */
+function isMappedReportKey(key: string): boolean {
+	return key.endsWith(".ts") || key.endsWith("jest.config.luau");
+}
+
+describe("coverage pipeline (mapper -> istanbul json reporter)", { timeout: 30_000 }, () => {
 	it("should write coverage-final.json keyed by ts paths with sane statement/fn maps", () => {
 		expect.assertions(4);
 
@@ -110,7 +118,10 @@ describe("coverage pipeline (mapper -> istanbul json reporter)", () => {
 		const fixtureRoot = createRbxtsFixtureSandbox(RBXTS_FIXTURE);
 		const fixtureOut = path.join(fixtureRoot, "out");
 
-		const files = instrumentRoot({ luauRoot: fixtureOut, shadowDir: shadowDirectory });
+		const files = instrumentRoot({
+			luauRoot: toPosixRoot(fixtureOut),
+			shadowDir: shadowDirectory,
+		});
 		const manifest = buildManifest(files, fixtureOut, shadowDirectory);
 		const coverageData = buildSyntheticCoverage(files);
 
@@ -130,18 +141,12 @@ describe("coverage pipeline (mapper -> istanbul json reporter)", () => {
 		});
 
 		expect(exampleEntry).toBeDefined();
+		expect(Object.keys(report).every(isMappedReportKey)).toBeTrue();
 		expect(
-			Object.keys(report).every(
-				(key) => key.endsWith(".ts") || key.endsWith("jest.config.luau"),
-			),
-		).toBeTrue();
-		expect(
-			Object.values(exampleEntry?.statementMap ?? {}).every(
+			Object.values(exampleEntry!.statementMap).every(
 				(statement) => statement.start.line >= 1,
 			),
 		).toBeTrue();
-		expect(Object.values(exampleEntry?.fnMap ?? {}).map((entry) => entry.name)).toContain(
-			"greet",
-		);
+		expect(Object.values(exampleEntry!.fnMap).map((entry) => entry.name)).toContain("greet");
 	});
 });

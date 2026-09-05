@@ -2,19 +2,13 @@ export interface RojoTreeNode {
 	$className?: string;
 	$ignoreUnknownInstances?: boolean;
 	$path?: string | { optional: string };
-	$properties?: Record<string, unknown>;
-	[key: string]:
-		| boolean
-		| Record<string, unknown>
-		| RojoTreeNode
-		| string
-		| undefined
-		| { optional: string };
+	$properties?: JSONObject;
+	[key: string]: boolean | JSONObject | RojoTreeNode | string | undefined | { optional: string };
 }
 
 export interface RojoProject {
 	name: string;
-	servePort?: number;
+	servePort?: number | undefined;
 	tree: RojoTreeNode;
 }
 
@@ -25,5 +19,18 @@ export interface RojoProject {
  * re-parsing the project file.
  */
 export interface LoadedRojoProject extends RojoProject {
-	raw: Record<string, unknown>;
+	raw: JSONObject;
+}
+
+/**
+ * Narrow an arbitrary tree value to a {@link RojoTreeNode}. Tree walkers reach
+ * values through the index signature, whose union is wider than the node type,
+ * so they need this rather than an assertion. Arrays and `null` are rejected —
+ * neither is a valid child instance, and `typeof null === "object"` would
+ * otherwise crash the walk.
+ * @param value - The tree value to test.
+ * @returns Whether the value is a tree node.
+ */
+export function isRojoTreeNode(value: unknown): value is RojoTreeNode {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }

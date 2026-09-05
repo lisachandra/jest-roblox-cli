@@ -1,34 +1,33 @@
-import { WorkQueue } from "@isentinel/roblox-runner";
+import { createJsonWorkQueueWriter, type WorkQueueWriter } from "@isentinel/roblox-runner";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { decodeQueueItem, encodeQueueItem, prepareWorkStealingQueue } from "./work-stealing.ts";
+import { prepareWorkStealingQueueAsync } from "./work-stealing.ts";
 
 interface EnqueueCall {
 	items: ReadonlyArray<unknown>;
 	options?: { ttlMs?: number };
 }
 
-function createQueueStub(enqueueImpl?: () => Promise<void>): {
-	enqueueCalls: Array<EnqueueCall>;
-	factory: (queueId: string) => WorkQueue<{ pkg: string; project: string }>;
-	queueIds: Array<string>;
-} {
+function createQueueStub(enqueueImpl?: () => Promise<void>) {
 	const enqueueCalls: Array<EnqueueCall> = [];
 	const queueIds: Array<string> = [];
 
-	function factory(queueId: string): WorkQueue<{ pkg: string; project: string }> {
+	function factory(queueId: string): WorkQueueWriter<{ pkg: string; project: string }> {
 		queueIds.push(queueId);
-		const queue = Object.create(WorkQueue.prototype) as WorkQueue<{
-			pkg: string;
-			project: string;
-		}>;
-		vi.spyOn(queue, "enqueue").mockImplementation(async (items, options): Promise<void> => {
-			enqueueCalls.push({ items, ...(options ? { options } : {}) });
-			if (enqueueImpl) {
-				await enqueueImpl();
-			}
+		const queue = createJsonWorkQueueWriter<{ pkg: string; project: string }>({
+			apiKey: "test-key",
+			queueId,
+			universeId: "123",
 		});
+		vi.spyOn(queue, "enqueueAsync").mockImplementation(
+			async (items, options): Promise<void> => {
+				enqueueCalls.push(options === undefined ? { items } : { items, options });
+				if (enqueueImpl) {
+					await enqueueImpl();
+				}
+			},
+		);
 		return queue;
 	}
 
@@ -37,13 +36,13 @@ function createQueueStub(enqueueImpl?: () => Promise<void>): {
 
 const CREDENTIALS = { apiKey: "test-key", universeId: "123" };
 
-describe(prepareWorkStealingQueue, () => {
+describe(prepareWorkStealingQueueAsync, () => {
 	it("should push every package onto a per-run UUID-keyed queue with default TTL", async () => {
 		expect.assertions(3);
 
 		const { enqueueCalls, factory, queueIds } = createQueueStub();
 
-		await prepareWorkStealingQueue({
+		await prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [
 				{ pkg: "@halcyon/foo", project: "alpha" },
@@ -56,7 +55,7 @@ describe(prepareWorkStealingQueue, () => {
 
 		expect(queueIds).toStrictEqual(["queue-uuid-1"]);
 		expect(enqueueCalls).toHaveLength(1);
-		expect(enqueueCalls[0]?.options?.ttlMs).toBe(600_000);
+		expect(enqueueCalls[0]!.options!.ttlMs).toBe(600_000);
 	});
 
 	it("should accept a custom ttlSeconds override", async () => {
@@ -64,7 +63,7 @@ describe(prepareWorkStealingQueue, () => {
 
 		const { enqueueCalls, factory } = createQueueStub();
 
-		await prepareWorkStealingQueue({
+		await prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [{ pkg: "@halcyon/foo", project: "alpha" }],
 			perPackageTimeoutSeconds: 60,
@@ -73,7 +72,7 @@ describe(prepareWorkStealingQueue, () => {
 			uuid: () => "qid",
 		});
 
-		expect(enqueueCalls[0]?.options?.ttlMs).toBe(120_000);
+		expect(enqueueCalls[0]!.options!.ttlMs).toBe(120_000);
 	});
 
 	it("should set invisibilityWindowSeconds to perPackageTimeoutSeconds + 30", async () => {
@@ -81,7 +80,7 @@ describe(prepareWorkStealingQueue, () => {
 
 		const { factory } = createQueueStub();
 
-		const prepared = await prepareWorkStealingQueue({
+		const prepared = await prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [],
 			perPackageTimeoutSeconds: 60,
@@ -92,12 +91,34 @@ describe(prepareWorkStealingQueue, () => {
 		expect(prepared.invisibilityWindowSeconds).toBe(90);
 	});
 
+	// The runner re-queues an item it dropped over budget, and the put-back has
+	// to name a TTL. Reporting the one the items were seeded with is what keeps
+	// an override from stopping at this function.
+	it("should report the TTL it seeded the items with", async () => {
+		expect.assertions(2);
+
+		const { factory } = createQueueStub();
+		const options = {
+			credentials: CREDENTIALS,
+			packages: [],
+			perPackageTimeoutSeconds: 60,
+			queueFactory: factory,
+			uuid: () => "qid",
+		};
+
+		const fallback = await prepareWorkStealingQueueAsync(options);
+		const overridden = await prepareWorkStealingQueueAsync({ ...options, ttlSeconds: 120 });
+
+		expect(fallback.ttlSeconds).toBe(600);
+		expect(overridden.ttlSeconds).toBe(120);
+	});
+
 	it("should return the queueId produced by the injected uuid generator", async () => {
 		expect.assertions(1);
 
 		const { factory } = createQueueStub();
 
-		const prepared = await prepareWorkStealingQueue({
+		const prepared = await prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [],
 			perPackageTimeoutSeconds: 60,
@@ -113,7 +134,7 @@ describe(prepareWorkStealingQueue, () => {
 
 		const { enqueueCalls, factory } = createQueueStub();
 
-		await prepareWorkStealingQueue({
+		await prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [{ pkg: "@halcyon/foo", project: "alpha" }],
 			perPackageTimeoutSeconds: 60,
@@ -121,7 +142,7 @@ describe(prepareWorkStealingQueue, () => {
 			uuid: () => "qid",
 		});
 
-		expect(enqueueCalls[0]?.items).toStrictEqual([{ pkg: "@halcyon/foo", project: "alpha" }]);
+		expect(enqueueCalls[0]!.items).toStrictEqual([{ pkg: "@halcyon/foo", project: "alpha" }]);
 	});
 
 	it("should call enqueue with empty items array when packages array is empty", async () => {
@@ -129,7 +150,7 @@ describe(prepareWorkStealingQueue, () => {
 
 		const { enqueueCalls, factory } = createQueueStub();
 
-		const prepared = await prepareWorkStealingQueue({
+		const prepared = await prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [],
 			perPackageTimeoutSeconds: 60,
@@ -137,7 +158,7 @@ describe(prepareWorkStealingQueue, () => {
 			uuid: () => "qid",
 		});
 
-		expect(enqueueCalls[0]?.items).toStrictEqual([]);
+		expect(enqueueCalls[0]!.items).toStrictEqual([]);
 		expect(prepared.queueId).toBe("qid");
 	});
 
@@ -149,7 +170,7 @@ describe(prepareWorkStealingQueue, () => {
 		});
 
 		await expect(
-			prepareWorkStealingQueue({
+			prepareWorkStealingQueueAsync({
 				credentials: CREDENTIALS,
 				packages: [{ pkg: "alpha", project: "p1" }],
 				perPackageTimeoutSeconds: 60,
@@ -164,7 +185,7 @@ describe(prepareWorkStealingQueue, () => {
 
 		const { factory } = createQueueStub();
 
-		const prepared = await prepareWorkStealingQueue({
+		const prepared = await prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [],
 			perPackageTimeoutSeconds: 60,
@@ -176,47 +197,12 @@ describe(prepareWorkStealingQueue, () => {
 		);
 	});
 
-	it("should encode a QueueItem as its plain object representation", () => {
-		expect.assertions(1);
-
-		expect(encodeQueueItem({ pkg: "@halcyon/foo", project: "alpha" })).toStrictEqual({
-			pkg: "@halcyon/foo",
-			project: "alpha",
-		});
-	});
-
-	it("should decode a wire payload back into a QueueItem", () => {
-		expect.assertions(1);
-
-		const wire = { pkg: "@halcyon/bar", project: "beta" };
-
-		expect(decodeQueueItem(wire)).toStrictEqual(wire);
-	});
-
-	it("should throw when wire payload is missing required fields", () => {
-		expect.assertions(1);
-
-		expect(() => decodeQueueItem({ pkg: "@halcyon/bar" })).toThrow("project must be a string");
-	});
-
-	it("should throw when wire payload field has wrong type", () => {
-		expect.assertions(1);
-
-		expect(() => decodeQueueItem({ pkg: 42, project: "beta" })).toThrow("pkg must be a string");
-	});
-
-	it("should throw when wire payload is not an object", () => {
-		expect.assertions(1);
-
-		expect(() => decodeQueueItem("not-an-object")).toThrow("must be an object");
-	});
-
-	it("should construct a real WorkQueue when no factory is provided", () => {
+	it("should construct a real queue writer when no factory is provided", () => {
 		expect.assertions(1);
 
 		// Just confirming construction succeeds — actual HTTP would fail without
 		// mocks; this exercises the default factory branch.
-		const promise = prepareWorkStealingQueue({
+		const promise = prepareWorkStealingQueueAsync({
 			credentials: CREDENTIALS,
 			packages: [],
 			perPackageTimeoutSeconds: 60,
@@ -226,11 +212,11 @@ describe(prepareWorkStealingQueue, () => {
 		expect(promise).toBeInstanceOf(Promise);
 	});
 
-	it("should construct a real WorkQueue with a custom baseUrl when provided", () => {
+	it("should construct a real queue writer with a custom baseUrl when provided", () => {
 		expect.assertions(1);
 
 		// Exercises the baseUrl-defined branch of the default factory path.
-		const promise = prepareWorkStealingQueue({
+		const promise = prepareWorkStealingQueueAsync({
 			baseUrl: "http://127.0.0.1:4010",
 			credentials: CREDENTIALS,
 			packages: [],

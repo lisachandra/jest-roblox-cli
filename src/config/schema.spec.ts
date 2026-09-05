@@ -1,7 +1,8 @@
 // cspell:words bakcend
 import { type } from "arktype";
-import { describe, expect, it } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 
+import type { Config } from "./schema.ts";
 import {
 	configSchema,
 	defineConfig,
@@ -43,9 +44,13 @@ describe(defineConfig, () => {
 			},
 		});
 
-		expect(config.test?.setupFiles).toBeFunction();
+		expect(config.test!.setupFiles).toBeFunction();
 	});
 });
+
+function schemaAcceptsBackend(backend: string): boolean {
+	return !(configSchema({ backend }) instanceof type.errors);
+}
 
 describe(isValidBackend, () => {
 	it("should return true for valid backends", () => {
@@ -142,6 +147,12 @@ describe("sHARED_TEST_KEYS", () => {
 		expect(SHARED_TEST_KEYS.has("testMatch")).toBeTrue();
 		expect(SHARED_TEST_KEYS.has("clearMocks")).toBeTrue();
 		expect(SHARED_TEST_KEYS.has("testTimeout")).toBeTrue();
+	});
+
+	it("should contain projectTimeout", () => {
+		expect.assertions(1);
+
+		expect(SHARED_TEST_KEYS.has("projectTimeout")).toBeTrue();
 	});
 
 	it("should not contain global-only or CLI keys", () => {
@@ -253,6 +264,21 @@ describe(configSchema, () => {
 			expect(result).not.toBeInstanceOf(type.errors);
 		});
 
+		it("should accept projectTimeout at test: and per-project", () => {
+			expect.assertions(1);
+
+			const result = configSchema({
+				test: {
+					projects: [
+						{ test: { displayName: "slow", include: ["src"], projectTimeout: 0 } },
+					],
+					projectTimeout: 30_000,
+				},
+			});
+
+			expect(result).not.toBeInstanceOf(type.errors);
+		});
+
 		it("should reject the removed `cache` field as unknown", () => {
 			expect.assertions(1);
 
@@ -260,11 +286,11 @@ describe(configSchema, () => {
 		});
 
 		it("should accept all valid backend values", () => {
-			expect.assertions(4);
+			expect.assertions(1);
 
-			for (const backend of ["auto", "open-cloud", "studio", "studio-cli"]) {
-				expect(configSchema({ backend })).not.toBeInstanceOf(type.errors);
-			}
+			expect(["auto", "open-cloud", "studio", "studio-cli"]).toSatisfyAll(
+				schemaAcceptsBackend,
+			);
 		});
 
 		it("should accept a studioPath string", () => {
@@ -389,7 +415,7 @@ describe(configSchema, () => {
 			expect.assertions(1);
 
 			const result = configSchema({
-				formatters: ["default", ["github-actions", { annotations: true }]],
+				formatters: ["default", ["github-actions", { displayAnnotations: true }]],
 			});
 
 			expect(result).not.toBeInstanceOf(type.errors);
@@ -587,6 +613,14 @@ describe(configSchema, () => {
 			expect(result).toBeInstanceOf(type.errors);
 		});
 
+		it("should reject a negative projectTimeout", () => {
+			expect.assertions(1);
+
+			const result = configSchema({ test: { projectTimeout: -1 } });
+
+			expect(result).toBeInstanceOf(type.errors);
+		});
+
 		it("should reject testMatch with wrong type", () => {
 			expect.assertions(1);
 
@@ -680,7 +714,7 @@ describe(configSchema, () => {
 		});
 
 		it("should reject global-only key verbose inside an inline project", () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
 			const result = configSchema({
 				test: {
@@ -696,8 +730,9 @@ describe(configSchema, () => {
 				},
 			});
 
-			expect(result).toBeInstanceOf(type.errors);
-			expect(String(result)).toContain("verbose");
+			assert(result instanceof type.errors);
+
+			expect(result.summary).toContain("verbose");
 		});
 
 		it("should reject parallel: 0", () => {
@@ -741,47 +776,47 @@ describe(configSchema, () => {
 
 	describe("error messages", () => {
 		it("should produce readable error for invalid backend", () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
 			const result = configSchema({ backend: "bad" });
 
-			expect(result).toBeInstanceOf(type.errors);
-			expect((result as type.errors).summary).toMatchInlineSnapshot(
+			assert(result instanceof type.errors);
+
+			expect(result.summary).toMatchInlineSnapshot(
 				'"backend must be "auto", "open-cloud", "studio" or "studio-cli" (was "bad")"',
 			);
 		});
 
 		it("should produce readable error for wrong type", () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
 			const result = configSchema({ port: "not-a-number" });
 
-			expect(result).toBeInstanceOf(type.errors);
-			expect((result as type.errors).summary).toMatchInlineSnapshot(
-				'"port must be a number (was a string)"',
-			);
+			assert(result instanceof type.errors);
+
+			expect(result.summary).toMatchInlineSnapshot('"port must be a number (was a string)"');
 		});
 
 		it("should produce readable error for undeclared key", () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
 			const result = configSchema({ bakcend: "studio" });
 
-			expect(result).toBeInstanceOf(type.errors);
-			expect((result as type.errors).summary).toMatchInlineSnapshot(
-				'"bakcend must be removed"',
-			);
+			assert(result instanceof type.errors);
+
+			expect(result.summary).toMatchInlineSnapshot('"bakcend must be removed"');
 		});
 
 		it("should produce readable error for nested validation", () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
 			const result = configSchema({
 				test: { coverageThreshold: { lines: "high" } },
 			});
 
-			expect(result).toBeInstanceOf(type.errors);
-			expect((result as type.errors).summary).toMatchInlineSnapshot(
+			assert(result instanceof type.errors);
+
+			expect(result.summary).toMatchInlineSnapshot(
 				'"test.coverageThreshold.lines must be a number (was a string)"',
 			);
 		});
@@ -792,7 +827,7 @@ describe(validateConfig, () => {
 	it("should return the config when valid", () => {
 		expect.assertions(1);
 
-		const input = { backend: "studio", test: { verbose: true } };
+		const input = { backend: "studio", test: { verbose: true } } satisfies Config;
 
 		expect(validateConfig(input)).toStrictEqual(input);
 	});
@@ -873,6 +908,12 @@ describe(validateConfig, () => {
 		}).toThrow(
 			"`typecheck` options have moved under `test.typecheck`. Replace these keys: typecheck → test.typecheck.enabled, typecheckOnly → test.typecheck.only, typecheckTsconfig → test.typecheck.tsconfig",
 		);
+	});
+
+	it("should not treat Object prototype names as migrated typecheck keys", () => {
+		expect.assertions(1);
+
+		expect(() => validateConfig({ constructor: true })).not.toThrow(/typecheck/);
 	});
 
 	it("should accept a typecheck object under test:", () => {
@@ -1002,9 +1043,9 @@ describe(validateConfig, () => {
 	it("should accept workspace.root with workspace.packages", () => {
 		expect.assertions(1);
 
-		expect(() =>
-			validateConfig({ workspace: { packages: ["packages/*"], root: "." } }),
-		).not.toThrow();
+		expect(() => {
+			return validateConfig({ workspace: { packages: ["packages/*"], root: "." } });
+		}).not.toThrow();
 	});
 
 	it("should reject workspace.packages without workspace.root", () => {
@@ -1052,7 +1093,7 @@ describe(validateConfig, () => {
 	it("should reject NaN test.slowTestThreshold", () => {
 		expect.assertions(1);
 
-		expect(() => validateConfig({ test: { slowTestThreshold: Number.NaN } })).toThrow(
+		expect(() => validateConfig({ test: { slowTestThreshold: NaN } })).toThrow(
 			/slowTestThreshold/,
 		);
 	});

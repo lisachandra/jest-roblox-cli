@@ -1,11 +1,13 @@
 /* cspell:words jridgewell */
-import { fromPartial } from "@total-typescript/shoehorn";
+import type { originalPositionFor } from "@jridgewell/trace-mapping";
+import { fromAny, fromPartial } from "@total-typescript/shoehorn";
 
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, vi } from "vitest";
 
 import type { CoverageMap } from "./coverage-map.ts";
 import type { CoverageManifest } from "./manifest.ts";
 import { MANIFEST_VERSION } from "./manifest.ts";
+import type { MappedFileCoverage } from "./mapper.ts";
 import { CoverageMapMalformedError, mapCoverageToTypeScript } from "./mapper.ts";
 import type { RawCoverageData } from "./types.ts";
 
@@ -13,8 +15,7 @@ const { mockOriginalPositionFor, mockReadFileSync, MockTraceMap } = vi.hoisted((
 	class MockTraceMapClass {}
 
 	return {
-		mockOriginalPositionFor:
-			vi.fn<(map: unknown, position: { column: number; line: number }) => unknown>(),
+		mockOriginalPositionFor: vi.fn<typeof originalPositionFor>(),
 		mockReadFileSync: vi.fn<(path: string, encoding: string) => string>(),
 		MockTraceMap: MockTraceMapClass,
 	};
@@ -28,12 +29,39 @@ vi.mock(import("node:fs"), async (importOriginal) => {
 });
 
 vi.mock(import("@jridgewell/trace-mapping"), async (importOriginal) => {
-	return {
+	return fromAny({
 		...(await importOriginal()),
 		originalPositionFor: mockOriginalPositionFor,
 		TraceMap: MockTraceMap,
-	} as unknown as typeof import("@jridgewell/trace-mapping");
+	});
 });
+
+/**
+ * `originalPositionFor` stub: the span start (column 0) resolves to a.ts, its
+ * end to b.ts. Hoisted to module scope — the split would otherwise be a
+ * conditional inside a test body.
+ */
+function positionSplitByColumn(
+	_map: Parameters<typeof originalPositionFor>[0],
+	position: Parameters<typeof originalPositionFor>[1],
+): ReturnType<typeof originalPositionFor> {
+	return position.column === 0
+		? { name: null, column: 0, line: 3, source: "src/a.ts" }
+		: { name: null, column: 25, line: 3, source: "src/b.ts" };
+}
+
+/**
+ * As {@linkcode positionSplitByColumn}, but the first branch arm resolves to
+ * a.ts.
+ */
+function positionSplitByLine(
+	_map: Parameters<typeof originalPositionFor>[0],
+	position: Parameters<typeof originalPositionFor>[1],
+): ReturnType<typeof originalPositionFor> {
+	return position.line === 3
+		? { name: null, column: 0, line: 2, source: "src/a.ts" }
+		: { name: null, column: 0, line: 4, source: "src/b.ts" };
+}
 
 function createManifest(files: CoverageManifest["files"] = {}): CoverageManifest {
 	return {
@@ -53,18 +81,23 @@ function createCoverageMap(
 	functionMap?: CoverageMap["functionMap"],
 	branchMap?: CoverageMap["branchMap"],
 ): CoverageMap {
-	return {
-		statementMap,
-		...(functionMap !== undefined ? { functionMap } : {}),
-		...(branchMap !== undefined ? { branchMap } : {}),
-	};
+	let coverageMap: CoverageMap = { statementMap };
+	if (functionMap !== undefined) {
+		coverageMap = { ...coverageMap, functionMap };
+	}
+
+	if (branchMap !== undefined) {
+		coverageMap = { ...coverageMap, branchMap };
+	}
+
+	return coverageMap;
 }
 
 function setupFs(fileContents: Record<string, string>): void {
 	mockReadFileSync.mockImplementation((filePath: string) => {
 		const contents = fileContents[filePath];
 		if (contents === undefined) {
-			const err = new Error(`ENOENT: no such file: ${filePath}`) as NodeJS.ErrnoException;
+			const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file: ${filePath}`);
 			err.code = "ENOENT";
 			throw err;
 		}
@@ -76,22 +109,20 @@ function setupFs(fileContents: Record<string, string>): void {
 function setupSourceMapMappings(
 	mappings: Record<string, { column: number; line: number; source: string }>,
 ): void {
-	mockOriginalPositionFor.mockImplementation(
-		(_map: unknown, position: { column: number; line: number }) => {
-			const key = `${String(position.line)}:${String(position.column)}`;
-			const mapping = mappings[key];
-			if (mapping === undefined) {
-				return { name: null, column: null, line: null, source: null };
-			}
+	mockOriginalPositionFor.mockImplementation((_map, position) => {
+		const key = `${String(position.line)}:${String(position.column)}`;
+		const mapping = mappings[key];
+		if (mapping === undefined) {
+			return { name: null, column: null, line: null, source: null };
+		}
 
-			return {
-				name: null,
-				column: mapping.column,
-				line: mapping.line,
-				source: mapping.source,
-			};
-		},
-	);
+		return {
+			name: null,
+			column: mapping.column,
+			line: mapping.line,
+			source: mapping.source,
+		};
+	});
 }
 
 function createManifestFiles() {
@@ -143,12 +174,12 @@ describe(mapCoverageToTypeScript, () => {
 
 			const file = result.files["src/shared/player.ts"];
 
-			expect(file?.path).toBe("src/shared/player.ts");
-			expect(file?.statementMap["0"]).toStrictEqual({
+			expect(file!.path).toBe("src/shared/player.ts");
+			expect(file!.statementMap["0"]).toStrictEqual({
 				end: { column: 25, line: 3 },
 				start: { column: 0, line: 3 },
 			});
-			expect(file?.s["0"]).toBe(3);
+			expect(file!.s["0"]).toBe(3);
 		});
 	});
 
@@ -289,8 +320,8 @@ describe(mapCoverageToTypeScript, () => {
 
 			const file = result.files["src/shared/player.ts"];
 
-			expect(Object.keys(file?.statementMap ?? {})).toHaveLength(1);
-			expect(file?.s["0"]).toBe(5);
+			expect(Object.keys(file!.statementMap)).toHaveLength(1);
+			expect(file!.s["0"]).toBe(5);
 		});
 	});
 
@@ -338,9 +369,9 @@ describe(mapCoverageToTypeScript, () => {
 
 			const file = result.files["src/shared/player.ts"];
 
-			expect(Object.keys(file?.statementMap ?? {})).toHaveLength(1);
-			expect(file?.s["0"]).toBe(10);
-			expect(file?.statementMap["0"]).toStrictEqual({
+			expect(Object.keys(file!.statementMap)).toHaveLength(1);
+			expect(file!.s["0"]).toBe(10);
+			expect(file!.statementMap["0"]).toStrictEqual({
 				end: { column: 25, line: 2 },
 				start: { column: 0, line: 2 },
 			});
@@ -393,7 +424,123 @@ describe(mapCoverageToTypeScript, () => {
 
 			// First stmt end col 25 > second stmt end col 5, same line →
 			// existing wins
-			expect(file?.statementMap["0"]?.end).toStrictEqual({ column: 25, line: 2 });
+			expect(file!.statementMap["0"]!.end).toStrictEqual({ column: 25, line: 2 });
+		});
+	});
+
+	describe("with one source statement lowered to several Luau statements", () => {
+		// `const [first, second] = buildPair(\n\tinput,\n);` on TS line 10.
+		// roblox-ts lowers it to a `local _binding = ...` mapped across the
+		// call's three source lines, plus one single-line fragment per bound
+		// name, each mapped to its own column of line 10.
+		const bindingSpan = { end: { column: 33, line: 20 }, start: { column: 1, line: 20 } };
+		const firstSpan = { end: { column: 26, line: 21 }, start: { column: 1, line: 21 } };
+		const secondSpan = { end: { column: 27, line: 22 }, start: { column: 1, line: 22 } };
+
+		function setupLuauFile(statementMap: CoverageMap["statementMap"]): void {
+			setupFs({
+				"out/shared/player.luau.cov-map.json": JSON.stringify(
+					createCoverageMap(statementMap),
+				),
+				"out/shared/player.luau.map": '{"version":3}',
+			});
+		}
+
+		function setupDestructuringMappings(): void {
+			setupSourceMapMappings({
+				// `local _binding = buildPair(input)`
+				"20:0": { column: 0, line: 10, source: "src/shared/player.ts" },
+				"20:32": { column: 1, line: 12, source: "src/shared/player.ts" },
+				// `local first = _binding[1]`
+				"21:0": { column: 7, line: 10, source: "src/shared/player.ts" },
+				"21:25": { column: 12, line: 10, source: "src/shared/player.ts" },
+				// `local second = _binding[2]`
+				"22:0": { column: 14, line: 10, source: "src/shared/player.ts" },
+				"22:26": { column: 20, line: 10, source: "src/shared/player.ts" },
+			});
+		}
+
+		function runFile(hitCounts: Record<string, number>): MappedFileCoverage {
+			const result = mapCoverageToTypeScript(
+				{ "shared/player.luau": { s: hitCounts } },
+				createManifest({
+					"shared/player.luau": {
+						...createManifestFiles()["shared/player.luau"],
+						statementCount: Object.keys(hitCounts).length,
+					},
+				}),
+			);
+
+			const file = result.files["src/shared/player.ts"];
+			assert(file !== undefined, "fixture statements map to src/shared/player.ts");
+			return file;
+		}
+
+		it("should record one entry per source statement", () => {
+			expect.assertions(2);
+
+			setupLuauFile({ "0": bindingSpan, "1": firstSpan, "2": secondSpan });
+			setupDestructuringMappings();
+
+			const file = runFile({ "0": 3, "1": 3, "2": 3 });
+
+			expect(Object.keys(file.statementMap)).toHaveLength(1);
+			expect(file.statementMap["0"]).toStrictEqual({
+				end: { column: 1, line: 12 },
+				start: { column: 0, line: 10 },
+			});
+		});
+
+		it("should sum the fragment hit counts rather than splitting them", () => {
+			expect.assertions(1);
+
+			setupLuauFile({ "0": bindingSpan, "1": firstSpan, "2": secondSpan });
+			setupDestructuringMappings();
+
+			const file = runFile({ "0": 3, "1": 3, "2": 3 });
+
+			expect(file.s["0"]).toBe(9);
+		});
+
+		it("should widen the entry start when a fragment is recorded first", () => {
+			expect.assertions(2);
+
+			// A fragment lands before the statement start does. The entry takes
+			// the leftmost column, so it still covers the whole source
+			// statement.
+			setupLuauFile({ "0": firstSpan, "1": bindingSpan });
+			setupDestructuringMappings();
+
+			const file = runFile({ "0": 4, "1": 4 });
+
+			expect(Object.keys(file.statementMap)).toHaveLength(1);
+			expect(file.statementMap["0"]).toStrictEqual({
+				end: { column: 1, line: 12 },
+				start: { column: 0, line: 10 },
+			});
+		});
+
+		it("should keep single-line statements that merely share a line apart", () => {
+			expect.assertions(1);
+
+			// `first(); second();` — two source statements, neither spanning
+			// lines. Nothing marks them as fragments of one statement, so they
+			// stay separate.
+			setupLuauFile({
+				"0": { end: { column: 10, line: 20 }, start: { column: 1, line: 20 } },
+				"1": { end: { column: 11, line: 21 }, start: { column: 1, line: 21 } },
+			});
+
+			setupSourceMapMappings({
+				"20:0": { column: 0, line: 10, source: "src/shared/player.ts" },
+				"20:9": { column: 8, line: 10, source: "src/shared/player.ts" },
+				"21:0": { column: 10, line: 10, source: "src/shared/player.ts" },
+				"21:10": { column: 19, line: 10, source: "src/shared/player.ts" },
+			});
+
+			const file = runFile({ "0": 1, "1": 1 });
+
+			expect(Object.keys(file.statementMap)).toHaveLength(2);
 		});
 	});
 
@@ -430,7 +577,7 @@ describe(mapCoverageToTypeScript, () => {
 
 			const file = result.files["src/shared/player.ts"];
 
-			expect(file?.s["0"]).toBe(0);
+			expect(file!.s["0"]).toBe(0);
 		});
 	});
 
@@ -472,7 +619,7 @@ describe(mapCoverageToTypeScript, () => {
 			const file = result.files["src/shared/player.ts"];
 
 			expect(file).toBeDefined();
-			expect(file?.s["0"]).toBe(0);
+			expect(file!.s["0"]).toBe(0);
 		});
 	});
 
@@ -481,7 +628,7 @@ describe(mapCoverageToTypeScript, () => {
 			expect.assertions(1);
 
 			mockReadFileSync.mockImplementation(() => {
-				const err = new Error("ENOENT") as NodeJS.ErrnoException;
+				const err: NodeJS.ErrnoException = new Error("ENOENT");
 				err.code = "ENOENT";
 				throw err;
 			});
@@ -534,16 +681,7 @@ describe(mapCoverageToTypeScript, () => {
 				"out/shared/player.luau.map": '{"version":3}',
 			});
 
-			mockOriginalPositionFor.mockImplementation(
-				(_map: unknown, position: { column: number }) => {
-					// start maps to a.ts, end maps to b.ts
-					if (position.column === 0) {
-						return { name: null, column: 0, line: 3, source: "src/a.ts" };
-					}
-
-					return { name: null, column: 25, line: 3, source: "src/b.ts" };
-				},
-			);
+			mockOriginalPositionFor.mockImplementation(positionSplitByColumn);
 
 			const result = mapCoverageToTypeScript(
 				{ "shared/player.luau": { s: { "0": 1 } } },
@@ -715,9 +853,9 @@ describe(mapCoverageToTypeScript, () => {
 			const coverageMap = createCoverageMap(
 				{},
 				{
-					"1": {
+					"1": fromPartial({
 						location: { end: { column: 4, line: 8 }, start: { column: 1, line: 5 } },
-					} as unknown as NonNullable<CoverageMap["functionMap"]>[string],
+					}),
 				},
 			);
 
@@ -820,8 +958,8 @@ describe(mapCoverageToTypeScript, () => {
 
 			expect(file).toBeDefined();
 			expect(file.f["0"]).toBe(0);
-			expect(file.fnMap["0"]?.name).toBe("unmappable");
-			expect(file.fnMap["0"]?.loc).toStrictEqual({
+			expect(file.fnMap["0"]!.name).toBe("unmappable");
+			expect(file.fnMap["0"]!.loc).toStrictEqual({
 				end: { column: 0, line: 1 },
 				start: { column: 0, line: 1 },
 			});
@@ -932,8 +1070,8 @@ describe(mapCoverageToTypeScript, () => {
 			// Function lands in one of the two TS files (first resolved)
 			const aFile = result.files["src/shared/a.ts"];
 			const bFile = result.files["src/shared/b.ts"];
-			const funcInA = Object.keys(aFile?.fnMap ?? {}).length;
-			const funcInB = Object.keys(bFile?.fnMap ?? {}).length;
+			const funcInA = Object.keys(aFile!.fnMap).length;
+			const funcInB = Object.keys(bFile!.fnMap).length;
 
 			expect(funcInA + funcInB).toBe(1);
 		});
@@ -1044,8 +1182,8 @@ describe(mapCoverageToTypeScript, () => {
 
 			// Coalesced: hit count summed, end is the later position (line 5 >
 			// line 3)
-			expect(file?.s["0"]).toBe(6);
-			expect(file?.statementMap["0"]?.end).toStrictEqual({ column: 5, line: 5 });
+			expect(file!.s["0"]).toBe(6);
+			expect(file!.statementMap["0"]!.end).toStrictEqual({ column: 5, line: 5 });
 		});
 
 		it("should pick the earlier end position's line when first statement ends later", () => {
@@ -1094,7 +1232,7 @@ describe(mapCoverageToTypeScript, () => {
 
 			// First statement's end (line 6) > second's end (line 3), so line 6
 			// wins
-			expect(file?.statementMap["0"]?.end).toStrictEqual({ column: 10, line: 6 });
+			expect(file!.statementMap["0"]!.end).toStrictEqual({ column: 10, line: 6 });
 		});
 	});
 
@@ -1243,13 +1381,7 @@ describe(mapCoverageToTypeScript, () => {
 
 			const coverageMap = createCoverageMap({}, undefined, {
 				"1": {
-					locations: [
-						{
-							notASpan: true,
-						} as unknown as NonNullable<
-							CoverageMap["branchMap"]
-						>[string]["locations"][number],
-					],
+					locations: [fromAny({ notASpan: true })],
 					type: "if",
 				},
 			});
@@ -1352,16 +1484,7 @@ describe(mapCoverageToTypeScript, () => {
 				"out/shared/player.luau.map": '{"version":3}',
 			});
 
-			// First arm maps to a.ts, second arm maps to b.ts
-			mockOriginalPositionFor.mockImplementation(
-				(_map: unknown, position: { line: number }) => {
-					if (position.line === 3) {
-						return { name: null, column: 0, line: 2, source: "src/a.ts" };
-					}
-
-					return { name: null, column: 0, line: 4, source: "src/b.ts" };
-				},
-			);
+			mockOriginalPositionFor.mockImplementation(positionSplitByLine);
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [1, 0] }, s: {} },
@@ -1603,8 +1726,8 @@ describe(mapCoverageToTypeScript, () => {
 			const file = result.files["src/shared/player.ts"];
 
 			expect(file).toBeDefined();
-			expect(file?.s["0"]).toBe(5);
-			expect(file?.branchMap).toStrictEqual({});
+			expect(file!.s["0"]).toBe(5);
+			expect(file!.branchMap).toStrictEqual({});
 		});
 
 		it("should keep a collapsing expr-if branch (a real ternary is not a phantom)", () => {
@@ -1653,7 +1776,7 @@ describe(mapCoverageToTypeScript, () => {
 			const file = result.files["src/shared/player.ts"];
 
 			expect(file).toBeDefined();
-			expect(file?.b["0"]).toStrictEqual([4, 6]);
+			expect(file!.b["0"]).toStrictEqual([4, 6]);
 		});
 	});
 
@@ -1685,8 +1808,8 @@ describe(mapCoverageToTypeScript, () => {
 			const file = result.files["shared/player.luau"];
 
 			expect(file).toBeDefined();
-			expect(file?.s["0"]).toBe(5);
-			expect(file?.statementMap["0"]).toStrictEqual({
+			expect(file!.s["0"]).toBe(5);
+			expect(file!.statementMap["0"]).toStrictEqual({
 				end: { column: 19, line: 3 },
 				start: { column: 0, line: 1 },
 			});
@@ -1728,9 +1851,9 @@ describe(mapCoverageToTypeScript, () => {
 
 			const file = result.files["shared/player.luau"]!;
 
-			expect(file.fnMap["0"]?.name).toBe("greet");
+			expect(file.fnMap["0"]!.name).toBe("greet");
 			expect(file.f["0"]).toBe(3);
-			expect(file.fnMap["0"]?.loc).toStrictEqual({
+			expect(file.fnMap["0"]!.loc).toStrictEqual({
 				end: { column: 3, line: 5 },
 				start: { column: 0, line: 3 },
 			});
@@ -1774,8 +1897,8 @@ describe(mapCoverageToTypeScript, () => {
 			const file = result.files["shared/player.luau"]!;
 
 			expect(file.b["0"]).toStrictEqual([2, 1]);
-			expect(file.branchMap["0"]?.type).toBe("if");
-			expect(file.branchMap["0"]?.locations).toStrictEqual([
+			expect(file.branchMap["0"]!.type).toBe("if");
+			expect(file.branchMap["0"]!.locations).toStrictEqual([
 				{ end: { column: 9, line: 3 }, start: { column: 0, line: 3 } },
 				{ end: { column: 9, line: 5 }, start: { column: 0, line: 5 } },
 			]);
@@ -1989,7 +2112,7 @@ describe(mapCoverageToTypeScript, () => {
 			const file = result.files["shared/player.luau"];
 
 			expect(file).toBeDefined();
-			expect(file?.s["0"]).toBe(0);
+			expect(file!.s["0"]).toBe(0);
 		});
 
 		it("should merge coverage from duplicate keys into existing pending entries", () => {

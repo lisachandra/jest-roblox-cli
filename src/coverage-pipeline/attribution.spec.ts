@@ -27,7 +27,55 @@ function exampleManifest(): CoverageManifest {
 	};
 }
 
+/**
+ * A manifest as a warm run reads it: the shadow found `out/m.luau` unchanged
+ * and carried the previous run's record forward verbatim, attribution included.
+ */
+function warmManifest(): CoverageManifest {
+	const manifest = exampleManifest();
+	manifest.files["out/m.luau"] = {
+		...manifest.files["out/m.luau"]!,
+		coveringTestIds: { "1": ["stale"], "2": ["stale"] },
+		staticStatementIds: ["0"],
+	};
+
+	return manifest;
+}
+
 describe(harvestAttribution, () => {
+	it("should record a test's location and range hash when its source resolves to them", () => {
+		expect.assertions(1);
+
+		const result = harvestAttribution(
+			[
+				{
+					delta: { "out/m.luau": { s: [1] } },
+					testCaseId: "adds",
+					testFilePath: "out/m.spec.luau",
+				},
+			],
+			{},
+			() => {
+				return {
+					location: { column: 0, line: 12 },
+					testFileSourceHash: "hash-a",
+					testSourceHash: "range-a",
+				};
+			},
+		);
+
+		expect(result.tests).toStrictEqual([
+			{
+				location: { column: 0, line: 12 },
+				testCaseId: "adds",
+				testFilePath: "out/m.spec.luau",
+				testFileSourceHash: "hash-a",
+				testId: "out/m.spec.luau::adds",
+				testSourceHash: "range-a",
+			},
+		]);
+	});
+
 	it("should attribute a covered statement to the single test that hit it", () => {
 		expect.assertions(2);
 
@@ -40,9 +88,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{},
-			() => {
-				return "hash-a";
-			},
+			() => ({ testFileSourceHash: "hash-a" }),
 		);
 
 		expect(result.tests).toStrictEqual([
@@ -70,9 +116,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{},
-			() => {
-				return "hash-a";
-			},
+			() => ({ testFileSourceHash: "hash-a" }),
 		);
 
 		expect(result.coveringTestIds).toStrictEqual({
@@ -100,9 +144,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{},
-			() => {
-				return "hash-a";
-			},
+			() => ({ testFileSourceHash: "hash-a" }),
 		);
 
 		expect(result.tests).toHaveLength(2);
@@ -127,9 +169,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{},
-			() => {
-				return "hash-a";
-			},
+			() => ({ testFileSourceHash: "hash-a" }),
 		);
 
 		expect(result.tests).toStrictEqual([]);
@@ -150,9 +190,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{},
-			() => {
-				return "hash-a";
-			},
+			() => ({ testFileSourceHash: "hash-a" }),
 		);
 
 		expect(result.tests).toHaveLength(1);
@@ -175,9 +213,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{ "out/m.luau": { s: { "0": 1, "1": 1, "2": 1 } } },
-			() => {
-				return "hash-a";
-			},
+			() => ({ testFileSourceHash: "hash-a" }),
 		);
 
 		expect(result.staticStatementIds).toStrictEqual({ "out/m.luau": ["0", "1"] });
@@ -188,11 +224,11 @@ describe(harvestAttribution, () => {
 
 		// No per-test deltas, so nothing is credited; statement 1 was never hit
 		// (count 0) and stays out of the static set.
-		const result = harvestAttribution(
-			[],
-			{ "out/m.luau": { s: { "0": 1, "1": 0 } } },
-			() => "hash-a",
-		);
+		const result = harvestAttribution([], { "out/m.luau": { s: { "0": 1, "1": 0 } } }, () => {
+			return {
+				testFileSourceHash: "hash-a",
+			};
+		});
 
 		expect(result.staticStatementIds).toStrictEqual({ "out/m.luau": ["0"] });
 	});
@@ -209,9 +245,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{ "out/m.luau": { s: { "1": 1 } } },
-			() => {
-				return "hash-a";
-			},
+			() => ({ testFileSourceHash: "hash-a" }),
 		);
 
 		expect(result.staticStatementIds).toStrictEqual({});
@@ -229,7 +263,7 @@ describe(harvestAttribution, () => {
 				},
 			],
 			{},
-			() => {},
+			() => ({ testFileSourceHash: "" }),
 		);
 
 		expect(result.tests[0]!.testFileSourceHash).toBe("");
@@ -290,6 +324,48 @@ describe(applyAttribution, () => {
 		});
 
 		expect(result.files["out/ghost.luau"]).toBeUndefined();
+	});
+
+	it("should drop a carried-forward coveringTestIds when this run has only static ids", () => {
+		expect.assertions(3);
+
+		// The detector-regression case: every statement of the file became
+		// module-load code, so this harvest names it under static ids alone.
+		const result = applyAttribution(warmManifest(), {
+			coveringTestIds: {},
+			staticStatementIds: { "out/m.luau": ["0", "1", "2"] },
+			tests: [],
+		});
+
+		expect(result.files["out/m.luau"]!.coveringTestIds).toBeUndefined();
+		expect(result.files["out/m.luau"]!.staticStatementIds).toStrictEqual(["0", "1", "2"]);
+		expect(result.files["out/m.luau"]!.statementCount).toBe(3);
+	});
+
+	it("should drop a carried-forward staticStatementIds when this run has only covering ids", () => {
+		expect.assertions(2);
+
+		const result = applyAttribution(warmManifest(), {
+			coveringTestIds: { "out/m.luau": { "0": ["t1"] } },
+			staticStatementIds: {},
+			tests: [],
+		});
+
+		expect(result.files["out/m.luau"]!.staticStatementIds).toBeUndefined();
+		expect(result.files["out/m.luau"]!.coveringTestIds).toStrictEqual({ "0": ["t1"] });
+	});
+
+	it("should drop both carried-forward fields when this run attributes the file nothing", () => {
+		expect.assertions(2);
+
+		const result = applyAttribution(warmManifest(), {
+			coveringTestIds: {},
+			staticStatementIds: {},
+			tests: [],
+		});
+
+		expect(result.files["out/m.luau"]!.coveringTestIds).toBeUndefined();
+		expect(result.files["out/m.luau"]!.staticStatementIds).toBeUndefined();
 	});
 });
 

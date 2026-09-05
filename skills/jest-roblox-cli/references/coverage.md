@@ -60,13 +60,13 @@ const config = {
 Available metrics: `statements`, `branches`, `functions`, `lines`.
 
 In `--workspace` mode thresholds are **per-package**: each package that opted
-into coverage (its own `collectCoverage`) is gated against its own files. The
-workspace-root config's `coverageThreshold` is the metric-level base for every
-package; a package's own declaration overrides the metrics it names — even
-downward — and unnamed metrics inherit the root's. There is no pooled
-cross-package check, so one package's high coverage can't mask another's
-shortfall. A package that declares a threshold without `collectCoverage` gets a
-warning: the threshold cannot be enforced without instrumentation.
+into coverage (its own `collectCoverage`) is gated against its own files, by the
+threshold it declared itself. A package that declares none is not gated — a
+workspace run has no config of its own to inherit a base from, so a threshold
+only ever comes from the package. There is no pooled cross-package check either,
+so one package's high coverage can't mask another's shortfall. A package that
+declares a threshold without `collectCoverage` gets a warning: the threshold
+cannot be enforced without instrumentation.
 
 ## Config Fields
 
@@ -87,10 +87,54 @@ excludes barrel files even when they are never required by a test. In workspace
 mode each package's own patterns apply to that package's files, so one package
 can opt out without affecting another.
 
-`collectCoverageFrom` is **not** scoped per-package in workspace mode — it is
-read from the workspace-root config and applied after the cross-package merge,
-unlike `coveragePathIgnorePatterns`. Per-package narrowing there comes from each
-package's instrumented manifest plus its own ignore patterns.
+`collectCoverageFrom` is scoped per-package in workspace mode, the same as
+`coveragePathIgnorePatterns`. Both narrow the package's universe before its
+report renders, so a package's report and its threshold gate always judge the
+same set of files.
+
+The universe also decides which files get probes at all. A file outside it is
+mirrored into the shadow directory verbatim instead of instrumented, so the
+place stays loadable but the run never carries hit counts the report would
+discard. That matters on Open Cloud, which rejects a task returning more than 4
+MiB: a place probed across its whole source tree can spend most of that budget
+on files no report asks about. Narrowing `collectCoverageFrom` is the lever —
+`luauRoots` and `coveragePathIgnorePatterns` cut whole roots the same way.
+
+The fallback differs by mode. A multi-project run with no `collectCoverageFrom`
+derives the universe from each project's `include` globs (see the note above),
+and instruments against that derived set. Workspace mode has no such fallback: a
+package that sets nothing reports on, and probes, everything under its
+`luauRoots`.
+
+In workspace mode a package's `collectCoverageFrom` globs resolve against that
+package's own `rootDir`, which defaults to the package directory. A package at
+`packages/foo` writes `src/**/*.ts` for its own sources, whatever directory the
+CLI was invoked from. Single and multi mode anchor on the invocation directory
+instead — every coverage path they produce is relative to it, `rootDir` included
+by default.
+
+`coveragePathIgnorePatterns` matches by substring, so `**/index.ts` reaches a
+file at any depth under the anchor regardless of where the anchor sits. A
+pattern naming a directory _above_ the package, though, is anchor-relative like
+any other.
+
+<!-- prettier-ignore -->
+> [!WARNING]
+> A universe that matches no file yields an empty report, and an empty report
+> passes `coverageThreshold` vacuously — there is no file to fall short. Nothing
+> detects that for you, so check the report lists the files you expect before
+> trusting a threshold. A workspace package that used to write its globs from
+> the workspace root (`packages/foo/src/**/*.ts`) is exactly this case: drop the
+> package prefix and write `src/**/*.ts`.
+
+Changing either set of globs — or the `rootDir` they anchor to — invalidates the
+incremental coverage cache: the shadow directory still holds probed copies of
+files the new universe excludes, and no source hash would notice.
+
+In workspace mode every field in the table above is read per-package. Each
+package gets its own report, from its own reporters, written under its own
+`coverageDirectory` — nothing is merged across packages, and nothing is read
+from a config at the directory you invoked the CLI from.
 
 ## Generated Files
 
@@ -105,7 +149,8 @@ manifests. Add the umbrella to `.gitignore`:
 
 1. Resolves `luauRoots` from tsconfig `outDir` (or explicit config)
 2. Copies compiled Luau to shadow directory (`.jest-roblox/coverage/`)
-3. Instruments Luau files with coverage probes (`__cov_s`, `__cov_f`, `__cov_b`)
+3. Instruments the Luau files inside the coverage universe with coverage probes
+   (`__cov_s`, `__cov_f`, `__cov_b`); the rest stay as copied
 4. Rewrites Rojo project to point at instrumented files
 5. Builds coverage place file via `rojo build`
 6. Runs tests against the instrumented place

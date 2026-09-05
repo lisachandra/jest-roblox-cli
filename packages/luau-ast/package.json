@@ -19,27 +19,47 @@
 			"types": "./dist/index.d.mts",
 			"default": "./dist/index.mjs"
 		},
-		"./package.json": "./package.json"
+		"./ast": {
+			"source": "./src/ast.ts",
+			"types": "./dist/ast.d.mts",
+			"default": "./dist/ast.mjs"
+		},
+		"./package.json": "./package.json",
+		"./parser": {
+			"source": "./src/parser.ts",
+			"types": "./dist/parser.d.mts",
+			"default": "./dist/parser.mjs"
+		},
+		"./visit": {
+			"source": "./src/visit.ts",
+			"types": "./dist/visit.d.mts",
+			"default": "./dist/visit.mjs"
+		}
 	},
 	"types": "./dist/index.d.mts",
+	"files": [
+		"dist",
+		"src"
+	],
 	"scripts": {
 		"build": "tsdown"
 	},
 	"devDependencies": {
-		"@isentinel/eslint-config": "6.0.0-beta.3",
-		"@isentinel/tsconfig": "1.2.0",
+		"@isentinel/eslint-config": "6.0.0-beta.42",
+		"@isentinel/tsconfig": "2.0.0",
+		"@total-typescript/shoehorn": "0.1.2",
 		"@types/node": "24.12.3",
 		"@typescript/native-preview": "7.0.0-dev.20260607.1",
-		"@vitest/coverage-v8": "4.1.8",
+		"@vitest/coverage-v8": "5.0.0-rc.4",
 		"@vitest/eslint-plugin": "1.6.19",
-		"eslint": "10.6.0",
-		"eslint-plugin-n": "18.2.1",
-		"eslint-plugin-pnpm": "1.6.1",
-		"tsdown": "0.22.0",
+		"eslint": "10.9.0",
+		"eslint-plugin-n": "18.3.0",
+		"eslint-plugin-pnpm": "1.8.0",
+		"tsdown": "0.22.14",
 		"typescript": "6.0.3",
-		"vitest": "4.1.8"
+		"vitest": "5.0.0-rc.4"
 	},
-	"packageManager": "pnpm@11.5.2+sha512.71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916",
+	"packageManager": "pnpm@11.24.0+sha512.bd27e345e976dcb0be0b7a1228217b049a817e21b1f355c90dbe7dc46671895a8bc1e6d06c24554505ea93ea0b45f489a27ec1bfbc8de6a9659fca0f16fa0000",
 	"engines": {
 		"node": ">=24.12.0"
 	}

@@ -12,7 +12,15 @@ const wholeRunErrorSchema = type({
 });
 
 const envelopeSchema = type({
-	entries: type({
+	// Set by a task that stopped on a failing package under `--bail`: the
+	// packages it never reached have no entry, and that gap is expected rather
+	// than a broken task.
+	"bailed?": "boolean",
+	// Set by a work-stealing task that stopped with items still queued because
+	// its return envelope was full. The task pool reads it to decide whether to
+	// launch another task.
+	"deferred?": "boolean",
+	"entries": type({
 		"bannerOutput?": "string",
 		"elapsedMs?": "number",
 		"gameOutput?": "string",
@@ -21,9 +29,38 @@ const envelopeSchema = type({
 		"project?": "string",
 		"snapshotWrites?": { "[string]": "string" },
 	}).array(),
+	// Set by the run-mode coordinator when the projects ran across VM hosts:
+	// the run's game output was captured once, for the batch, so it belongs to
+	// no single project. Absent on every sequential run, including a parallel
+	// request that found no host to run on.
+	"gameOutputScope?": "'batch'",
 });
 
-export function parseEnvelope(jestOutput: string): Array<EnvelopeEntry> {
+/** One task's return envelope: what it ran, and why it stopped. */
+export interface DecodedEnvelope {
+	/** A package failed under `--bail`, so the rest were never started. */
+	bailed: boolean;
+	/**
+	 * The return envelope filled up, so another task should collect the rest.
+	 */
+	deferred: boolean;
+	entries: Array<EnvelopeEntry>;
+	/**
+	 * `"batch"` when the runner captured game output once for the whole run
+	 * rather than per project. Undefined when each entry owns its own capture.
+	 */
+	gameOutputScope?: "batch" | undefined;
+}
+
+/**
+ * Decode a task's return envelope in one pass.
+ *
+ * Both stop flags come back alongside the entries because the envelope carries
+ * the whole Jest output of every package the task ran — up to Open Cloud's
+ * 4 MiB cap — and reading a flag through its own `JSON.parse` would walk all
+ * of it a second time.
+ */
+export function decodeEnvelope(jestOutput: string): DecodedEnvelope {
 	const raw = JSON.parse(jestOutput);
 	const envelope = envelopeSchema(raw);
 	if (envelope instanceof type.errors) {
@@ -39,24 +76,49 @@ export function parseEnvelope(jestOutput: string): Array<EnvelopeEntry> {
 			parseJestOutput(jestOutput);
 		}
 
-		return [{ jestOutput }];
+		return { bailed: false, deferred: false, entries: [{ jestOutput }] };
 	}
 
-	return envelope.entries;
+	return {
+		bailed: envelope.bailed === true,
+		deferred: envelope.deferred === true,
+		entries: envelope.entries,
+		gameOutputScope: envelope.gameOutputScope,
+	};
+}
+
+export function parseEnvelope(jestOutput: string): Array<EnvelopeEntry> {
+	return decodeEnvelope(jestOutput).entries;
+}
+
+/**
+ * Whether a task stopped with queued work still outstanding.
+ *
+ * Deliberately lenient — anything malformed reads as "nothing outstanding".
+ * This runs while the task pool is still deciding whether to launch more work,
+ * so throwing here would be swallowed by the pool's per-task error handling;
+ * the strict parse that surfaces a broken task runs once the pool settles.
+ */
+export function isEnvelopeDeferred(jestOutput: string): boolean {
+	try {
+		return decodeEnvelope(jestOutput).deferred;
+	} catch {
+		return false;
+	}
 }
 
 export function buildProjectResult(
-	entry: EnvelopeEntry,
-	job: ProjectJob,
-	fallbackGameOutput: string | undefined,
-): ProjectBackendResult {
-	const {
+	{
 		bannerOutput,
 		elapsedMs,
 		gameOutput: entryGameOutput,
 		jestOutput,
 		snapshotWrites,
-	} = entry;
+	}: EnvelopeEntry,
+	job: ProjectJob,
+	fallbackGameOutput: string | undefined,
+	gameOutputScope?: "batch",
+): ProjectBackendResult {
 	const gameOutput = entryGameOutput ?? fallbackGameOutput;
 
 	let parsed;
@@ -76,7 +138,7 @@ export function buildProjectResult(
 	}
 
 	// Length check, not `??`: an empty {} from a future malformed
-	// producer must not mask a populated parsed._snapshotWrites
+	// producer must not mask a populated runner.snapshotWrites
 	// scraped from jestOutput (single-package runner.luau path).
 	const hasEntryWrites = snapshotWrites !== undefined && Object.keys(snapshotWrites).length > 0;
 
@@ -87,6 +149,7 @@ export function buildProjectResult(
 		displayName: job.displayName,
 		elapsedMs: elapsedMs ?? 0,
 		gameOutput,
+		gameOutputScope,
 		luauTiming: parsed.luauTiming,
 		perTestCoverage: parsed.perTestCoverage,
 		result: parsed.result,

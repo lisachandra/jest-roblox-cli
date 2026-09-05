@@ -13,41 +13,284 @@ function emptyResult(): CollectorResult {
 	};
 }
 
-function binaryArm(
-	beginColumn: number,
-	endColumn: number,
-): CollectorResult["branches"][number]["arms"][number] {
+function binaryArm({
+	beginColumn,
+	endColumn,
+	line = 1,
+}: {
+	beginColumn: number;
+	endColumn: number;
+	line?: number;
+}): CollectorResult["branches"][number]["arms"][number] {
 	return {
 		bodyFirstColumn: 0,
 		bodyFirstLine: 0,
-		location: { beginColumn, beginLine: 1, endColumn, endLine: 1 },
+		location: { beginColumn, beginLine: line, endColumn, endLine: line },
 	};
 }
 
-function wrap(
-	branchIndex: number,
-	armIndex: number,
-	beginColumn: number,
-	endColumn: number,
-): CollectorResult["wrapProbes"][number] {
+function wrap({
+	armIndex,
+	beginColumn,
+	branchIndex,
+	endColumn,
+	line = 1,
+}: {
+	armIndex: number;
+	beginColumn: number;
+	branchIndex: number;
+	endColumn: number;
+	line?: number;
+}): CollectorResult["wrapProbes"][number] {
 	return {
 		armIndex,
 		branchIndex,
-		exprLocation: { beginColumn, beginLine: 1, endColumn, endLine: 1 },
+		exprLocation: { beginColumn, beginLine: line, endColumn, endLine: line },
 	};
 }
 
 describe("probe-inserter", () => {
 	describe(insertProbes, () => {
-		it("should return preamble-only for empty result", () => {
+		// A file that is nothing but its directive run has nowhere to put a
+		// preamble: appended, it lands inside the comment; prepended, the
+		// directive stops opening the file. Nothing to count either, so nothing
+		// to declare.
+		it("should leave a file with no coverage sites verbatim", () => {
 			expect.assertions(3);
 
-			const source = "";
-			const result = insertProbes(source, emptyResult(), "test.luau");
+			expect(insertProbes("--!strict\n", emptyResult(), "test.luau")).toBe("--!strict\n");
+			expect(insertProbes("--!strict\n--!native\n", emptyResult(), "test.luau")).toBe(
+				"--!strict\n--!native\n",
+			);
+			expect(insertProbes("-- one\n-- two\n", emptyResult(), "test.luau")).toBe(
+				"-- one\n-- two",
+			);
+		});
+
+		it("should declare the function bucket for a file whose only sites are functions", () => {
+			expect.assertions(3);
+
+			const collector: CollectorResult = {
+				...emptyResult(),
+				functions: [
+					{
+						name: "f",
+						bodyFirstColumn: 0,
+						bodyFirstLine: 0,
+						index: 1,
+						location: { beginColumn: 1, beginLine: 1, endColumn: 4, endLine: 2 },
+					},
+				],
+			};
+
+			const result = insertProbes("local function f()\nend", collector, "test.luau");
+
+			expect(result).toContain("local __cov_f =");
+			expect(result).toContain("for __i = 1, 1 do if __cov_f");
+			expect(result).not.toContain("__cov_s[__i]");
+		});
+
+		it("should declare the branch bucket for a file whose only sites are branches", () => {
+			expect.assertions(2);
+
+			const collector: CollectorResult = {
+				...emptyResult(),
+				branches: [
+					{
+						arms: [
+							binaryArm({ beginColumn: 1, endColumn: 2 }),
+							binaryArm({ beginColumn: 3, endColumn: 4 }),
+						],
+						branchType: "expr-if",
+						index: 1,
+					},
+				],
+			};
+
+			const result = insertProbes("local x = a or b", collector, "test.luau");
+
+			expect(result).toContain("local __cov_b =");
+			expect(result).not.toContain("__cov_s[__i]");
+		});
+
+		// The one case no fixture in `test/fixtures/coverage-pipeline` covers:
+		// a leading mode directive, which the fold has to skip past. The branch
+		// count is what used to grow the shift, so it varies here too.
+		it("should keep every original line at its original line number", () => {
+			expect.assertions(2);
+
+			const source = '--!strict\nlocal a = 1\nlocal b = 2\nerror("boom")';
+			const collector: CollectorResult = {
+				...emptyResult(),
+				branches: Array.from({ length: 12 }, (_unused, index) => {
+					return {
+						arms: [
+							binaryArm({ beginColumn: 1, endColumn: 2, line: 2 }),
+							binaryArm({ beginColumn: 3, endColumn: 4, line: 2 }),
+						],
+						branchType: "expr-if" as const,
+						index: index + 1,
+					};
+				}),
+			};
+
+			const result = insertProbes(source, collector, "test.luau");
+
+			const lines = result.split("\n");
+
+			expect(lines).toHaveLength(4);
+			expect(lines[3]).toBe('error("boom")');
+		});
+
+		it("should declare only the buckets the file's sites need", () => {
+			expect.assertions(5);
+
+			const source = "local x = 1";
+			const collector: CollectorResult = {
+				...emptyResult(),
+				statements: [
+					{
+						index: 1,
+						location: { beginColumn: 1, beginLine: 1, endColumn: 12, endLine: 1 },
+					},
+				],
+			};
+
+			const result = insertProbes(source, collector, "test.luau");
 
 			expect(result).toContain("_G.__jest_roblox_cov");
 			expect(result).toContain('__cov_file_key = "test.luau"');
-			expect(result).not.toContain("for __i = 1,");
+			expect(result).not.toContain("local __cov_f =");
+			expect(result).not.toContain("local __cov_b =");
+			// Pins the statement-only preamble verbatim; the contract test below
+			// pins the shape once every bucket is in play.
+			expect(result).toMatchSnapshot();
+		});
+
+		it("should preserve the complete instrumentation contract", () => {
+			expect.assertions(2);
+
+			const source = "--!strict\nlocal x = if flag then 1 else 2";
+			const collector: CollectorResult = {
+				...emptyResult(),
+				branches: [
+					{
+						arms: [
+							binaryArm({ beginColumn: 24, endColumn: 25, line: 2 }),
+							binaryArm({ beginColumn: 31, endColumn: 32, line: 2 }),
+						],
+						branchType: "expr-if",
+						index: 1,
+					},
+				],
+				functions: [
+					{
+						name: "fixture",
+						bodyFirstColumn: 1,
+						bodyFirstLine: 2,
+						index: 1,
+						location: { beginColumn: 1, beginLine: 2, endColumn: 32, endLine: 2 },
+					},
+				],
+				statements: [
+					{
+						index: 1,
+						location: { beginColumn: 1, beginLine: 2, endColumn: 32, endLine: 2 },
+					},
+				],
+				wrapProbes: [
+					wrap({ armIndex: 1, beginColumn: 24, branchIndex: 1, endColumn: 25, line: 2 }),
+					wrap({ armIndex: 2, beginColumn: 31, branchIndex: 1, endColumn: 32, line: 2 }),
+				],
+			};
+
+			const result = insertProbes(source, collector, 'path\\to"\n\r\0file.luau');
+
+			expect(result).toStartWith("--!strict\n");
+			expect(result).toMatchSnapshot();
+		});
+
+		it("should hoist every leading mode directive above the preamble", () => {
+			expect.assertions(2);
+
+			const directives = "--!strict\n--!native\n--!optimize 2\n";
+			const result = insertProbes(`${directives}local x = 1`, emptyResult(), "test.luau");
+
+			expect(result).toStartWith(directives);
+			// Below the preamble a directive no longer opens the file, so
+			// Luau stops reading it however it is spaced.
+			expect(result.slice(directives.length)).not.toContain("--!");
+		});
+
+		it("should keep hoisting past a directive Luau does not act on", () => {
+			expect.assertions(1);
+
+			// Luau reads `--!Native` as a hot comment and ignores it, so the
+			// `--!native` behind it still opens the file and still counts.
+			const directives = "--!strict\n--!Native\n--!native\n";
+			const result = insertProbes(`${directives}local x = 1`, emptyResult(), "test.luau");
+
+			expect(result).toStartWith(directives);
+		});
+
+		it("should keep hoisting past a blank line between directives", () => {
+			expect.assertions(1);
+
+			const header = "--!strict\n\n--!native\n";
+			const result = insertProbes(`${header}local x = 1`, emptyResult(), "test.luau");
+
+			expect(result).toStartWith(header);
+		});
+
+		it("should keep hoisting past a plain comment between directives", () => {
+			expect.assertions(2);
+
+			const lineCommented = "--!strict\n-- why native\n--!native\n";
+			const blockCommented = "--!strict\n--[[ why\nnative ]]\n--!native\n";
+
+			expect(
+				insertProbes(`${lineCommented}local x = 1`, emptyResult(), "test.luau"),
+			).toStartWith(lineCommented);
+			expect(
+				insertProbes(`${blockCommented}local x = 1`, emptyResult(), "test.luau"),
+			).toStartWith(blockCommented);
+		});
+
+		it("should hoist a directive that carries leading whitespace", () => {
+			expect.assertions(1);
+
+			const header = "--!strict\n\t--!native\n";
+			const result = insertProbes(`${header}local x = 1`, emptyResult(), "test.luau");
+
+			expect(result).toStartWith(header);
+		});
+
+		it("should keep code below the preamble when a bare return splits a line", () => {
+			expect.assertions(1);
+
+			const collector: CollectorResult = {
+				...emptyResult(),
+				statements: [
+					{
+						index: 1,
+						location: { beginColumn: 11, beginLine: 1, endColumn: 22, endLine: 1 },
+					},
+				],
+			};
+
+			// Luau ends the comment at the `\r` and calls what follows code, so
+			// hoisting the whole line would put `__cov_s[1]` above its own table.
+			const result = insertProbes("--!strict\rlocal x = 1", collector, "test.luau");
+
+			expect(result).toStartWith("if _G.__jest_roblox_cov");
+		});
+
+		it("should only treat a leading mode directive as a directive", () => {
+			expect.assertions(1);
+
+			expect(insertProbes("local x = '--!strict'", emptyResult(), "test.luau")).toEndWith(
+				"local x = '--!strict'",
+			);
 		});
 
 		it("should insert statement probes before each statement", () => {
@@ -109,7 +352,7 @@ describe("probe-inserter", () => {
 		});
 
 		it("should insert branch probes at arm body first statements", () => {
-			expect.assertions(3);
+			expect.assertions(4);
 
 			const source = "if true then\n    local a = 1\nelse\n    local b = 2\nend";
 			const collector: CollectorResult = {
@@ -163,6 +406,9 @@ describe("probe-inserter", () => {
 			expect(result).toContain("__cov_b[1][1] += 1;");
 			expect(result).toContain("__cov_b[1][2] += 1;");
 			expect(result).toContain("__cov_b[1] = {0, 0}");
+			// The generated Luau is executable instrumentation, so keep its exact
+			// shape stable while the assertions document the important pieces.
+			expect(result).toMatchSnapshot();
 		});
 
 		it("should insert implicit else probes before end keyword", () => {
@@ -466,12 +712,18 @@ describe("probe-inserter", () => {
 				...emptyResult(),
 				branches: [
 					{
-						arms: [binaryArm(11, 18), binaryArm(23, 24)],
+						arms: [
+							binaryArm({ beginColumn: 11, endColumn: 18 }),
+							binaryArm({ beginColumn: 23, endColumn: 24 }),
+						],
 						branchType: "binary-expr",
 						index: 1,
 					},
 					{
-						arms: [binaryArm(11, 12), binaryArm(17, 18)],
+						arms: [
+							binaryArm({ beginColumn: 11, endColumn: 12 }),
+							binaryArm({ beginColumn: 17, endColumn: 18 }),
+						],
 						branchType: "binary-expr",
 						index: 2,
 					},
@@ -483,10 +735,10 @@ describe("probe-inserter", () => {
 					},
 				],
 				wrapProbes: [
-					wrap(1, 1, 11, 18),
-					wrap(1, 2, 23, 24),
-					wrap(2, 1, 11, 12),
-					wrap(2, 2, 17, 18),
+					wrap({ armIndex: 1, beginColumn: 11, branchIndex: 1, endColumn: 18 }),
+					wrap({ armIndex: 2, beginColumn: 23, branchIndex: 1, endColumn: 24 }),
+					wrap({ armIndex: 1, beginColumn: 11, branchIndex: 2, endColumn: 12 }),
+					wrap({ armIndex: 2, beginColumn: 17, branchIndex: 2, endColumn: 18 }),
 				],
 			};
 
@@ -510,12 +762,18 @@ describe("probe-inserter", () => {
 				...emptyResult(),
 				branches: [
 					{
-						arms: [binaryArm(11, 12), binaryArm(12, 13)],
+						arms: [
+							binaryArm({ beginColumn: 11, endColumn: 12 }),
+							binaryArm({ beginColumn: 12, endColumn: 13 }),
+						],
 						branchType: "binary-expr",
 						index: 1,
 					},
 					{
-						arms: [binaryArm(11, 12), binaryArm(6, 7)],
+						arms: [
+							binaryArm({ beginColumn: 11, endColumn: 12 }),
+							binaryArm({ beginColumn: 6, endColumn: 7 }),
+						],
 						branchType: "binary-expr",
 						index: 2,
 					},
@@ -570,7 +828,10 @@ describe("probe-inserter", () => {
 				...emptyResult(),
 				branches: [
 					{
-						arms: [binaryArm(11, 12), binaryArm(13, 14)],
+						arms: [
+							binaryArm({ beginColumn: 11, endColumn: 12 }),
+							binaryArm({ beginColumn: 13, endColumn: 14 }),
+						],
 						branchType: "binary-expr",
 						index: 1,
 					},
@@ -581,7 +842,7 @@ describe("probe-inserter", () => {
 						location: { beginColumn: 11, beginLine: 1, endColumn: 13, endLine: 1 },
 					},
 				],
-				wrapProbes: [wrap(1, 1, 11, 12)],
+				wrapProbes: [wrap({ armIndex: 1, beginColumn: 11, branchIndex: 1, endColumn: 12 })],
 			};
 
 			const result = insertProbes(source, collector, "test.luau");
@@ -646,7 +907,7 @@ describe("probe-inserter", () => {
 		});
 
 		it("should handle CRLF line endings", () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
 			const source = "local x = 1\r\nprint(x)";
 			const collector: CollectorResult = {
@@ -665,8 +926,7 @@ describe("probe-inserter", () => {
 
 			const result = insertProbes(source, collector, "test.luau");
 
-			expect(result).toContain("__cov_s[1] += 1; local x = 1");
-			expect(result).toContain("__cov_s[2] += 1; print(x)");
+			expect(result).toEndWith("__cov_s[1] += 1; local x = 1\n__cov_s[2] += 1; print(x)");
 		});
 	});
 });

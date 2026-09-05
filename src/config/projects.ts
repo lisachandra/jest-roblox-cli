@@ -1,6 +1,13 @@
 import type { Mount, PathClassifier, PathKind, RojoTreeNode } from "@isentinel/rojo-utils";
-import { collectMounts, collectPaths, findInTree, pruneAncestors } from "@isentinel/rojo-utils";
+import {
+	collectMounts,
+	collectPaths,
+	findInTree,
+	pruneAncestors,
+	resolveMountPath,
+} from "@isentinel/rojo-utils";
 
+import { type } from "arktype";
 import { loadConfig as c12LoadConfig } from "c12";
 import fs from "node:fs";
 import * as path from "node:path";
@@ -8,30 +15,36 @@ import * as path from "node:path";
 import type { TsconfigDirectories } from "../executor.ts";
 import { resolveTsconfigDirectories } from "../executor.ts";
 import { stripTsExtension } from "../utils/extensions.ts";
+import { isString } from "../utils/is-string.ts";
+import type { PosixRoot } from "../utils/normalize-windows-path.ts";
+import { toPosixRoot } from "../utils/normalize-windows-path.ts";
 import { ConfigError } from "./errors.ts";
 import { findLuauConfigFile, loadLuauConfig } from "./luau-config-loader.ts";
 import type { TypecheckConfig } from "./resolve-typecheck-config.ts";
 import type {
-	InlineProjectConfig,
+	ProjectConfigFile,
 	ProjectEntry,
 	ProjectTestConfig,
 	ResolvedConfig,
 } from "./schema.ts";
+import { projectConfigFileSchema } from "./schema.ts";
 
-const TRAILING_SLASH = /\/$/;
 const TS_OR_LUAU_EXTENSION = /\.(tsx?|luau?)$/;
+const GLOB_CHARACTER = /[*?[{]/;
 
 export interface ResolvedProjectConfig {
 	config: ResolvedConfig;
-	displayColor?: string;
+	displayColor?: string | undefined;
 	displayName: string;
 	/**
 	 * Root-prefixed `exclude` globs subtracted from Runtime Test discovery.
 	 * Optional on the public type (back-compat for external constructors);
 	 * `resolveProjectConfig` always populates it (defaulting to `[]`).
 	 */
-	exclude?: Array<string>;
-	/** Original include patterns (with TS extensions) for filesystem discovery. */
+	exclude?: Array<string> | undefined;
+	/**
+	 * Original include patterns (with TS extensions) for filesystem discovery.
+	 */
 	include: Array<string>;
 	/**
 	 * Single resolved output directory (workspace-relative). Set only when
@@ -39,27 +52,26 @@ export interface ResolvedProjectConfig {
 	 * multiple rojo mounts. Kept for back-compat; new code should consume
 	 * `rojoMounts` instead.
 	 */
-	outDir?: string;
+	outDir?: string | undefined;
 	/** DataModel paths Jest walks up from to discover test configs. */
 	projects: Array<string>;
 	/** Internal: FS↔DataModel pairs for stub generation and shadow sync. */
 	rojoMounts: Array<Mount>;
 	/** Luau-side testMatch patterns (extensions stripped). */
 	testMatch: Array<string>;
-	/** Raw per-project `test.typecheck`, merged via `resolveTypecheckConfig`. */
-	typecheck?: TypecheckConfig;
+	/**
+	 * Raw per-project `test.typecheck`, merged via `resolveTypecheckConfig`.
+	 */
+	typecheck?: TypecheckConfig | undefined;
 }
 
-export function extractStaticRoot(pattern: string): { glob: string; root: string } {
-	const globChars = new Set(["*", "?", "[", "{"]);
-	let firstGlobIndex = -1;
+export interface StaticRootPattern {
+	glob: string;
+	root: string;
+}
 
-	for (const [index, char] of [...pattern].entries()) {
-		if (globChars.has(char)) {
-			firstGlobIndex = index;
-			break;
-		}
-	}
+export function extractStaticRoot(pattern: string): StaticRootPattern {
+	const firstGlobIndex = GLOB_CHARACTER.exec(pattern)?.index ?? -1;
 
 	if (firstGlobIndex === -1) {
 		// No glob characters — treat entire pattern as root with empty glob
@@ -84,19 +96,18 @@ export function extractStaticRoot(pattern: string): { glob: string; root: string
 
 export { stripTsExtension } from "../utils/extensions.ts";
 
-export function mapFsRootToDataModel(outDirectory: string, rojoTree: RojoTreeNode): string {
-	const normalized = outDirectory.replace(TRAILING_SLASH, "");
-	const result = findInTree(rojoTree, normalized, "");
+export function mapFsRootToDataModel(outDirectory: PosixRoot, rojoTree: RojoTreeNode): string {
+	const result = findInTree(rojoTree, outDirectory, "");
 	if (result === undefined) {
 		const available: Array<string> = [];
 		collectPaths(rojoTree, available);
 
-		let message = `No Rojo tree mapping found for path: ${normalized}`;
+		let message = `No Rojo tree mapping found for path: ${outDirectory}`;
 		if (available.length > 0) {
 			message += `\n\nAvailable $path entries: ${available.join(", ")}`;
 		}
 
-		const hint = normalized.startsWith("src/")
+		const hint = outDirectory.startsWith("src/")
 			? 'Path starts with "src/" — if using roblox-ts, set "outDir" in your project config to the compiled output directory (e.g. "out/client")'
 			: undefined;
 
@@ -140,9 +151,10 @@ export function applyProjectRoot(
 }
 
 export function createFsClassifier(rootDirectory: string): PathClassifier {
-	return function classify(fsPath: string): PathKind {
-		const absolute = path.isAbsolute(fsPath) ? fsPath : path.resolve(rootDirectory, fsPath);
-		const stat = fs.statSync(absolute, { throwIfNoEntry: false });
+	return function classify(fsPath): PathKind {
+		const stat = fs.statSync(resolveMountPath(rootDirectory, fsPath), {
+			throwIfNoEntry: false,
+		});
 		if (stat === undefined) {
 			return "missing";
 		}
@@ -151,8 +163,17 @@ export function createFsClassifier(rootDirectory: string): PathClassifier {
 	};
 }
 
-export function validateProjects(projects: Array<ProjectTestConfig>): void {
+/**
+ * Check the cross-project invariants a schema cannot: names present and
+ * unique, and an `include` that survived derivation.
+ *
+ * @param projects - The project configs as loaded, before include is known.
+ * @returns The same projects, now carrying an `include`.
+ * @throws When a name is missing or duplicated, or a project selects no files.
+ */
+export function validateProjects(projects: Array<ProjectConfigFile>): Array<ProjectTestConfig> {
 	const names = new Set<string>();
+	const validated: Array<ProjectTestConfig> = [];
 
 	for (const project of projects) {
 		const name = displayNameOf(project);
@@ -167,10 +188,15 @@ export function validateProjects(projects: Array<ProjectTestConfig>): void {
 
 		names.add(name);
 
-		if (project.include.length === 0) {
+		const { include } = project;
+		if (include === undefined || include.length === 0) {
 			throw new Error(`Project "${name}" must have at least one include pattern`);
 		}
+
+		validated.push({ ...project, include });
 	}
+
+	return validated;
 }
 
 const PROJECT_ONLY_KEYS: ReadonlySet<string> = new Set([
@@ -235,33 +261,13 @@ export function resolveProjectConfig(
 export async function loadProjectConfigFile(
 	filePath: string,
 	cwd: string,
-): Promise<ProjectTestConfig> {
+): Promise<ProjectConfigFile> {
 	const luauConfigPath = findLuauConfigFile(filePath, cwd);
 	if (luauConfigPath !== undefined) {
 		return buildProjectConfigFromLuau(luauConfigPath, filePath);
 	}
 
-	let result;
-	try {
-		result = await c12LoadConfig<InlineProjectConfig | ProjectTestConfig>({
-			name: "jest-project",
-			configFile: filePath,
-			configFileRequired: true,
-			cwd,
-			dotenv: false,
-			globalRc: false,
-			omit$Keys: true,
-			packageJson: false,
-			rcFile: false,
-		});
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to load project config file ${filePath}: ${message}`, {
-			cause: err,
-		});
-	}
-
-	const config = unwrapProjectConfig(result.config);
+	const config = parseProjectConfigFile(await loadProjectConfigViaC12(filePath, cwd), filePath);
 
 	const name =
 		typeof config.displayName === "string" ? config.displayName : config.displayName.name;
@@ -283,23 +289,23 @@ export async function resolveAllProjects(
 	rojoTree: RojoTreeNode,
 	cwd: string,
 ): Promise<Array<ResolvedProjectConfig>> {
-	const projects: Array<ProjectTestConfig> = [];
+	const loaded: Array<ProjectConfigFile> = [];
 
 	for (const entry of entries) {
 		if (typeof entry === "string") {
-			projects.push(await loadProjectConfigFile(entry, cwd));
+			loaded.push(await loadProjectConfigFile(entry, cwd));
 		} else {
-			projects.push(entry.test);
+			loaded.push(entry.test);
 		}
 	}
 
-	validateProjects(projects);
+	const projects = validateProjects(loaded);
 
 	const classify = createFsClassifier(cwd);
 	return projects.map((project) => resolveProjectConfig(project, rootConfig, rojoTree, classify));
 }
 
-function displayNameOf(project: ProjectTestConfig): string {
+function displayNameOf(project: ProjectConfigFile): string {
 	return typeof project.displayName === "string" ? project.displayName : project.displayName.name;
 }
 
@@ -311,19 +317,21 @@ function mergeProjectConfig(
 	// values (excluding structural keys like include/displayName/root/outDir).
 	// `typecheck` is resolved separately via `resolveTypecheckConfig` (a layered
 	// merge), so it must not be wholesale-replaced here.
-	const merged: Record<string, unknown> = { ...rootConfig };
+	const merged: ResolvedConfig = { ...rootConfig };
 
 	for (const [key, value] of Object.entries(project)) {
-		if (!PROJECT_ONLY_KEYS.has(key) && key !== "typecheck" && value !== undefined) {
-			merged[key] = value;
+		if (value !== undefined && key !== "typecheck" && !PROJECT_ONLY_KEYS.has(key)) {
+			Reflect.set(merged, key, value);
 		}
 	}
 
-	return merged as unknown as ResolvedConfig;
+	return merged;
 }
 
-function joinProjectRoot(relativePath: string, projectRoot: string | undefined): string {
-	return projectRoot !== undefined ? path.posix.join(projectRoot, relativePath) : relativePath;
+function joinProjectRoot(relativePath: string, projectRoot: string | undefined): PosixRoot {
+	return toPosixRoot(
+		projectRoot !== undefined ? path.posix.join(projectRoot, relativePath) : relativePath,
+	);
 }
 
 function pruneAncestorMounts(mounts: Array<Mount>): Array<Mount> {
@@ -397,50 +405,56 @@ function resolveMounts(
 	return pruneAncestorMounts(dedupeMounts(allMounts));
 }
 
-function isInlineProjectConfig(config: unknown): config is InlineProjectConfig {
-	if (typeof config !== "object" || config === null || !("test" in config)) {
-		return false;
-	}
-
-	const { test } = config as { test?: unknown };
-	return typeof test === "object" && test !== null;
-}
-
-function unwrapProjectConfig(config: InlineProjectConfig | ProjectTestConfig): ProjectTestConfig {
-	if (isInlineProjectConfig(config)) {
-		return config.test;
-	}
-
-	return config;
-}
-
-function copyLuauOptionalFields(raw: Record<string, unknown>, config: ProjectTestConfig): void {
-	const record = config as unknown as Record<string, unknown>;
-
-	for (const key of LUAU_BOOLEAN_KEYS) {
-		if (typeof raw[key] === "boolean") {
-			record[key] = raw[key];
-		}
-	}
-
-	for (const key of LUAU_NUMBER_KEYS) {
-		if (typeof raw[key] === "number") {
-			record[key] = raw[key];
-		}
-	}
-
-	for (const key of LUAU_STRING_KEYS) {
-		if (typeof raw[key] === "string") {
-			record[key] = raw[key];
-		}
-	}
-
-	for (const key of LUAU_STRING_ARRAY_KEYS) {
-		if (Array.isArray(raw[key])) {
-			record[key] = raw[key];
-		}
+// c12 surfaces a resolution failure as a bare loader error; re-throw it naming
+// the config file so the user knows which project entry to fix.
+async function loadProjectConfigViaC12(filePath: string, cwd: string): Promise<unknown> {
+	try {
+		const result = await c12LoadConfig({
+			name: "jest-project",
+			configFile: filePath,
+			configFileRequired: true,
+			cwd,
+			dotenv: false,
+			globalRc: false,
+			omit$Keys: true,
+			packageJson: false,
+			rcFile: false,
+		});
+		return result.config;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to load project config file ${filePath}: ${message}`, {
+			cause: err,
+		});
 	}
 }
+
+function parseProjectConfigFile(raw: unknown, filePath: string): ProjectConfigFile {
+	const result = projectConfigFileSchema(raw);
+	if (result instanceof type.errors) {
+		throw new Error(`Invalid project config file "${filePath}": ${result.summary}`);
+	}
+
+	return result;
+}
+
+const luauProjectConfigSchema = type({
+	"+": "delete",
+	"automock?": "boolean",
+	"clearMocks?": "boolean",
+	"displayName": "string",
+	"injectGlobals?": "boolean",
+	"mockDataModel?": "boolean",
+	"resetMocks?": "boolean",
+	"resetModules?": "boolean",
+	"restoreMocks?": "boolean",
+	"setupFiles?": "string[]",
+	"setupFilesAfterEnv?": "string[]",
+	"slowTestThreshold?": "number",
+	"testEnvironment?": "string",
+	"testMatch?": "string[]",
+	"testTimeout?": "number",
+});
 
 function buildProjectConfigFromLuau(
 	luauConfigPath: string,
@@ -453,9 +467,12 @@ function buildProjectConfigFromLuau(
 		throw new Error(`Luau config file "${luauConfigPath}" must have a displayName string`);
 	}
 
-	const testMatch = Array.isArray(raw["testMatch"])
-		? (raw["testMatch"] as Array<string>)
-		: undefined;
+	const validated = luauProjectConfigSchema(raw);
+	if (validated instanceof type.errors) {
+		throw new Error(`Invalid Luau config file "${luauConfigPath}": ${validated.summary}`);
+	}
+
+	const { testMatch } = validated;
 
 	// Derive include from testMatch — append .luau extension and prefix with
 	// directory path
@@ -464,18 +481,7 @@ function buildProjectConfigFromLuau(
 			? testMatch.map((pattern) => path.posix.join(directoryPath, `${pattern}.luau`))
 			: [path.posix.join(directoryPath, "**/*.spec.luau")];
 
-	const config: ProjectTestConfig = {
-		displayName,
-		include,
-	};
-
-	if (testMatch !== undefined) {
-		config.testMatch = testMatch;
-	}
-
-	copyLuauOptionalFields(raw, config);
-
-	return config;
+	return { ...validated, include };
 }
 
 /**
@@ -485,21 +491,19 @@ function buildProjectConfigFromLuau(
  * needing the CLI-specific `include`.
  */
 function deriveIncludeFromTestMatch(
-	config: ProjectTestConfig,
+	config: ProjectConfigFile,
 	configDirectory: string,
-	tsconfig: TsconfigDirectories,
+	{ outDir, rootDir }: TsconfigDirectories,
 ): void {
-	const raw = config as unknown as Record<string, unknown>;
-
-	if (raw["include"] !== undefined) {
+	if (config.include !== undefined) {
 		return;
 	}
 
-	if (!Array.isArray(raw["testMatch"])) {
+	if (!Array.isArray(config.testMatch)) {
 		return;
 	}
 
-	config.include = (raw["testMatch"] as Array<string>).flatMap((pattern) => {
+	config.include = config.testMatch.filter(isString).flatMap((pattern) => {
 		const withExtensions = TS_OR_LUAU_EXTENSION.test(pattern)
 			? [pattern]
 			: [`${pattern}.ts`, `${pattern}.tsx`];
@@ -509,33 +513,10 @@ function deriveIncludeFromTestMatch(
 
 	// Derive outDir from tsconfig rootDir/outDir mapping so the Rojo tree
 	// mapping resolves correctly (e.g. src/shared → out/shared).
-	const { outDir, rootDir } = tsconfig;
-	if (raw["outDir"] === undefined && rootDir !== undefined && outDir !== undefined) {
+	if (rootDir !== undefined && outDir !== undefined && config.outDir === undefined) {
 		const rootPrefix = `${rootDir}/`;
 		if (configDirectory.startsWith(rootPrefix)) {
 			config.outDir = `${outDir}/${configDirectory.slice(rootPrefix.length)}`;
 		}
 	}
 }
-
-const LUAU_BOOLEAN_KEYS: ReadonlyArray<keyof ProjectTestConfig> = [
-	"automock",
-	"clearMocks",
-	"injectGlobals",
-	"mockDataModel",
-	"resetMocks",
-	"resetModules",
-	"restoreMocks",
-];
-
-const LUAU_NUMBER_KEYS: ReadonlyArray<keyof ProjectTestConfig> = [
-	"slowTestThreshold",
-	"testTimeout",
-];
-
-const LUAU_STRING_KEYS: ReadonlyArray<keyof ProjectTestConfig> = ["testEnvironment"];
-
-const LUAU_STRING_ARRAY_KEYS: ReadonlyArray<keyof ProjectTestConfig> = [
-	"setupFiles",
-	"setupFilesAfterEnv",
-];

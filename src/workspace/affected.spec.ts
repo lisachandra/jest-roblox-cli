@@ -4,9 +4,10 @@ import { vol } from "memfs";
 import * as cp from "node:child_process";
 import * as path from "node:path";
 import process from "node:process";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { getAffectedPackages } from "./affected.ts";
+import type { PackageInfo } from "./package-resolver.ts";
 
 function stubPlatform(platform: NodeJS.Platform): void {
 	const original = process.platform;
@@ -25,14 +26,14 @@ vi.mock(import("node:child_process"));
 
 const ROOT = path.resolve("/repo");
 
-type NxResolveResult = "not-found" | "schema-violation" | { root: string };
+type NxResolveResult = "non-json" | "not-found" | "schema-violation" | { root: string };
 
 function packagePathFor(name: string): string {
 	return `packages/${name.replace(/^@[^/]+\//, "")}`;
 }
 
-function seedRobloxWorkspace(names: Array<string>): Record<string, string> {
-	const entries: Record<string, string> = {
+function seedRobloxWorkspace(names: Array<string>) {
+	const entries = {
 		[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
 	};
 	for (const name of names) {
@@ -44,20 +45,11 @@ function seedRobloxWorkspace(names: Array<string>): Record<string, string> {
 	return entries;
 }
 
-function turboItem(
-	name: string,
-	relativePath: string = packagePathFor(name),
-): {
-	name: string;
-	path: string;
-} {
+function turboItem(name: string, relativePath: string = packagePathFor(name)) {
 	return { name, path: relativePath };
 }
 
-function packageInfoFor(
-	name: string,
-	relativePath: string = packagePathFor(name),
-): { name: string; packageDirectory: string } {
+function packageInfoFor(name: string, relativePath: string = packagePathFor(name)) {
 	return { name, packageDirectory: path.join(ROOT, relativePath) };
 }
 
@@ -90,10 +82,36 @@ function mockNxResponses(
 				return JSON.stringify({ name, type: "library" });
 			}
 
+			if (entry === "non-json") {
+				return "Welcome to nx!\nnot-json-at-all";
+			}
+
 			return JSON.stringify({ name, root: entry.root, type: "library" });
 		}
 
 		throw new Error(`unexpected nx args: ${args.join(" ")}`);
+	});
+}
+
+// Windows wraps the nx args in `cmd /c "<command> <quoted args>"`, so
+// `mockNxResponses`' arg-routing falls through — route on the inner `/c` string
+// instead.
+function mockWindowsNxResponses(
+	affected: Array<string>,
+	project: { name: string; root: string; type: string },
+): void {
+	vi.mocked(cp.execFileSync).mockImplementation((...callArgs) => {
+		const args = callArgs[1] ?? [];
+		const inner = typeof args[3] === "string" ? args[3] : "";
+		if (inner.includes('"projects"')) {
+			return JSON.stringify(affected);
+		}
+
+		if (inner.includes('"project"')) {
+			return JSON.stringify(project);
+		}
+
+		throw new Error(`unexpected inner: ${inner}`);
 	});
 }
 
@@ -138,13 +156,25 @@ describe(getAffectedPackages, () => {
 	});
 
 	it("should throw with a descriptive error when turbo output is not valid JSON", () => {
-		expect.assertions(1);
+		expect.assertions(2);
 
 		vol.reset();
 		vol.fromJSON({ [path.join(ROOT, "turbo.json")]: "{}" });
 		vi.mocked(cp.execFileSync).mockReturnValue("warn: cache miss\nnot-json-at-all");
 
-		expect(() => getAffectedPackages(ROOT, "main")).toThrow(/turbo returned non-JSON output/);
+		let caught: unknown;
+		try {
+			getAffectedPackages(ROOT, "main");
+		} catch (err) {
+			caught = err;
+		}
+
+		assert(caught instanceof Error);
+
+		expect(caught.message).toBe(
+			"turbo returned non-JSON output: warn: cache miss\nnot-json-at-all",
+		);
+		expect(caught.cause).toBeInstanceOf(SyntaxError);
 	});
 
 	it("should throw with a descriptive error when nx output does not match the expected schema", () => {
@@ -160,13 +190,23 @@ describe(getAffectedPackages, () => {
 	});
 
 	it("should throw with a descriptive error when nx output is not valid JSON", () => {
-		expect.assertions(1);
+		expect.assertions(2);
 
 		vol.reset();
 		vol.fromJSON({ [path.join(ROOT, "nx.json")]: "{}" });
 		vi.mocked(cp.execFileSync).mockReturnValue("not-json");
 
-		expect(() => getAffectedPackages(ROOT, "main")).toThrow(/nx returned non-JSON output/);
+		let caught: unknown;
+		try {
+			getAffectedPackages(ROOT, "main");
+		} catch (err) {
+			caught = err;
+		}
+
+		assert(caught instanceof Error);
+
+		expect(caught.message).toBe("nx returned non-JSON output: not-json");
+		expect(caught.cause).toBeInstanceOf(SyntaxError);
 	});
 
 	it("should tolerate unknown top-level fields in turbo output (e.g. packageManager)", () => {
@@ -206,14 +246,16 @@ describe(getAffectedPackages, () => {
 		vol.reset();
 		vol.fromJSON({ [path.join(ROOT, "turbo.json")]: "{}" });
 		const stderrError = Object.assign(new Error("turbo exited with code 1"), {
-			stderr: "invalid filter syntax",
+			code: "EPERM",
+			stderr: "  invalid filter syntax\n",
 		});
 		vi.mocked(cp.execFileSync).mockImplementation(() => {
 			throw stderrError;
 		});
 
-		expect(() => getAffectedPackages(ROOT, "main")).toThrow(
-			/turbo failed: invalid filter syntax/,
+		expect(() => getAffectedPackages(ROOT, "main")).toThrowWithMessage(
+			Error,
+			"turbo failed: invalid filter syntax",
 		);
 	});
 
@@ -260,12 +302,17 @@ describe(getAffectedPackages, () => {
 			throw bareError;
 		});
 
-		function act(): unknown {
-			return getAffectedPackages(ROOT, "main");
+		let caught: unknown;
+		try {
+			getAffectedPackages(ROOT, "main");
+		} catch (err) {
+			caught = err;
 		}
 
-		expect(act).toThrowWithMessage(Error, "turbo failed");
-		expect(act).toThrow(expect.objectContaining({ cause: bareError }) as Error);
+		assert(caught instanceof Error);
+
+		expect(caught.message).toBe("turbo failed");
+		expect(caught.cause).toBe(bareError);
 	});
 
 	it.for<[string, string]>([
@@ -283,7 +330,10 @@ describe(getAffectedPackages, () => {
 		vol.reset();
 		vol.fromJSON({ [path.join(ROOT, "turbo.json")]: "{}" });
 
-		expect(() => getAffectedPackages(ROOT, ref)).toThrow(/Invalid --affected-since ref/);
+		expect(() => getAffectedPackages(ROOT, ref)).toThrowWithMessage(
+			Error,
+			`Invalid --affected-since ref ${JSON.stringify(ref)}. Allowed: letters, digits, _ . / ~ ^ -.`,
+		);
 		expect(vi.mocked(cp.execFileSync)).not.toHaveBeenCalled();
 	});
 
@@ -312,7 +362,7 @@ describe(getAffectedPackages, () => {
 	});
 
 	it("should invoke cmd.exe directly with verbatim args on Windows (no shell:true to avoid DEP0190)", () => {
-		expect.assertions(4);
+		expect.assertions(5);
 
 		stubPlatform("win32");
 		vol.reset();
@@ -336,13 +386,11 @@ describe(getAffectedPackages, () => {
 			"/c",
 			'"turbo "ls" "--filter=...[main]" "--output=json""',
 		]);
-		expect(options).toMatchObject({
-			cwd: ROOT,
-			shell: false,
-			windowsHide: true,
-			windowsVerbatimArguments: true,
-		});
-		expect(options?.env?.["PATH"]).toStartWith(`${binDirectory}${path.delimiter}`);
+		expect(options).toMatchObject({ cwd: ROOT, shell: false, windowsHide: true });
+		// `ExecFileSyncOptions` does not declare the flag, so it cannot go in
+		// the literal above.
+		expect(options).toHaveProperty("windowsVerbatimArguments", true);
+		expect(options!.env!["PATH"]).toStartWith(`${binDirectory}${path.delimiter}`);
 	});
 
 	// cspell:words PATHEXT
@@ -363,7 +411,7 @@ describe(getAffectedPackages, () => {
 
 		const [, args] = vi.mocked(cp.execFileSync).mock.calls[0]!;
 
-		expect(args?.[3]).toStartWith('"turbo "');
+		expect(args![3]).toStartWith('"turbo "');
 	});
 
 	it("should preserve cmd metacharacters like ^ inside double-quoted args on Windows", () => {
@@ -378,7 +426,7 @@ describe(getAffectedPackages, () => {
 
 		const [, args] = vi.mocked(cp.execFileSync).mock.calls[0]!;
 
-		expect(args?.[3]).toContain('"--filter=...[HEAD^]"');
+		expect(args![3]).toContain('"--filter=...[HEAD^]"');
 	});
 
 	it("should resolve nx from node_modules/.bin without a shell on POSIX", () => {
@@ -568,7 +616,7 @@ describe(getAffectedPackages, () => {
 		vol.fromJSON({ [path.join(ROOT, "nx.json")]: "{}" });
 		mockNxResponses(["foo"], { foo: "schema-violation" });
 
-		function act(): unknown {
+		function act(): Array<PackageInfo> {
 			return getAffectedPackages(ROOT, "develop");
 		}
 
@@ -599,18 +647,7 @@ describe(getAffectedPackages, () => {
 		stubPlatform("linux");
 		vol.reset();
 		vol.fromJSON({ [path.join(ROOT, "nx.json")]: "{}" });
-		vi.mocked(cp.execFileSync).mockImplementation((...callArgs) => {
-			const args = callArgs[1] ?? [];
-			if (args[0] === "show" && args[1] === "projects") {
-				return JSON.stringify(["weird"]);
-			}
-
-			if (args[0] === "show" && args[1] === "project") {
-				return "Welcome to nx!\nnot-json-at-all";
-			}
-
-			throw new Error(`unexpected args: ${args.join(" ")}`);
-		});
+		mockNxResponses(["weird"], { weird: "non-json" });
 
 		expect(() => getAffectedPackages(ROOT, "develop")).toThrow(/nx show project "weird"/);
 	});
@@ -624,22 +661,7 @@ describe(getAffectedPackages, () => {
 			[path.join(ROOT, "apps/foo/jest.config.ts")]: "export default {};",
 			[path.join(ROOT, "nx.json")]: "{}",
 		});
-		// mockNxResponses can't be used here — Windows wraps the args in
-		// `cmd /c "..."` so its arg-routing falls through. Hand-mock by
-		// inspecting the inner /c string.
-		vi.mocked(cp.execFileSync).mockImplementation((...callArgs) => {
-			const args = callArgs[1] ?? [];
-			const inner = typeof args[3] === "string" ? args[3] : "";
-			if (inner.includes('"projects"')) {
-				return JSON.stringify(["foo"]);
-			}
-
-			if (inner.includes('"project"')) {
-				return JSON.stringify({ name: "foo", root: "apps/foo", type: "library" });
-			}
-
-			throw new Error(`unexpected inner: ${inner}`);
-		});
+		mockWindowsNxResponses(["foo"], { name: "foo", root: "apps/foo", type: "library" });
 
 		getAffectedPackages(ROOT, "develop");
 
@@ -650,7 +672,7 @@ describe(getAffectedPackages, () => {
 		const [perProjectFile, perProjectArgs] = calls[1]!;
 
 		expect(perProjectFile).toBe("cmd.exe");
-		expect(perProjectArgs?.[3]).toBe('"nx "show" "project" "foo" "--json""');
+		expect(perProjectArgs![3]).toBe('"nx "show" "project" "foo" "--json""');
 	});
 
 	it("should silently drop turbo items whose path no longer exists on disk", () => {
@@ -703,6 +725,24 @@ describe(getAffectedPackages, () => {
 		);
 
 		expect(getAffectedPackages(ROOT, "main")).toStrictEqual([packageInfoFor("@org/foo")]);
+	});
+
+	it("should require the whole filename to be jest.config.<ext>", () => {
+		expect.assertions(1);
+
+		vol.reset();
+		vol.fromJSON({
+			[path.join(ROOT, "packages/foo/jest.config.ts.backup")]: "export default {};",
+			[path.join(ROOT, "packages/foo/not-jest.config.ts")]: "export default {};",
+			[path.join(ROOT, "packages/foo/package.json")]: '{"name":"@org/foo"}',
+			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			[path.join(ROOT, "turbo.json")]: "{}",
+		});
+		vi.mocked(cp.execFileSync).mockReturnValue(
+			JSON.stringify({ packages: { items: [turboItem("@org/foo")] } }),
+		);
+
+		expect(getAffectedPackages(ROOT, "main")).toStrictEqual([]);
 	});
 
 	it("should drop affected packages that lack a jest.config.* marker", () => {

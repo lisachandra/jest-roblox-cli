@@ -1,9 +1,7 @@
 import { type } from "arktype";
 import * as fs from "node:fs";
-import * as path from "node:path";
-import process from "node:process";
 
-import { isErrnoException } from "../utils/errno.ts";
+import { atomicWrite } from "../utils/atomic-write.ts";
 
 export interface SourceLocation {
 	end: { column: number; line: number };
@@ -32,12 +30,20 @@ const coverageMapSchema = type({
 	"statementMap": type({ "[string]": spanSchema }),
 }).as<CoverageMap>();
 
+/**
+ * No stray sweep, unlike the package's other publishers. This runs once per
+ * covered file into the shadow mirror the same loop is filling, so the sweep's
+ * directory scan grows with that directory and repeats for every file in it —
+ * tens of microseconds each, where its caller in `instrumenter.ts` already
+ * declines to spend microseconds. A stray left here belongs to a tree the next
+ * instrumentation run rebuilds.
+ */
 export function writeCoverageMap(filePath: string, map: CoverageMap): void {
-	const directory = path.dirname(filePath);
-	fs.mkdirSync(directory, { recursive: true });
-	const temporaryPath = path.join(directory, `${path.basename(filePath)}.tmp.${process.pid}`);
-	fs.writeFileSync(temporaryPath, JSON.stringify(map, undefined, "\t"));
-	fs.renameSync(temporaryPath, filePath);
+	atomicWrite({
+		contents: JSON.stringify(map, undefined, "\t"),
+		sweepStrays: false,
+		targetPath: filePath,
+	});
 }
 
 /**
@@ -52,7 +58,7 @@ export function readCoverageMap(filePath: string): ReadCoverageMapResult {
 	try {
 		contents = fs.readFileSync(filePath, "utf-8");
 	} catch (err) {
-		if (isErrnoException(err) && err.code === "ENOENT") {
+		if (err instanceof Error && "code" in err && err.code === "ENOENT") {
 			return { kind: "missing" };
 		}
 
@@ -61,7 +67,7 @@ export function readCoverageMap(filePath: string): ReadCoverageMapResult {
 		throw err;
 	}
 
-	let parsed: unknown;
+	let parsed: JSONValue;
 	try {
 		parsed = JSON.parse(contents);
 	} catch {

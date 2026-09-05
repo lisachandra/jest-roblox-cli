@@ -1,57 +1,33 @@
+import { fromAny } from "@total-typescript/shoehorn";
+
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import process from "node:process";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { applySnapshotFormatDefaults, loadConfig, loadRawConfig, resolveConfig } from "./loader.ts";
+import { resolveUniverseAnchor } from "../coverage-pipeline/coverage-universe.ts";
+import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import { loadConfig, loadRawConfig, resolveConfig } from "./loader.ts";
 import type { Config } from "./schema.ts";
-import { DEFAULT_CONFIG } from "./schema.ts";
+import { DEFAULT_CONFIG, resolvePlaceFilePath } from "./schema.ts";
 
-describe(applySnapshotFormatDefaults, () => {
-	it("should default printBasicPrototype to true for luau project", () => {
-		expect.assertions(1);
+/**
+ * Hoisted out of the test body — the two-clause check would otherwise be a
+ * conditional inside a test.
+ */
+function isErrorWithoutNotFoundMessage(error: unknown): boolean {
+	return error instanceof Error && !error.message.includes("Config file not found");
+}
 
-		const result = applySnapshotFormatDefaults(DEFAULT_CONFIG, true);
-
-		expect(result.snapshotFormat?.printBasicPrototype).toBeTrue();
+function makeTemporaryDirectory(prefix = "config-test-"): string {
+	const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	onTestFinished(() => {
+		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 	});
 
-	it("should default printBasicPrototype to false for typescript project", () => {
-		expect.assertions(1);
-
-		const result = applySnapshotFormatDefaults(DEFAULT_CONFIG, false);
-
-		expect(result.snapshotFormat?.printBasicPrototype).toBeFalse();
-	});
-
-	it("should preserve explicit printBasicPrototype=true even for typescript project", () => {
-		expect.assertions(1);
-
-		const config = { ...DEFAULT_CONFIG, snapshotFormat: { printBasicPrototype: true } };
-		const result = applySnapshotFormatDefaults(config, false);
-
-		expect(result.snapshotFormat?.printBasicPrototype).toBeTrue();
-	});
-
-	it("should preserve explicit printBasicPrototype=false even for luau project", () => {
-		expect.assertions(1);
-
-		const config = { ...DEFAULT_CONFIG, snapshotFormat: { printBasicPrototype: false } };
-		const result = applySnapshotFormatDefaults(config, true);
-
-		expect(result.snapshotFormat?.printBasicPrototype).toBeFalse();
-	});
-
-	it("should not mutate the original config", () => {
-		expect.assertions(1);
-
-		const config = { ...DEFAULT_CONFIG };
-		applySnapshotFormatDefaults(config, true);
-
-		expect((config as Record<string, unknown>)["snapshotFormat"]).toBeUndefined();
-	});
-});
+	return temporaryDirectory;
+}
 
 describe(resolveConfig, () => {
 	it("should use defaults when no config provided", () => {
@@ -62,6 +38,15 @@ describe(resolveConfig, () => {
 		expect(result.testMatch).toStrictEqual(DEFAULT_CONFIG.testMatch);
 		expect(result.verbose).toBeFalse();
 		expect(result.silent).toBeFalse();
+	});
+
+	it("should omit artifact paths that the user did not configure", () => {
+		expect.assertions(2);
+
+		const result = resolveConfig({});
+
+		expect(result).not.toHaveProperty("gameOutput");
+		expect(result).not.toHaveProperty("outputFile");
 	});
 
 	it("should override defaults with provided config", () => {
@@ -133,7 +118,7 @@ describe(resolveConfig, () => {
 	it("should throw on invalid backend in config", () => {
 		expect.assertions(1);
 
-		const config = { backend: "not-a-backend" as string } as Config;
+		const config: Config = fromAny({ backend: "not-a-backend" });
 
 		expect(() => resolveConfig(config)).toThrow("Invalid config");
 	});
@@ -202,13 +187,14 @@ describe(resolveConfig, () => {
 	});
 });
 
-describe(loadConfig, () => {
+// The first c12 load pays jiti's cold start (~140ms), and it lands on
+// whichever test runs first, so the whole describe carries the budget.
+describe(loadConfig, { timeout: 1000 }, () => {
 	it("should return defaults when no config file found", async () => {
 		expect.assertions(2);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const result = await loadConfig(undefined, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.rootDir).toBe(temporaryDirectory);
 		expect(result.verbose).toBe(DEFAULT_CONFIG.verbose);
@@ -217,12 +203,11 @@ describe(loadConfig, () => {
 	it("should load config from explicit path", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "custom.config.mjs");
 		fs.writeFileSync(configPath, "export default { test: { verbose: true } };");
 
 		const result = await loadConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.verbose).toBeTrue();
 	});
@@ -230,91 +215,178 @@ describe(loadConfig, () => {
 	it("should default rootDir to cwd", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const result = await loadConfig(undefined, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.rootDir).toBe(temporaryDirectory);
 	});
 
 	it("should throw when explicit config path not found", async () => {
-		expect.assertions(1);
+		expect.assertions(2);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const missingPath = path.join(temporaryDirectory, "nonexistent.config.ts");
 
-		await expect(loadConfig(missingPath, temporaryDirectory)).rejects.toThrow(
-			"Config file not found",
-		);
+		const error = await loadConfig(missingPath, temporaryDirectory).catch((err) => err);
 
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
+		assert(error instanceof Error);
+
+		expect(error.message).toBe(`Config file not found: ${missingPath}`);
+		expect(error.cause).toBeInstanceOf(Error);
 	});
 
 	it("should surface parse errors without masking as not found", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		fs.writeFileSync(path.join(temporaryDirectory, "jest.config.mjs"), "export default {{{");
 
 		await expect(loadConfig(undefined, temporaryDirectory)).rejects.toSatisfy(
-			(error: unknown) =>
-				error instanceof Error && !error.message.includes("Config file not found"),
+			isErrorWithoutNotFoundMessage,
 		);
-
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 	});
 
 	it("should validate backend from config file", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		fs.writeFileSync(configPath, 'export default { backend: "not-a-backend" };');
 
 		await expect(loadConfig(configPath, temporaryDirectory)).rejects.toThrow("Invalid config");
-
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 	});
 
 	it("should reject config file with invalid port type", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		fs.writeFileSync(configPath, 'export default { port: "not-a-number" };');
 
 		await expect(loadConfig(configPath, temporaryDirectory)).rejects.toThrow("Invalid config");
-
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 	});
 
 	it("should reject config file with undeclared keys", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		// Intentional typo to test undeclared key rejection
 		// cspell:disable-next-line
 		fs.writeFileSync(configPath, 'export default { bakcend: "studio" };');
 
 		await expect(loadConfig(configPath, temporaryDirectory)).rejects.toThrow("Invalid config");
-
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 	});
 
 	it("should default rootDir to cwd even when config file is in a subdirectory", async () => {
 		expect.assertions(1);
 
-		const parentDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const parentDirectory = makeTemporaryDirectory();
 		const subdirectory = path.join(parentDirectory, "packages", "core");
 		fs.mkdirSync(subdirectory, { recursive: true });
 		const configPath = path.join(subdirectory, "jest.config.mjs");
 		fs.writeFileSync(configPath, "export default { test: { verbose: true } };");
 
 		const result = await loadConfig(configPath, parentDirectory);
-		fs.rmSync(parentDirectory, { force: true, recursive: true });
 
 		expect(path.normalize(result.rootDir)).toBe(path.normalize(parentDirectory));
+	});
+
+	it("should resolve a relative rootDir against an explicit config path", async () => {
+		expect.assertions(1);
+
+		const workspaceRoot = makeTemporaryDirectory();
+		const packageDirectory = path.join(workspaceRoot, "packages", "core");
+		fs.mkdirSync(packageDirectory, { recursive: true });
+		const configPath = path.join(packageDirectory, "jest.config.mjs");
+		fs.writeFileSync(configPath, 'export default { rootDir: "." };');
+
+		const result = await loadConfig(configPath, workspaceRoot);
+
+		expect(result.rootDir).toBe(packageDirectory);
+	});
+
+	it("should resolve a relative rootDir against the load directory", async () => {
+		expect.assertions(1);
+
+		const packageDirectory = makeTemporaryDirectory();
+		fs.writeFileSync(
+			path.join(packageDirectory, "jest.config.mjs"),
+			'export default { rootDir: "." };',
+		);
+
+		const result = await loadConfig(undefined, packageDirectory);
+
+		expect(result.rootDir).toBe(packageDirectory);
+	});
+
+	it("should anchor the expanded log paths on a relative rootDir", async () => {
+		expect.assertions(2);
+
+		const packageDirectory = makeTemporaryDirectory();
+		fs.writeFileSync(
+			path.join(packageDirectory, "jest.config.mjs"),
+			'export default { gameOutput: true, outputFile: true, rootDir: "." };',
+		);
+
+		const result = await loadConfig(undefined, packageDirectory);
+
+		expect(result.gameOutput).toBe(path.join(packageDirectory, "game-output.log"));
+		expect(result.outputFile).toBe(path.join(packageDirectory, "jest-output.log"));
+	});
+
+	it("should anchor the place file on a relative rootDir", async () => {
+		expect.assertions(1);
+
+		const packageDirectory = makeTemporaryDirectory();
+		fs.writeFileSync(
+			path.join(packageDirectory, "jest.config.mjs"),
+			'export default { placeFile: "build/test.rbxl", rootDir: "." };',
+		);
+
+		const result = await loadConfig(undefined, packageDirectory);
+
+		expect(resolvePlaceFilePath(result)).toBe(path.join(packageDirectory, "build/test.rbxl"));
+	});
+
+	it("should anchor the coverage universe on a relative rootDir", async () => {
+		expect.assertions(1);
+
+		const packageDirectory = makeTemporaryDirectory();
+		fs.writeFileSync(
+			path.join(packageDirectory, "jest.config.mjs"),
+			'export default { rootDir: "." };',
+		);
+
+		const result = await loadConfig(undefined, packageDirectory);
+		// A plain string, so the assertion can name one: the
+		// anchor is a branded PosixRoot.
+		const anchor: string = resolveUniverseAnchor(result.rootDir);
+
+		expect(anchor).toBe(normalizeWindowsPath(packageDirectory));
+	});
+
+	it("should absolutize a relative cwd when no rootDir is declared", async () => {
+		expect.assertions(1);
+
+		const result = await loadConfig(undefined, ".");
+
+		expect(result.rootDir).toBe(process.cwd());
+	});
+
+	it("should keep a rootDir that is absolute on any host", async () => {
+		expect.assertions(2);
+
+		const packageDirectory = makeTemporaryDirectory();
+		const configPath = path.join(packageDirectory, "jest.config.mjs");
+
+		fs.writeFileSync(configPath, 'export default { rootDir: "D:/repo/foo" };');
+		const windowsRoot = await loadConfig(undefined, packageDirectory);
+		fs.writeFileSync(configPath, 'export default { rootDir: "/repo/foo" };');
+		const posixRoot = await loadConfig(undefined, packageDirectory);
+
+		expect(windowsRoot.rootDir).toBe("D:/repo/foo");
+		expect(posixRoot.rootDir).toBe("/repo/foo");
 	});
 
 	// TODO: rewrite result.setupFiles → result.test.setupFiles
@@ -323,7 +395,7 @@ describe(loadConfig, () => {
 		it("should replace parent array when child uses a function value", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const parentPath = path.join(temporaryDirectory, "parent.config.mjs");
 			fs.writeFileSync(
 				parentPath,
@@ -337,7 +409,6 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(childPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.setupFiles).toStrictEqual(["child-setup.luau"]);
 		});
@@ -345,7 +416,7 @@ describe(loadConfig, () => {
 		it("should allow child function to filter parent array values", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const parentPath = path.join(temporaryDirectory, "parent.config.mjs");
 			fs.writeFileSync(
 				parentPath,
@@ -359,7 +430,6 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(childPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.setupFiles).toStrictEqual(["keep.luau"]);
 		});
@@ -367,7 +437,7 @@ describe(loadConfig, () => {
 		it("should concatenate arrays when child uses plain array (default defu behavior)", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const parentPath = path.join(temporaryDirectory, "parent.config.mjs");
 			fs.writeFileSync(
 				parentPath,
@@ -381,7 +451,6 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(childPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.setupFiles).toStrictEqual(["child-setup.luau", "parent-setup.luau"]);
 		});
@@ -389,7 +458,7 @@ describe(loadConfig, () => {
 		it("should override scalar values from parent", async () => {
 			expect.assertions(2);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const parentPath = path.join(temporaryDirectory, "parent.config.mjs");
 			fs.writeFileSync(
 				parentPath,
@@ -403,7 +472,6 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(childPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.timeout).toBe(10000);
 			expect(result.verbose).toBeTrue();
@@ -412,7 +480,7 @@ describe(loadConfig, () => {
 		it("should deep-merge nested objects like snapshotFormat", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const parentPath = path.join(temporaryDirectory, "parent.config.mjs");
 			fs.writeFileSync(
 				parentPath,
@@ -426,7 +494,6 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(childPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.snapshotFormat).toStrictEqual({ indent: 4, min: true });
 		});
@@ -434,7 +501,7 @@ describe(loadConfig, () => {
 		it("should resolve function values when config has no parent", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(
 				configPath,
@@ -442,7 +509,6 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(configPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.setupFiles).toStrictEqual(["standalone.luau"]);
 		});
@@ -450,7 +516,7 @@ describe(loadConfig, () => {
 		it("should pass empty defaults to standalone test merger functions", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(
 				configPath,
@@ -458,7 +524,6 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(configPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.setupFiles).toStrictEqual(["standalone.luau"]);
 		});
@@ -466,7 +531,7 @@ describe(loadConfig, () => {
 		it("should pass configured defaults to standalone test merger functions", async () => {
 			expect.assertions(2);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(
 				configPath,
@@ -474,16 +539,32 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(configPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.testMatch).toContain("**/*.spec.ts");
 			expect(result.testMatch).toContain("**/*.custom.ts");
 		});
 
+		it("should append to the built-in copy-ignore patterns via a merger function", async () => {
+			expect.assertions(3);
+
+			const temporaryDirectory = makeTemporaryDirectory();
+			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
+			fs.writeFileSync(
+				configPath,
+				'export default { test: { coverageCopyIgnorePatterns: defaults => [...defaults, "**/*.tsbuildinfo"] } };',
+			);
+
+			const result = await loadConfig(configPath, temporaryDirectory);
+
+			expect(result.coverageCopyIgnorePatterns).toContain("**/*.d.ts");
+			expect(result.coverageCopyIgnorePatterns).toContain("**/*.d.ts.map");
+			expect(result.coverageCopyIgnorePatterns).toContain("**/*.tsbuildinfo");
+		});
+
 		it("should pass object defaults to standalone test merger functions", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(
 				configPath,
@@ -491,29 +572,41 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(configPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.snapshotFormat).toStrictEqual({ min: true });
+		});
+
+		it("should pass an object rather than an array to object merger functions", async () => {
+			expect.assertions(1);
+
+			const temporaryDirectory = makeTemporaryDirectory();
+			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
+			fs.writeFileSync(
+				configPath,
+				"export default { test: { snapshotFormat: defaults => ({ indent: Array.isArray(defaults) ? 99 : 2 }) } };",
+			);
+
+			const result = await loadConfig(configPath, temporaryDirectory);
+
+			expect(result.snapshotFormat).toStrictEqual({ indent: 2 });
 		});
 
 		it("should reject function values for non-mergeable keys", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(configPath, 'export default { backend: () => "studio" };');
 
 			await expect(loadConfig(configPath, temporaryDirectory)).rejects.toThrow(
 				"Invalid config",
 			);
-
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 		});
 
 		it("should pass empty defaults to standalone root-level merger functions", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+			const temporaryDirectory = makeTemporaryDirectory();
 			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(
 				configPath,
@@ -521,25 +614,16 @@ describe(loadConfig, () => {
 			);
 
 			const result = await loadConfig(configPath, temporaryDirectory);
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 			expect(result.luauRoots).toStrictEqual(["child-out"]);
 		});
 	});
 
 	describe("extends across directories", () => {
-		function setupTemporaryDirectory() {
-			const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
-			onTestFinished(() => {
-				fs.rmSync(temporaryDirectory, { force: true, recursive: true });
-			});
-			return temporaryDirectory;
-		}
-
 		it("should resolve parent in workspace root from child in nested subdirectory", async () => {
 			expect.assertions(2);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.shared.mjs"),
 				"export default { timeout: 12345, test: { verbose: true } };",
@@ -561,7 +645,7 @@ describe(loadConfig, () => {
 		it("should resolve extends against config file dir, not process.cwd()", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.shared.mjs"),
 				"export default { timeout: 54321 };",
@@ -574,11 +658,9 @@ describe(loadConfig, () => {
 				'export default { extends: "../../jest.shared.mjs" };',
 			);
 
-			const originalCwd = process.cwd();
-			onTestFinished(() => {
-				process.chdir(originalCwd);
-			});
-			process.chdir(os.tmpdir());
+			// Stub rather than `process.chdir` — the latter throws under a
+			// worker-thread pool, which is what Stryker runs the suite in.
+			vi.spyOn(process, "cwd").mockReturnValue(os.tmpdir());
 
 			const result = await loadConfig(undefined, childDirectory);
 
@@ -588,7 +670,7 @@ describe(loadConfig, () => {
 		it("should resolve nested extends chain across directories", async () => {
 			expect.assertions(3);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.base.mjs"),
 				'export default { backend: "open-cloud" };',
@@ -618,7 +700,7 @@ describe(loadConfig, () => {
 		it("should load diamond extends with shared base ancestor", async () => {
 			expect.assertions(3);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "base.mjs"),
 				'export default { backend: "open-cloud" };',
@@ -646,7 +728,7 @@ describe(loadConfig, () => {
 		it("should resolve absolute extends path verbatim", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			const parentPath = path.join(temporaryDirectory, "jest.shared.mjs");
 			fs.writeFileSync(parentPath, "export default { timeout: 2222 };");
 
@@ -665,26 +747,23 @@ describe(loadConfig, () => {
 		it("should detect true cycle in extends chain", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
-			fs.writeFileSync(
-				path.join(temporaryDirectory, "a.mjs"),
-				'export default { extends: "./b.mjs" };',
-			);
-			fs.writeFileSync(
-				path.join(temporaryDirectory, "b.mjs"),
-				'export default { extends: "./a.mjs" };',
-			);
+			const temporaryDirectory = makeTemporaryDirectory();
+			const firstPath = path.join(temporaryDirectory, "a.mjs");
+			const secondPath = path.join(temporaryDirectory, "b.mjs");
+			fs.writeFileSync(firstPath, 'export default { extends: "./b.mjs" };');
+			fs.writeFileSync(secondPath, 'export default { extends: "./a.mjs" };');
 
-			await expect(
-				loadConfig(path.join(temporaryDirectory, "a.mjs"), temporaryDirectory),
-			).rejects.toThrowWithMessage(Error, /Circular extends detected/);
+			await expect(loadConfig(firstPath, temporaryDirectory)).rejects.toThrowWithMessage(
+				Error,
+				`Circular extends detected: ${firstPath} -> ${secondPath} -> ${firstPath}.`,
+			);
 		});
 
 		// cspell:disable-next-line
 		it("should resolve extensionless extends via c12 extension search", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.shared.mjs"),
 				"export default { timeout: 7777 };",
@@ -699,9 +778,9 @@ describe(loadConfig, () => {
 		});
 
 		it("should surface parent parse errors with extends context, not as 'not found'", async () => {
-			expect.assertions(4);
+			expect.assertions(3);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.shared.mjs"),
 				"export default {{{",
@@ -710,13 +789,11 @@ describe(loadConfig, () => {
 			const childPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(childPath, 'export default { extends: "./jest.shared.mjs" };');
 
-			const error = await loadConfig(childPath, temporaryDirectory).catch(
-				(err: unknown) => err,
-			);
+			const error = await loadConfig(childPath, temporaryDirectory).catch((err) => err);
 
-			expect(error).toBeInstanceOf(Error);
+			assert(error instanceof Error);
 
-			const { message } = error as Error;
+			const { message } = error;
 
 			expect(message).toContain("Failed to resolve extends");
 			expect(message).not.toContain("Config file not found");
@@ -724,24 +801,23 @@ describe(loadConfig, () => {
 		});
 
 		it("should surface explicit-path parse errors without wrapping as 'not found'", async () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 			fs.writeFileSync(configPath, "export default {{{");
 
-			const error = await loadConfig(configPath, temporaryDirectory).catch(
-				(err: unknown) => err,
-			);
+			const error = await loadConfig(configPath, temporaryDirectory).catch((err) => err);
 
-			expect(error).toBeInstanceOf(Error);
-			expect((error as Error).message).not.toContain("Config file not found");
+			assert(error instanceof Error);
+
+			expect(error.message).not.toContain("Config file not found");
 		});
 
 		it("should anchor a relative workspace.root to the declaring shared config dir", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.shared.mjs"),
 				'export default { workspace: { packages: ["packages/*"], root: "." } };',
@@ -760,13 +836,13 @@ describe(loadConfig, () => {
 			// macOS the anchored root resolves under /private/tmp; realpath the
 			// expected dir to match on symlinked-tmp hosts (a no-op where tmp is
 			// not a link).
-			expect(result.workspace?.root).toBe(fs.realpathSync(temporaryDirectory));
+			expect(result.workspace!.root).toBe(fs.realpathSync(temporaryDirectory));
 		});
 
 		it("should anchor a relative workspace.root declared without extends", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.config.mjs"),
 				'export default { workspace: { packages: ["packages/*"], root: "." } };',
@@ -776,13 +852,13 @@ describe(loadConfig, () => {
 
 			// realpath the expected dir so the assertion holds on symlinked-tmp
 			// hosts (macOS resolves the loaded config path under /private/tmp).
-			expect(result.workspace?.root).toBe(fs.realpathSync(temporaryDirectory));
+			expect(result.workspace!.root).toBe(fs.realpathSync(temporaryDirectory));
 		});
 
 		it("should leave an absolute workspace.root untouched", async () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = setupTemporaryDirectory();
+			const temporaryDirectory = makeTemporaryDirectory();
 			const absoluteRoot = path.resolve(temporaryDirectory, "elsewhere");
 			fs.writeFileSync(
 				path.join(temporaryDirectory, "jest.config.mjs"),
@@ -791,7 +867,7 @@ describe(loadConfig, () => {
 
 			const result = await loadConfig(undefined, temporaryDirectory);
 
-			expect(result.workspace?.root).toBe(absoluteRoot);
+			expect(result.workspace!.root).toBe(absoluteRoot);
 		});
 	});
 
@@ -801,7 +877,7 @@ describe(loadConfig, () => {
 		const warnings: Array<string> = [];
 		const originalWarn = console.warn;
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		// Config that calls console.warn during evaluation — simulates c12
 		// emitting a non-extend warning during config load.
@@ -818,7 +894,6 @@ describe(loadConfig, () => {
 			await loadConfig(configPath, temporaryDirectory);
 		} finally {
 			console.warn = originalWarn;
-			fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 		}
 
 		expect(warnings).toContain("some other warning");
@@ -829,12 +904,11 @@ describe(loadConfig, () => {
 
 		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.json");
 		fs.writeFileSync(configPath, JSON.stringify({ test: { verbose: true } }));
 
 		const result = await loadConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.verbose).toBeTrue();
 	});
@@ -844,12 +918,11 @@ describe(loadConfig, () => {
 
 		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		fs.writeFileSync(configPath, "export default { test: { verbose: true } };");
 
 		const result = await loadConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.verbose).toBeTrue();
 	});
@@ -859,7 +932,7 @@ describe(loadConfig, () => {
 
 		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.ts");
 		fs.writeFileSync(
 			configPath,
@@ -868,7 +941,6 @@ describe(loadConfig, () => {
 		);
 
 		const result = await loadConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.verbose).toBeTrue();
 	});
@@ -878,7 +950,7 @@ describe(loadConfig, () => {
 
 		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.mts");
 		fs.writeFileSync(
 			configPath,
@@ -887,7 +959,6 @@ describe(loadConfig, () => {
 		);
 
 		const result = await loadConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.verbose).toBeTrue();
 	});
@@ -897,7 +968,7 @@ describe(loadConfig, () => {
 
 		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.cts");
 		// `.cts` is CommonJS — native type-stripping rejects `export default` /
 		// `export =`, so a `.cts` config uses `module.exports`.
@@ -909,7 +980,6 @@ describe(loadConfig, () => {
 		);
 
 		const result = await loadConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.verbose).toBeTrue();
 	});
@@ -917,7 +987,7 @@ describe(loadConfig, () => {
 	it("should throw with clear message when extends target is missing", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory();
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		fs.writeFileSync(
 			configPath,
@@ -928,8 +998,6 @@ describe(loadConfig, () => {
 			Error,
 			/Failed to resolve extends.*does-not-exist\.mjs/,
 		);
-
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 	});
 });
 
@@ -937,14 +1005,13 @@ describe(loadRawConfig, () => {
 	it("should leave user-omitted fields undefined (no DEFAULT_CONFIG merge)", async () => {
 		expect.assertions(4);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "raw-config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory("raw-config-test-");
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		fs.writeFileSync(configPath, "export default { test: { verbose: true } };");
 
 		const result = await loadRawConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
-		expect(result.test?.verbose).toBeTrue();
+		expect(result.test!.verbose).toBeTrue();
 		expect(result.backend).toBeUndefined();
 		expect(result.color).toBeUndefined();
 		expect(result.rootDir).toBeUndefined();
@@ -953,9 +1020,8 @@ describe(loadRawConfig, () => {
 	it("should return empty object when no config file found", async () => {
 		expect.assertions(2);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "raw-config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory("raw-config-test-");
 		const result = await loadRawConfig(undefined, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
 		expect(result.backend).toBeUndefined();
 		expect(result.test).toBeUndefined();
@@ -964,20 +1030,18 @@ describe(loadRawConfig, () => {
 	it("should throw when explicit config path not found", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "raw-config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory("raw-config-test-");
 		const missingPath = path.join(temporaryDirectory, "nonexistent.config.ts");
 
 		await expect(loadRawConfig(missingPath, temporaryDirectory)).rejects.toThrow(
 			"Config file not found",
 		);
-
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 	});
 
 	it("should resolve extends chains the same as loadConfig", async () => {
 		expect.assertions(2);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "raw-config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory("raw-config-test-");
 		const parentPath = path.join(temporaryDirectory, "parent.config.mjs");
 		fs.writeFileSync(
 			parentPath,
@@ -991,16 +1055,15 @@ describe(loadRawConfig, () => {
 		);
 
 		const result = await loadRawConfig(childPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
-		expect(result.test?.setupFiles).toStrictEqual(["parent-setup.luau"]);
-		expect(result.test?.verbose).toBeTrue();
+		expect(result.test!.setupFiles).toStrictEqual(["parent-setup.luau"]);
+		expect(result.test!.verbose).toBeTrue();
 	});
 
 	it("should resolve function-valued merger fields against empty defaults", async () => {
 		expect.assertions(1);
 
-		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "raw-config-test-"));
+		const temporaryDirectory = makeTemporaryDirectory("raw-config-test-");
 		const configPath = path.join(temporaryDirectory, "jest.config.mjs");
 		fs.writeFileSync(
 			configPath,
@@ -1008,8 +1071,7 @@ describe(loadRawConfig, () => {
 		);
 
 		const result = await loadRawConfig(configPath, temporaryDirectory);
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
 
-		expect(result.test?.setupFiles).toStrictEqual(["child-setup.luau"]);
+		expect(result.test!.setupFiles).toStrictEqual(["child-setup.luau"]);
 	});
 });

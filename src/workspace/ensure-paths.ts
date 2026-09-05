@@ -1,4 +1,4 @@
-import { loadRojoProject } from "@isentinel/rojo-utils";
+import { isRojoTreeNode, loadRojoProject, resolveMountPath } from "@isentinel/rojo-utils";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -29,7 +29,7 @@ function isDirectoryPath(node: RojoTreeNode, pathValue: string): boolean {
 function collectDirectoryPaths(node: RojoTreeNode, projectDirectory: string): void {
 	for (const [key, value] of Object.entries(node)) {
 		if (key === "$path" && typeof value === "string" && isDirectoryPath(node, value)) {
-			const absolute = path.resolve(projectDirectory, value);
+			const absolute = resolveMountPath(projectDirectory, value);
 			if (!fs.existsSync(absolute)) {
 				fs.mkdirSync(absolute, { recursive: true });
 			}
@@ -37,8 +37,8 @@ function collectDirectoryPaths(node: RojoTreeNode, projectDirectory: string): vo
 			continue;
 		}
 
-		if (!key.startsWith("$") && typeof value === "object" && !Array.isArray(value)) {
-			collectDirectoryPaths(value as RojoTreeNode, projectDirectory);
+		if (isRojoTreeNode(value) && !key.startsWith("$")) {
+			collectDirectoryPaths(value, projectDirectory);
 		}
 	}
 }

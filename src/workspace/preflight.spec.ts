@@ -14,8 +14,8 @@ vi.mock(import("node:fs"), async () => {
 const ROOT = path.resolve("/repo");
 const FOO_DIR = path.join(ROOT, "packages/foo");
 
-function projectJson(json: object): string {
-	return String(JSON.stringify(json));
+function projectJson(json: JSONObject): string {
+	return JSON.stringify(json);
 }
 
 describe(validatePackages, () => {
@@ -63,8 +63,8 @@ describe(validatePackages, () => {
 		]);
 
 		expect(errors).toHaveLength(1);
-		expect(errors[0]?.package).toBe("@halcyon/foo");
-		expect(errors[0]?.reason ?? "").toMatch(/rojoProject not found/);
+		expect(errors[0]!.package).toBe("@halcyon/foo");
+		expect(errors[0]!.reason).toMatch(/rojoProject not found/);
 	});
 
 	it("should report when rojoProject fails to parse", () => {
@@ -85,8 +85,8 @@ describe(validatePackages, () => {
 		]);
 
 		expect(errors).toHaveLength(1);
-		expect(errors[0]?.package).toBe("@halcyon/foo");
-		expect(errors[0]?.reason ?? "").toMatch(/failed to parse rojoProject/);
+		expect(errors[0]!.package).toBe("@halcyon/foo");
+		expect(errors[0]!.reason).toMatch(/failed to parse rojoProject/);
 	});
 
 	it("should report each missing $path target", () => {

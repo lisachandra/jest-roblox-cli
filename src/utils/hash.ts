@@ -6,6 +6,11 @@ export function hashBuffer(data: buffer.Buffer): string {
 	return createHash("sha256").update(data).digest("hex");
 }
 
+/** SHA-256 of a string, for digests over config rather than file bytes. */
+export function hashString(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
 /**
  * SHA-256 of a file's raw bytes. The canonical helper for recording and
  * re-verifying artifact hashes — reads the file as a buffer so the digest
@@ -13,4 +18,14 @@ export function hashBuffer(data: buffer.Buffer): string {
  */
 export function hashFile(filePath: string): string {
 	return hashBuffer(fs.readFileSync(filePath));
+}
+
+/**
+ * {@link hashFile} without holding the event loop. The fingerprint passes read
+ * tens of thousands of files in a row, which is long enough that a synchronous
+ * read starves every timer in the process — the stage block's repaint among
+ * them, so a phase that spends its whole life here reports no progress at all.
+ */
+export async function hashFileAsync(filePath: string): Promise<string> {
+	return hashBuffer(await fs.promises.readFile(filePath));
 }

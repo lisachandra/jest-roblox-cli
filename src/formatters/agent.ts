@@ -1,4 +1,3 @@
-import assert from "node:assert";
 import path from "node:path";
 
 import {
@@ -6,7 +5,13 @@ import {
 	type MappedLocation,
 	type SourceMapper,
 } from "../source-mapper/index.ts";
-import { hasExecError, type JestResult, type TestCaseResult } from "../types/jest-result.ts";
+import {
+	execErrorReason,
+	type ExecErrorTestFileResult,
+	hasExecError,
+	type JestResult,
+	type TestCaseResult,
+} from "../types/jest-result.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import {
 	cleanExecErrorMessage,
@@ -15,16 +20,31 @@ import {
 	parseSourceLocation,
 	resolveDisplayPath,
 } from "./formatter.ts";
+import type { BailSummary } from "./shared.ts";
+import { createStyles } from "./styles.ts";
+import {
+	countFileBuckets,
+	countTestBuckets,
+	formatBailLine,
+	formatSummaryParts,
+	formatTestFilesLine,
+	formatTestsLine,
+	formatTypeErrorsLine,
+	type SummaryCounts,
+	type TestRowCounts,
+} from "./summary.ts";
 
 export interface AgentOptions {
-	gameOutput?: string;
-	gameOutputSize?: number;
+	/** Set when `--bail` cut the run short; see {@link BailSummary}. */
+	bail?: BailSummary | undefined;
+	gameOutput?: string | undefined;
+	gameOutputSize?: number | undefined;
 	maxFailures: number;
-	outputFile?: string;
-	outputFileSize?: number;
+	outputFile?: string | undefined;
+	outputFileSize?: number | undefined;
 	rootDir: string;
-	sourceMapper?: SourceMapper;
-	typeErrorCount?: number;
+	sourceMapper?: SourceMapper | undefined;
+	typeErrorCount?: number | undefined;
 }
 
 interface AgentProjectEntry {
@@ -34,16 +54,23 @@ interface AgentProjectEntry {
 
 type SnippetLevel = "both" | "none" | "ts-only";
 
-interface AgentProjectStats {
-	allExecErrors: Array<JestResult["testResults"][number]>;
-	totalFailed: number;
-	totalFailedFiles: number;
-	totalPassed: number;
-	totalPassedFiles: number;
-	totalPending: number;
-	totalSkippedFiles: number;
-	totalTests: number;
+interface FormatFailureMessageOptions {
+	agentOptions: AgentOptions;
+	filePath: string;
+	originalMessage: string;
+	snippetLevel: SnippetLevel;
+	test: TestCaseResult;
 }
+
+interface AgentProjectStats {
+	allExecErrors: Array<ExecErrorTestFileResult>;
+	files: SummaryCounts;
+	tests: TestRowCounts;
+}
+
+// This formatter emits plain text only, so the shared summary rows render
+// through the no-op palette rather than growing a plain-text twin.
+const PLAIN_STYLES = createStyles(false);
 
 export function formatAgent(result: JestResult, options: AgentOptions): string {
 	const lines: Array<string> = [];
@@ -51,15 +78,14 @@ export function formatAgent(result: JestResult, options: AgentOptions): string {
 	const hasFailures = result.numFailedTests > 0 || execErrors.length > 0;
 
 	if (hasFailures) {
-		lines.push(...formatFileHeaders(result, options), "");
-
 		const totalFailures = result.numFailedTests + execErrors.length;
-		lines.push(`${"⎯".repeat(3)} Failed Tests ${totalFailures} ${"⎯".repeat(3)}`, "");
-
-		if (result.numFailedTests > 0) {
-			const failureLines = formatFailures(result, result.numFailedTests, options);
-			lines.push(...failureLines);
-		}
+		lines.push(
+			...formatFileHeaders(result, options),
+			"",
+			`${"⎯".repeat(3)} Failed Tests ${totalFailures} ${"⎯".repeat(3)}`,
+			"",
+			...formatFailures(result, result.numFailedTests, options),
+		);
 
 		for (const file of execErrors) {
 			lines.push(...formatExecError(file, options));
@@ -87,7 +113,7 @@ export function formatAgentMultiProject(
 	}
 
 	const stats = collectMultiProjectStats(projects);
-	const totalFailures = stats.totalFailed + stats.allExecErrors.length;
+	const totalFailures = stats.tests.counts.failed + stats.allExecErrors.length;
 
 	if (totalFailures > 0) {
 		lines.push(...formatMultiProjectFailures(projects, stats, options));
@@ -98,56 +124,14 @@ export function formatAgentMultiProject(
 	return lines.join("\n");
 }
 
-function formatTypeErrorLabel(count: number): string {
-	if (count === 0) {
-		return "no errors";
-	}
-
-	return `${count} error${count === 1 ? "" : "s"}`;
-}
-
 function formatSummarySection(result: JestResult, options: AgentOptions): Array<string> {
-	const lines: Array<string> = [];
-
-	const failedFiles = result.testResults.filter(
-		(file) => file.numFailingTests > 0 || hasExecError(file),
-	).length;
-	const passedFiles = result.testResults.filter(
-		(file) => file.numFailingTests === 0 && !hasExecError(file),
-	).length;
-	const totalFiles = failedFiles + passedFiles;
-
-	const fileParts: Array<string> = [];
-	if (failedFiles > 0) {
-		fileParts.push(`${failedFiles} failed`);
-	}
-
-	if (passedFiles > 0) {
-		fileParts.push(`${passedFiles} passed`);
-	}
-
-	lines.push(` Test Files  ${fileParts.join(" | ")} (${totalFiles})`);
-
-	const testParts: Array<string> = [];
-
-	if (result.numFailedTests > 0) {
-		testParts.push(`${result.numFailedTests} failed`);
-	}
-
-	if (result.numPassedTests > 0) {
-		testParts.push(`${result.numPassedTests} passed`);
-	}
-
-	if (result.numPendingTests > 0) {
-		testParts.push(`${result.numPendingTests} skipped`);
-	}
-
-	const totalTests = result.numTotalTests;
-	lines.push(`      Tests  ${testParts.join(" | ")} (${totalTests})`);
+	const lines: Array<string> = [
+		formatTestFilesLine(countFileBuckets(result), PLAIN_STYLES),
+		formatTestsLine(countTestBuckets(result), PLAIN_STYLES),
+	];
 
 	if (options.typeErrorCount !== undefined) {
-		const typeLabel = formatTypeErrorLabel(options.typeErrorCount);
-		lines.push(`Type Errors  ${typeLabel}`);
+		lines.push(formatTypeErrorsLine(options.typeErrorCount, PLAIN_STYLES));
 	}
 
 	return lines;
@@ -171,7 +155,7 @@ function formatFileHeaderExecError(
 	const displayPath = resolveDisplayPath(file.testFilePath, options.sourceMapper);
 	const relativePath = makeRelative(displayPath, options.rootDir);
 
-	return [` ❯ ${relativePath} (suite failed to run)`];
+	return [` ❯ ${relativePath} (suite ${execErrorReason(file)})`];
 }
 
 function formatFileHeaderFailures(
@@ -217,18 +201,14 @@ function formatFileHeaders(result: JestResult, options: AgentOptions): Array<str
 	return lines;
 }
 
-function formatExecError(
-	file: JestResult["testResults"][number],
-	options: AgentOptions,
-): Array<string> {
+function formatExecError(file: ExecErrorTestFileResult, options: AgentOptions): Array<string> {
 	const lines: Array<string> = [];
 	const displayPath = resolveDisplayPath(file.testFilePath, options.sourceMapper);
 	const relativePath = makeRelative(displayPath, options.rootDir);
 
-	assert(file.failureMessage !== undefined, "exec error files have failureMessage");
 	const errorMessage = cleanExecErrorMessage(file.failureMessage);
 
-	lines.push(` FAIL ${relativePath}`, errorMessage);
+	lines.push(` ${file.timedOut === true ? "TIMEOUT" : "FAIL"} ${relativePath}`, errorMessage);
 
 	const hint = getExecErrorHint(errorMessage);
 	if (hint !== undefined) {
@@ -300,10 +280,8 @@ function findFailureLocation(
 	mappedLocations: Array<MappedLocation>,
 	message: string,
 ): undefined | { line: number; path: string } {
-	if (mappedLocations.length > 0) {
-		const loc = mappedLocations[0];
-		assert(loc !== undefined, "array with length > 0 has element 0");
-
+	const [loc] = mappedLocations;
+	if (loc !== undefined) {
 		if (loc.tsPath !== undefined && loc.tsLine !== undefined) {
 			return { line: loc.tsLine, path: loc.tsPath };
 		}
@@ -331,11 +309,10 @@ function formatSnippetBlock(
 }
 
 function getTsSnippets(
-	loc: MappedLocation,
+	loc: MappedLocation & { tsLine: number; tsPath: string },
 	snippetLevel: SnippetLevel,
 	rootDirectory: string,
 ): Array<string> {
-	assert(loc.tsPath !== undefined && loc.tsLine !== undefined, "caller checked ts fields");
 	const result: Array<string> = [];
 
 	const tsSnippet = formatSnippetBlock(
@@ -382,7 +359,11 @@ function getMappedSnippets(
 	rootDirectory: string,
 ): Array<string> {
 	if (loc.tsPath !== undefined && loc.tsLine !== undefined) {
-		return getTsSnippets(loc, snippetLevel, rootDirectory);
+		return getTsSnippets(
+			{ ...loc, tsLine: loc.tsLine, tsPath: loc.tsPath },
+			snippetLevel,
+			rootDirectory,
+		);
 	}
 
 	return getLuauOnlySnippet(loc);
@@ -406,10 +387,8 @@ function getFailureSnippets(
 		return [];
 	}
 
-	if (mappedLocations.length > 0) {
-		const loc = mappedLocations[0];
-		assert(loc !== undefined, "array with length > 0 has element 0");
-
+	const [loc] = mappedLocations;
+	if (loc !== undefined) {
 		return getMappedSnippets(loc, snippetLevel, rootDirectory);
 	}
 
@@ -418,6 +397,65 @@ function getFailureSnippets(
 	}
 
 	return [];
+}
+
+// The expectation detail under a failure header: a snapshot diff, an
+// expected/received pair, or the raw message when neither was parsed out.
+function buildFailureDetail(parsed: ReturnType<typeof parseErrorMessage>): Array<string> {
+	if (parsed.snapshotDiff !== undefined) {
+		return [parsed.snapshotDiff];
+	}
+
+	if (parsed.expected !== undefined && parsed.received !== undefined) {
+		return [`Expected: ${parsed.expected}`, `Received: ${parsed.received}`];
+	}
+
+	return [parsed.message];
+}
+
+// One failure message: the ` FAIL <file>:<line> > <test>` header, the
+// expectation detail (snapshot diff, expected/received pair, or the raw
+// message), the source snippets, and a trailing blank line.
+function formatFailureMessage({
+	agentOptions,
+	filePath,
+	originalMessage,
+	snippetLevel,
+	test,
+}: FormatFailureMessageOptions): Array<string> {
+	const lines: Array<string> = [];
+
+	let mappedLocations: Array<MappedLocation> = [];
+	let message = originalMessage;
+
+	if (agentOptions.sourceMapper !== undefined) {
+		({ locations: mappedLocations, message } =
+			agentOptions.sourceMapper.mapFailureWithLocations(originalMessage));
+	}
+
+	const parsed = parseErrorMessage(originalMessage);
+	const location = findFailureLocation(mappedLocations, message);
+	const relativePath = makeRelative(location?.path ?? filePath, agentOptions.rootDir);
+	const lineInfo = location?.line !== undefined ? `:${location.line}` : "";
+	const ancestors = test.ancestorTitles.length > 0 ? ` > ${test.ancestorTitles.join(" > ")}` : "";
+
+	lines.push(
+		` FAIL ${relativePath}${lineInfo}${ancestors} > ${test.title}`,
+		...buildFailureDetail(parsed),
+	);
+
+	const snippets = getFailureSnippets(
+		mappedLocations,
+		location,
+		snippetLevel,
+		agentOptions.rootDir,
+	);
+	for (const snippet of snippets) {
+		lines.push(snippet);
+	}
+
+	lines.push("");
+	return lines;
 }
 
 function formatAgentFailure(
@@ -429,42 +467,15 @@ function formatAgentFailure(
 	const lines: Array<string> = [];
 
 	for (const originalMessage of test.failureMessages) {
-		let mappedLocations: Array<MappedLocation> = [];
-		let message = originalMessage;
-
-		if (options.sourceMapper !== undefined) {
-			({ locations: mappedLocations, message } =
-				options.sourceMapper.mapFailureWithLocations(originalMessage));
-		}
-
-		const parsed = parseErrorMessage(originalMessage);
-		const location = findFailureLocation(mappedLocations, message);
-		const relativePath = makeRelative(location?.path ?? filePath, options.rootDir);
-		const lineInfo = location?.line !== undefined ? `:${location.line}` : "";
-		const ancestors =
-			test.ancestorTitles.length > 0 ? ` > ${test.ancestorTitles.join(" > ")}` : "";
-
-		lines.push(` FAIL ${relativePath}${lineInfo}${ancestors} > ${test.title}`);
-
-		if (parsed.snapshotDiff !== undefined) {
-			lines.push(parsed.snapshotDiff);
-		} else if (parsed.expected !== undefined && parsed.received !== undefined) {
-			lines.push(`Expected: ${parsed.expected}`, `Received: ${parsed.received}`);
-		} else {
-			lines.push(parsed.message);
-		}
-
-		const snippets = getFailureSnippets(
-			mappedLocations,
-			location,
-			snippetLevel,
-			options.rootDir,
+		lines.push(
+			...formatFailureMessage({
+				agentOptions: options,
+				filePath,
+				originalMessage,
+				snippetLevel,
+				test,
+			}),
 		);
-		for (const snippet of snippets) {
-			lines.push(snippet);
-		}
-
-		lines.push("");
 	}
 
 	return lines.join("\n");
@@ -499,27 +510,7 @@ function formatAgentProjectHeader(
 	const execErrors = result.testResults.filter(hasExecError);
 	const hasFailures = result.numFailedTests > 0 || execErrors.length > 0;
 
-	const failedFiles = result.testResults.filter(
-		(file) => file.numFailingTests > 0 || hasExecError(file),
-	).length;
-	const skippedFiles = result.testResults.filter(
-		(file) => file.numFailingTests === 0 && file.numPassingTests === 0 && !hasExecError(file),
-	).length;
-	const passedFiles = result.testResults.length - failedFiles - skippedFiles;
-
-	const fileParts: Array<string> = [];
-	if (passedFiles > 0) {
-		fileParts.push(`${passedFiles} passed`);
-	}
-
-	if (failedFiles > 0) {
-		fileParts.push(`${failedFiles} failed`);
-	}
-
-	if (skippedFiles > 0) {
-		fileParts.push(`${skippedFiles} skipped`);
-	}
-
+	const fileParts = formatSummaryParts(countFileBuckets(result), PLAIN_STYLES);
 	const lines = [`▶ ${displayName}  ${fileParts.join(" | ")} (${result.numTotalTests} tests)`];
 
 	if (hasFailures) {
@@ -529,34 +520,24 @@ function formatAgentProjectHeader(
 	return lines;
 }
 
+function addCounts(running: SummaryCounts, next: SummaryCounts): void {
+	running.failed += next.failed;
+	running.passed += next.passed;
+	running.skipped += next.skipped;
+}
+
 function collectMultiProjectStats(projects: Array<AgentProjectEntry>): AgentProjectStats {
 	const stats: AgentProjectStats = {
 		allExecErrors: [],
-		totalFailed: 0,
-		totalFailedFiles: 0,
-		totalPassed: 0,
-		totalPassedFiles: 0,
-		totalPending: 0,
-		totalSkippedFiles: 0,
-		totalTests: 0,
+		files: { failed: 0, passed: 0, skipped: 0 },
+		tests: { counts: { failed: 0, passed: 0, skipped: 0 }, total: 0 },
 	};
 
 	for (const { result } of projects) {
-		const failedFiles = result.testResults.filter(
-			(file) => file.numFailingTests > 0 || hasExecError(file),
-		).length;
-		const skippedFiles = result.testResults.filter(
-			(file) =>
-				file.numFailingTests === 0 && file.numPassingTests === 0 && !hasExecError(file),
-		).length;
-
-		stats.totalFailed += result.numFailedTests;
-		stats.totalPassed += result.numPassedTests;
-		stats.totalPending += result.numPendingTests;
-		stats.totalTests += result.numTotalTests;
-		stats.totalFailedFiles += failedFiles;
-		stats.totalSkippedFiles += skippedFiles;
-		stats.totalPassedFiles += result.testResults.length - failedFiles - skippedFiles;
+		const tests = countTestBuckets(result);
+		addCounts(stats.files, countFileBuckets(result));
+		addCounts(stats.tests.counts, tests.counts);
+		stats.tests.total += tests.total;
 		stats.allExecErrors.push(...result.testResults.filter(hasExecError));
 	}
 
@@ -568,7 +549,7 @@ function formatMultiProjectFailures(
 	stats: AgentProjectStats,
 	options: AgentOptions,
 ): Array<string> {
-	const totalFailures = stats.totalFailed + stats.allExecErrors.length;
+	const totalFailures = stats.tests.counts.failed + stats.allExecErrors.length;
 	const lines: Array<string> = [
 		"",
 		`${"⎯".repeat(3)} Failed Tests ${totalFailures} ${"⎯".repeat(3)}`,
@@ -594,41 +575,17 @@ function formatMultiProjectFailures(
 }
 
 function formatMultiProjectSummary(stats: AgentProjectStats, options: AgentOptions): Array<string> {
-	const lines: Array<string> = [];
-
-	const fileParts: Array<string> = [];
-	if (stats.totalFailedFiles > 0) {
-		fileParts.push(`${stats.totalFailedFiles} failed`);
-	}
-
-	if (stats.totalPassedFiles > 0) {
-		fileParts.push(`${stats.totalPassedFiles} passed`);
-	}
-
-	if (stats.totalSkippedFiles > 0) {
-		fileParts.push(`${stats.totalSkippedFiles} skipped`);
-	}
-
-	const totalFiles = stats.totalFailedFiles + stats.totalPassedFiles + stats.totalSkippedFiles;
-	lines.push(` Test Files  ${fileParts.join(" | ")} (${totalFiles})`);
-
-	const testParts: Array<string> = [];
-	if (stats.totalFailed > 0) {
-		testParts.push(`${stats.totalFailed} failed`);
-	}
-
-	if (stats.totalPassed > 0) {
-		testParts.push(`${stats.totalPassed} passed`);
-	}
-
-	if (stats.totalPending > 0) {
-		testParts.push(`${stats.totalPending} skipped`);
-	}
-
-	lines.push(`      Tests  ${testParts.join(" | ")} (${stats.totalTests})`);
+	const lines: Array<string> = [
+		formatTestFilesLine(stats.files, PLAIN_STYLES),
+		formatTestsLine(stats.tests, PLAIN_STYLES),
+	];
 
 	if (options.typeErrorCount !== undefined) {
-		lines.push(`Type Errors  ${formatTypeErrorLabel(options.typeErrorCount)}`);
+		lines.push(formatTypeErrorsLine(options.typeErrorCount, PLAIN_STYLES));
+	}
+
+	if (options.bail !== undefined) {
+		lines.push(formatBailLine(options.bail, PLAIN_STYLES));
 	}
 
 	return lines;

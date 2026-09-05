@@ -1,5 +1,35 @@
 import { readFileSync } from "node:fs";
-import { defineConfig } from "tsdown";
+import { defineConfig, type ExportsOptions } from "tsdown";
+
+import {
+	buildIstanbulHtmlAssetsModule,
+	ISTANBUL_HTML_ASSETS_ID,
+} from "./loaders/istanbul-html-assets.mjs";
+
+/**
+ * Puts istanbul's html assets in the bundle. Both builds carry them: the
+ * reporters read them from beside their own module otherwise, which only holds
+ * for an install with `node_modules` beside it.
+ */
+function istanbulHtmlAssetsPlugin() {
+	return {
+		name: "istanbul-html-assets",
+		load(id: string) {
+			if (id !== ISTANBUL_HTML_ASSETS_ID) {
+				return;
+			}
+
+			return buildIstanbulHtmlAssetsModule();
+		},
+		resolveId(id: string) {
+			if (id !== ISTANBUL_HTML_ASSETS_ID) {
+				return;
+			}
+
+			return { id, external: false };
+		},
+	};
+}
 
 function luauRawPlugin() {
 	return {
@@ -17,6 +47,10 @@ function luauRawPlugin() {
 
 // cspell:ignore giget
 const SEA_STUB_MODULES = new Set(["@typescript/native-preview", "giget", "oxc-parser"]);
+
+type ExportsMap = Parameters<
+	Extract<NonNullable<ExportsOptions["customExports"]>, (...args: never) => void>
+>[0];
 
 function seaStubPlugin() {
 	return {
@@ -38,8 +72,44 @@ function seaStubPlugin() {
 	};
 }
 
-const [major, minor] = process.versions.node.split(".").map((part) => Number(part));
-const canBuildSea = major > 25 || (major === 25 && (minor ?? 0) >= 7);
+const [majorPart, minorPart] = process.versions.node.split(".").map((part) => Number(part));
+const major = majorPart ?? 0;
+const minor = minorPart ?? 0;
+const canBuildSea = major > 25 || (major === 25 && minor >= 7);
+
+function sortExports(exportsMap: ExportsMap): ExportsMap {
+	const collator = new Intl.Collator();
+	const sorted = Object.entries(exportsMap).toSorted(([a], [b]) => {
+		if (a === ".") {
+			return -1;
+		}
+
+		if (b === ".") {
+			return 1;
+		}
+
+		return collator.compare(a, b);
+	});
+	return Object.fromEntries(sorted);
+}
+
+function isConditionalExport(entry: unknown): entry is Record<string, string> {
+	return typeof entry === "object" && entry !== null;
+}
+
+// tsdown derives `.` from the `src/index.ts` entry. Both subpaths ship the same
+// dist chunk, but their `source` conditions differ: `.` resolves to the slim
+// `source.ts` barrel so a workspace consumer typechecking from source never
+// pulls the CLI's `.luau` graph, and `./artifacts` opts into the full producer
+// API (`prepareArtifacts`, `loadConfig`, …) for the consumers that need it.
+function customizeExports(exportsMap: ExportsMap): ExportsMap {
+	const root: unknown = exportsMap["."];
+	return sortExports({
+		...exportsMap,
+		".": isConditionalExport(root) ? { ...root, source: "./src/source.ts" } : root,
+		"./artifacts": root,
+	});
+}
 
 export default defineConfig([
 	{
@@ -63,9 +133,14 @@ export default defineConfig([
 			tsconfig: "tsconfig.lib.json",
 		},
 		entry: ["src/index.ts", "src/cli.ts", "!src/**/*.spec.ts"],
+		exports: {
+			customExports: customizeExports,
+			devExports: "source",
+			inlinedDependencies: false,
+		},
 		fixedExtension: true,
 		format: ["esm"],
-		plugins: [luauRawPlugin()],
+		plugins: [istanbulHtmlAssetsPlugin(), luauRawPlugin()],
 		publint: true,
 		shims: true,
 		target: ["node24"],
@@ -84,9 +159,9 @@ export default defineConfig([
 							useCodeCache: true,
 						},
 					},
-					format: ["cjs"],
+					format: ["cjs" as const],
 					outDir: "dist/sea",
-					plugins: [seaStubPlugin(), luauRawPlugin()],
+					plugins: [istanbulHtmlAssetsPlugin(), seaStubPlugin(), luauRawPlugin()],
 					shims: true,
 					target: ["node25"],
 				},

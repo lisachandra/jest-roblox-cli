@@ -11,22 +11,32 @@ words:
   - buildid
   - compoundassign
   - covmap
+  - debugname
   - defu
   - difftime
+  - dndebug
   - doublestar
   - elseBlock
   - elseExpr
+  - elsebody
   - elseifs
+  - emcc
+  - emscripten
+  - emsdk
+  - emxx
   - endcolumn
   - fmod
   - foreachi
   - frexp
+  - fwasm
   - getmetatable
   - getn
   - gmatch
   - gsub
   - highlightjs
   - indexexpr
+  - injective
+  - instrumentability
   - instrumentable
   - instrumenter
   - interp
@@ -40,9 +50,14 @@ words:
   - maxn
   - misresolution
   - modf
+  - mountless
   - newproxy
+  - normalised
   - ocale
+  - oxlint
   - pcall
+  - pnpmfile
+  - pnpmfiles
   - randomseed
   - rawequal
   - rawget
@@ -50,6 +65,8 @@ words:
   - rawset
   - rbxl
   - rbxlx
+  - rbxm
+  - rbxmx
   - recognised
   - rhsOperand
   - rojo
@@ -58,11 +75,15 @@ words:
   - statlocalfunction
   - thenBlock
   - thenExpr
+  - thenbody
   - typealias
   - typeassertion
   - typefunction
   - uncompiled
   - unmappable
+  - unparseable
+  - unprobed
+  - unrecognised
   - unstub
   - upgraders
   - vararg

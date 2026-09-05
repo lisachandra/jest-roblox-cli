@@ -2,41 +2,73 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { NOOP_TIMING_COLLECTOR, type TimingCollector } from "../timing/orchestration-collector.ts";
-import { hashBuffer } from "../utils/hash.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import { hashBuffer, hashFile } from "../utils/hash.ts";
+import type { PosixRoot } from "../utils/normalize-windows-path.ts";
+import {
+	normalizeWindowsPath,
+	relativeToRoot,
+	underRoot,
+} from "../utils/normalize-windows-path.ts";
+import type { CopyIgnoreMatcher, RootFiles } from "./discover-files.ts";
+import {
+	discoverRootFiles,
+	isInstrumentableFile,
+	isSkippedDirectory,
+	walkLuauDirectory,
+} from "./discover-files.ts";
+import type { InstrumentUniverse } from "./instrument-universe.ts";
 import { instrumentRoot } from "./instrumenter.ts";
 import type {
 	CoverageManifest,
 	InstrumentedFileRecord,
 	NonInstrumentedFileRecord,
 } from "./manifest.ts";
+import {
+	clearDirectoryAtFilePath,
+	createShadowDirectory,
+	shadowHoldsFile,
+} from "./shadow-entry.ts";
+
+export { isNonInstrumentedFile } from "./discover-files.ts";
 
 /**
- * Suffixes for files that are not instrumented for coverage but still need
- * syncing to the shadow directory. Matches parse-ast.luau:131-139.
+ * Does a `beforeBuild` bake own this shadow path?
+ *
+ * A bake writes into the shadow once the mirror has already run, so what it
+ * writes has no counterpart in the source root and every orphan sweep reads it
+ * as one. Deleting it would only be undone by the bake moments later, with the
+ * delete and the rewrite both reporting a change — a place rebuilt on every
+ * run and a buildId that never settles. So a bake declares what it owns and
+ * sweeps its own stale entries; a run without one declares nothing, and the
+ * sweeps clear whatever an earlier bake left in a shared shadow.
  */
-const NON_INSTRUMENTED_SUFFIXES = [
-	".spec.luau",
-	".test.luau",
-	".spec.lua",
-	".test.lua",
-	".snap.luau",
-	".snap.lua",
-] as const;
+export type BakeOwnershipMatcher = (shadowPath: string) => boolean;
 
 export interface PrepareShadowRootOptions {
-	luauRoot: string;
-	previousManifest?: CoverageManifest;
+	/**
+	 * Shadow entries a `beforeBuild` bake writes and sweeps for itself, which
+	 * the reconcile therefore leaves alone. Absent exempts nothing.
+	 */
+	isBakeOwned?: BakeOwnershipMatcher | undefined;
+	/** Paths this root's shadow never carries, relative to `luauRoot`. */
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoot: PosixRoot;
+	previousManifest?: CoverageManifest | undefined;
 	shadowDir: string;
 	/** Orchestration profiler forwarded to `instrumentRoot`. */
-	timing?: TimingCollector;
+	timing?: TimingCollector | undefined;
+	/**
+	 * Narrows which prod files get probes. Absent means the whole root, which
+	 * is what a config without `collectCoverageFrom` asks for.
+	 */
+	universe?: InstrumentUniverse | undefined;
 	useIncremental: boolean;
 }
 
 export interface ShadowRootResult {
 	changed: boolean;
 	files: Record<string, InstrumentedFileRecord>;
-	luauRoot: string;
+	luauRoot: PosixRoot;
 	nonInstrumentedFiles: Record<string, NonInstrumentedFileRecord>;
 	shadowDir: string;
 }
@@ -47,115 +79,257 @@ interface SyncResult {
 }
 
 interface FullCacheOptions {
-	luauRoot: string;
+	excluded: Set<string>;
+	isBakeOwned: BakeOwnershipMatcher | undefined;
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoot: PosixRoot;
 	previousManifest: CoverageManifest;
-	shadowDirectory: string;
+	shadowDir: string;
 	skipFiles: Set<string>;
 }
 
-export function isNonInstrumentedFile(filename: string): boolean {
-	return NON_INSTRUMENTED_SUFFIXES.some((suffix) => filename.endsWith(suffix));
+/** What the reconcile needs of one root, before it names the shadow tree. */
+interface ReconcileOptions {
+	isBakeOwned: BakeOwnershipMatcher | undefined;
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoot: PosixRoot;
+	shadowDir: string;
+}
+
+interface IncrementalPlan {
+	/**
+	 * Populated only on a full cache hit — every file in this root was
+	 * unchanged, so the caller returns this verbatim without instrumenting.
+	 */
+	fullCacheResult?: ShadowRootResult | undefined;
+	/** Previously-instrumented files were deleted or modified. */
+	hasChanged: boolean;
+	/** Relative paths the instrumenter can skip; undefined on a cold run. */
+	skipFiles: Set<string> | undefined;
+}
+
+interface IncrementalState {
+	allCached: boolean;
+	changed: boolean;
+	skipFiles: Set<string>;
+}
+
+/** What the incremental decision reads out of `PrepareShadowRootOptions`. */
+interface IncrementalStateInputs {
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoot: PosixRoot;
+	previousManifest: CoverageManifest;
+}
+
+/** What one root's mirror pass needs to decide and record each copy. */
+interface SyncNonInstrumentedOptions {
+	/** Prod files the universe denied probes, keyed relative to the root. */
+	excluded: Set<string>;
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoot: PosixRoot;
+	previousNonInstrumented: Record<string, NonInstrumentedFileRecord> | undefined;
+	shadowDir: string;
+}
+
+/** One root's mirror walk: where it reads from and where it writes to. */
+interface MirrorSourceTreeOptions {
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoot: PosixRoot;
+	shadowDirectory: string;
+}
+
+/** What one root's mirror walk found, and what it made on the way. */
+interface MirroredTree {
+	/**
+	 * Whether any shadow directory had to be created. A warm run reads this
+	 * as "a directory appeared upstream", which the place has to be rebuilt
+	 * around.
+	 */
+	hasCreatedDirectory: boolean;
+	/** Paths, relative to the root, the shadow carries verbatim. */
+	syncPaths: Array<string>;
+}
+
+/** What one entry of an orphaned subtree left behind. */
+interface OrphanSweep {
+	hasDeleted: boolean;
+	/** Whether the entry itself is gone, which is what frees its parent. */
+	wasRemoved: boolean;
+}
+
+/** What the reconcile walk holds constant across the whole tree. */
+interface PruneContext {
+	isBakeOwned: BakeOwnershipMatcher | undefined;
+	isCopyIgnored: CopyIgnoreMatcher;
+	luauRoot: PosixRoot;
+	/** Shadow root every relative path is keyed from, POSIX-normalized. */
+	shadowRoot: string;
+}
+
+interface InstrumentedFiles {
+	allFiles: Record<string, InstrumentedFileRecord>;
+	changed: boolean;
 }
 
 /**
- * Fast directory walk to discover instrumentable .luau/.lua files.
- * Must match parse-ast.luau's discoverFiles logic (same skip rules).
- */
-export function discoverInstrumentableFiles(luauRoot: string): Set<string> {
-	const posixRoot = normalizeWindowsPath(luauRoot);
-	const results: Array<string> = [];
-	walkLuauDirectory(posixRoot, posixRoot, isInstrumentableFile, results);
-	return new Set(results);
-}
-
-/**
- * Populate a shadow dir from one luauRoot: bulk-copy every file (cold path),
- * run the instrumenter to overlay instrumented prod files, then sync the files
- * the instrumenter never emits (spec/test/snap plus non-luau rojo files) with
- * hash-tracked records so the shadow is a complete mirror that satisfies rojo +
- * testMatch.
+ * Populate a shadow dir from one luauRoot: run the instrumenter to write the
+ * instrumented prod twins, then sync everything it never emits (spec/test/snap
+ * plus non-luau rojo files) with hash-tracked records, so the shadow is a
+ * complete mirror that satisfies rojo + testMatch.
+ *
+ * Between them those two passes write every file the shadow carries, so no
+ * pass copies the root wholesale. Directories are what neither reaches, and
+ * the sync mirrors those as it walks.
  *
  * On a warm run (cache hit) only changed files are re-instrumented, and the
  * shadow is reconciled against source so files deleted upstream don't linger.
  */
 export function prepareShadowRoot(options: PrepareShadowRootOptions): ShadowRootResult {
-	const { luauRoot, previousManifest, shadowDir, useIncremental } = options;
+	const { luauRoot, shadowDir } = options;
 	const timing = options.timing ?? NOOP_TIMING_COLLECTOR;
-	let changed = false;
 
-	if (!useIncremental) {
-		fs.mkdirSync(shadowDir, { recursive: true });
-		fs.cpSync(luauRoot, shadowDir, { recursive: true });
+	const rootFiles = splitRootFiles(options);
+	const plan = planIncremental(options, rootFiles);
+	if (plan.fullCacheResult !== undefined) {
+		return plan.fullCacheResult;
 	}
 
-	let skipFiles: Set<string> | undefined;
-
-	if (useIncremental && previousManifest !== undefined) {
-		const {
-			allCached,
-			changed: hasChanges,
-			skipFiles: computed,
-		} = computeIncrementalState(luauRoot, previousManifest);
-		skipFiles = computed;
-		changed = hasChanges;
-
-		if (allCached) {
-			return buildFullCacheResult({
-				luauRoot,
-				previousManifest,
-				shadowDirectory: shadowDir,
-				skipFiles,
-			});
-		}
-	}
-
-	const files = instrumentRoot({
-		luauRoot,
-		shadowDir,
-		skipFiles,
+	const excluded = rootFiles?.excluded ?? NO_EXCLUSIONS;
+	const { allFiles, changed: hasInstrumented } = instrumentChangedFiles(
+		options,
+		excluded,
+		plan.skipFiles,
 		timing,
-	});
-
-	if (Object.keys(files).length > 0) {
-		changed = true;
-	}
-
-	const allFiles: Record<string, InstrumentedFileRecord> = { ...files };
-
-	if (useIncremental && previousManifest !== undefined && skipFiles !== undefined) {
-		carryForwardRecords(luauRoot, previousManifest, allFiles, skipFiles);
-	}
-
-	const syncResult = syncNonInstrumentedFiles(
-		luauRoot,
-		shadowDir,
-		previousManifest?.nonInstrumentedFiles,
 	);
-
-	if (syncResult.changed) {
-		changed = true;
-	}
-
-	if (useIncremental && reconcileShadowToSource(luauRoot, shadowDir)) {
-		changed = true;
-	}
+	const mirror = mirrorUntouchedFiles(options, excluded);
 
 	return {
-		changed,
+		changed: plan.hasChanged || hasInstrumented || mirror.changed,
 		files: allFiles,
 		luauRoot,
-		nonInstrumentedFiles: syncResult.files,
+		nonInstrumentedFiles: mirror.files,
 		shadowDir,
 	};
 }
 
+/**
+ * Bring everything the instrumenter never emits into the shadow — spec/test/
+ * snap files, non-luau rojo files, and the prod files the universe excluded —
+ * then drop shadow entries whose source is gone.
+ *
+ * The reconcile is called outside the `||` so its cleanup side effect runs even
+ * when the sync already flagged a change.
+ */
+function mirrorUntouchedFiles(
+	{
+		isBakeOwned,
+		isCopyIgnored,
+		luauRoot,
+		previousManifest,
+		shadowDir,
+		useIncremental,
+	}: PrepareShadowRootOptions,
+	excluded: Set<string>,
+): SyncResult {
+	const synced = syncNonInstrumentedFiles({
+		excluded,
+		isCopyIgnored,
+		luauRoot,
+		previousNonInstrumented: previousManifest?.nonInstrumentedFiles,
+		shadowDir,
+	});
+	const hasReconciled =
+		useIncremental &&
+		reconcileShadowToSource({ isBakeOwned, isCopyIgnored, luauRoot, shadowDir });
+	return { changed: synced.changed || hasReconciled, files: synced.files };
+}
+
+/**
+ * The universe split, walked only when this run has a universe at all.
+ *
+ * Only a run that narrows needs it up front, to know what to mirror. Without
+ * one nothing is excluded, and the instrumentable set is read on a single
+ * branch of the plan — so `rootFiles` stays absent and that branch walks for
+ * itself, rather than every run paying a full readdir for a discarded result.
+ */
+function splitRootFiles({
+	isCopyIgnored,
+	luauRoot,
+	universe,
+}: PrepareShadowRootOptions): RootFiles | undefined {
+	return universe === undefined
+		? undefined
+		: discoverRootFiles(luauRoot, { isCopyIgnored, universe });
+}
+
+/** Shared empty set for a run that narrows nothing — only ever read. */
+const NO_EXCLUSIONS = new Set<string>();
+
 const COV_MAP_SUFFIX = ".cov-map.json";
+
+/**
+ * Mirror one file into the shadow, or carry its previous record forward.
+ *
+ * The carry-forward wants a matching source hash AND a record naming the very
+ * path this call would write AND a file still there: a partial cleanup or an
+ * interrupted run can leave the record valid on paper while the file it names
+ * is gone — or replaced by a directory, which is the same lie told the other
+ * way round — and a record from a run that mirrored this file somewhere else
+ * proves nothing about the path we mirror it to now.
+ *
+ * One read serves both jobs. The hash decides whether the copy is needed, and
+ * when it is, the bytes are already in hand — `copyFileSync` would open and
+ * read the same file a second time. The directory above `shadowPath` belongs to
+ * whichever pass owns the tree: the mirror walk creates every directory it
+ * enters, and the spine mirror creates the level it is about to fill.
+ *
+ * Exported for that spine mirror, which copies the loose files of the
+ * directories above a narrowed root: one owner for "a verbatim file in the
+ * shadow, with the record that decides whether to copy it again".
+ */
+export function syncOneFile(
+	sourcePath: string,
+	shadowPath: string,
+	previousRecord: NonInstrumentedFileRecord | undefined,
+): NonInstrumentedFileRecord {
+	const contents = fs.readFileSync(path.resolve(sourcePath));
+	const currentHash = hashBuffer(contents);
+	if (
+		previousRecord?.sourceHash === currentHash &&
+		previousRecord.shadowPath === shadowPath &&
+		shadowHoldsFile(shadowPath)
+	) {
+		return previousRecord;
+	}
+
+	clearDirectoryAtFilePath(shadowPath);
+	fs.writeFileSync(shadowPath, contents);
+
+	return { shadowPath, sourceHash: currentHash, sourcePath };
+}
+
+/**
+ * Best-effort deletion: something we cannot remove stays put rather than being
+ * reported as gone, so the caller never rebuilds the place over a lie.
+ *
+ * Exported for the spine prune, which clears the same shadow under the same
+ * contract.
+ */
+export function tryRemove(deleteEntry: () => void): boolean {
+	let wasRemoved = false;
+	try {
+		deleteEntry();
+		wasRemoved = true;
+	} catch {}
+
+	return wasRemoved;
+}
 
 /**
  * Does the source file backing a shadow entry still exist? A `.cov-map.json`
  * sidecar has no direct twin — it is keyed to its base `.luau`/`.lua`.
  */
-function sourceTwinExists(luauRoot: string, relativePath: string): boolean {
+function sourceTwinExists(luauRoot: PosixRoot, relativePath: string): boolean {
 	if (relativePath.endsWith(COV_MAP_SUFFIX)) {
 		const base = relativePath.slice(0, -COV_MAP_SUFFIX.length);
 		return (
@@ -167,80 +341,188 @@ function sourceTwinExists(luauRoot: string, relativePath: string): boolean {
 	return fs.existsSync(path.resolve(luauRoot, relativePath));
 }
 
-/**
- * Shared directory walker. Skips node_modules and dot-prefixed directories —
- * matching parse-ast.luau:113-147.
- * `predicate` receives the entry name and returns true to collect the file.
- */
-function walkLuauDirectory(
-	directory: string,
-	relativeTo: string,
-	predicate: (name: string) => boolean,
-	results: Array<string>,
-): void {
-	const entries = fs.readdirSync(directory, { withFileTypes: true });
-	for (const entry of entries) {
-		const fullPath = normalizeWindowsPath(path.join(directory, entry.name));
-		if (entry.isDirectory()) {
-			if (entry.name === "node_modules") {
-				continue;
-			}
-
-			if (entry.name.startsWith(".")) {
-				continue;
-			}
-
-			walkLuauDirectory(fullPath, relativeTo, predicate, results);
-		} else if (predicate(entry.name)) {
-			const relative = fullPath.slice(relativeTo.length + 1);
-			results.push(relative);
-		}
-	}
+//
+// Reconcile a warm shadow dir against its source root: drop every shadow entry
+// whose source counterpart no longer exists. One rule covers files and
+// directories alike, so a warm run converges on what a cold run would have
+// produced.
+//
+// Files are the common case, across every category the pipeline manages —
+// instrumented prod `.luau`, spec/test/snap, and non-luau rojo files
+// (`init.meta.json`, `*.model.json`, …). Diffing against source (rather than a
+// recorded file set) means a file category the sync never tracked still gets
+// cleaned up, so a stale `init.meta.json` cannot survive into the rojo build
+// and fail it. `.cov-map.json` sidecars are instrumenter output with no 1:1
+// source twin; they map back to their base `.luau`/`.lua`.
+//
+// Directories matter for one shape rojo cannot tolerate: a `foo/index.ts` ->
+// `foo.ts` rename leaves the shadow holding a stale `foo/` beside the fresh
+// `foo.luau`, which rojo mounts as a Folder and a ModuleScript both named `foo`
+// under one parent. An empty *source* directory is legitimate — a cold run
+// mirrors it and rojo makes a Folder — so a directory is judged on whether its
+// source counterpart exists, never on whether it still holds anything.
+//
+// The one exception is a generated `jest.config.luau` on a run whose
+// `beforeBuild` bakes them: those are copied in from the cache root after this
+// walk, so they have no source twin by design and the bake sweeps its own.
+//
+// Returns whether anything was removed, so the caller forces a place rebuild.
+//
+// Both callers run the mirror sync first, and that creates the shadow root
+// before anything else, so the walk below always has a directory to read.
+//
+function reconcileShadowToSource({
+	isBakeOwned,
+	isCopyIgnored,
+	luauRoot,
+	shadowDir,
+}: ReconcileOptions): boolean {
+	const shadowRoot = normalizeWindowsPath(shadowDir);
+	return pruneShadowDirectory({ isBakeOwned, isCopyIgnored, luauRoot, shadowRoot }, shadowRoot);
 }
 
-/**
- * Reconcile a warm shadow dir against its source root: unlink every shadow file
- * whose source no longer exists. This is the warm-run deletion mechanism across
- * every file category the pipeline manages — instrumented prod `.luau`,
- * spec/test/snap, and non-luau rojo files (`init.meta.json`, `*.model.json`, …)
- * alike. Diffing against source (rather than a recorded file set) means a file
- * category the sync never tracked still gets cleaned up, so a stale
- * `init.meta.json` can't survive into the rojo build and fail it. It walks with
- * the same scope as the rest of the pipeline (`walkLuauDirectory` skips
- * `node_modules`/dot-dirs); vendored content under those dirs is governed by
- * `rojoInputsHash` instead, which forces a cold rebuild when it changes.
- * `.cov-map.json` sidecars are instrumenter output with no 1:1 source twin;
- * they map back to their base `.luau`/`.lua`. Returns whether anything was
- * removed, so the caller forces a place rebuild.
- */
-function reconcileShadowToSource(luauRoot: string, shadowDirectory: string): boolean {
-	if (!fs.existsSync(shadowDirectory)) {
+function isInstrumenterOutput(relativePath: string): boolean {
+	return relativePath.endsWith(COV_MAP_SUFFIX);
+}
+
+function pruneOrphanFile(
+	{ isBakeOwned, isCopyIgnored, luauRoot }: PruneContext,
+	relativePath: string,
+	shadowPath: string,
+): boolean {
+	// An ignored path is judged on the pattern, not on its twin: its source is
+	// still on disk, so the twin check would keep every copy a shadow seeded
+	// before the pattern existed. Deciding it here is what lets a warm tree shed
+	// them on the run that adds a pattern rather than on the next cold rebuild.
+	//
+	// A `.cov-map.json` is exempt, for the reason `shouldSyncToShadow` passes
+	// over it too: the list governs what gets copied, and a sidecar was never
+	// copied — the instrumenter wrote it. Judging it by the list would let a
+	// pattern like `**/*.json` delete the sidecar of a module the same run just
+	// probed, and the report skips a record whose map is gone, so that module
+	// silently vanishes from coverage. Only the twin check applies to it, which
+	// is what still clears a sidecar whose module is gone.
+	if (
+		(isInstrumenterOutput(relativePath) || !isCopyIgnored(relativePath)) &&
+		sourceTwinExists(luauRoot, relativePath)
+	) {
 		return false;
 	}
 
-	const posixShadow = normalizeWindowsPath(shadowDirectory);
-	const shadowFiles: Array<string> = [];
-	walkLuauDirectory(posixShadow, posixShadow, () => true, shadowFiles);
+	// Asked only of what already reads as an orphan, which is the whole of what
+	// a bake writes. See {@link BakeOwnershipMatcher}.
+	if (isBakeOwned?.(shadowPath) === true) {
+		return false;
+	}
 
-	let deleted = false;
-	for (const relativePath of shadowFiles) {
-		if (sourceTwinExists(luauRoot, relativePath)) {
+	return tryRemove(() => {
+		fs.unlinkSync(shadowPath);
+	});
+}
+
+function pruneShadowDirectory(context: PruneContext, directory: string): boolean {
+	const entries = fs.readdirSync(directory, { withFileTypes: true });
+	let hasDeleted = false;
+
+	for (const entry of entries) {
+		// Never descend into these — no other walk in this file does either.
+		// Their fate rides on the parent directory's own source, so passing over
+		// them here cannot strand an orphaned parent.
+		if (entry.isDirectory() && isSkippedDirectory(entry.name)) {
 			continue;
 		}
 
-		try {
-			fs.unlinkSync(path.resolve(shadowDirectory, relativePath));
-			deleted = true;
-		} catch {
-			// Best-effort cleanup
+		const shadowPath = normalizeWindowsPath(path.join(directory, entry.name));
+		const relativePath = shadowPath.slice(context.shadowRoot.length + 1);
+		const wasRemoved = entry.isDirectory()
+			? pruneChildDirectory(context, relativePath, shadowPath)
+			: pruneOrphanFile(context, relativePath, shadowPath);
+
+		if (wasRemoved) {
+			hasDeleted = true;
 		}
 	}
 
-	return deleted;
+	return hasDeleted;
 }
 
-function isInstrumentableFile(name: string): boolean {
-	return (name.endsWith(".luau") || name.endsWith(".lua")) && !isNonInstrumentedFile(name);
+/** Ownership is the only question an orphaned parent leaves a file. */
+function pruneOrphanLeaf(isBakeOwned: BakeOwnershipMatcher, shadowPath: string): OrphanSweep {
+	if (isBakeOwned(shadowPath)) {
+		return { hasDeleted: false, wasRemoved: false };
+	}
+
+	const wasRemoved = tryRemove(() => {
+		fs.rmSync(shadowPath);
+	});
+	return { hasDeleted: wasRemoved, wasRemoved };
+}
+
+/**
+ * Clear an orphaned directory of everything the bake does not own, and go with
+ * it once nothing is left — so a spared file keeps its whole chain of parents
+ * and nothing else keeps one.
+ *
+ * The two answers part company on a directory that lost children but kept one:
+ * something was removed, so the place still rebuilds, yet the directory stays.
+ */
+function pruneOrphanDirectory(isBakeOwned: BakeOwnershipMatcher, directory: string): OrphanSweep {
+	let hasDeleted = false;
+	let isEmpty = true;
+
+	const entries = fs.readdirSync(directory, { withFileTypes: true });
+	for (const entry of entries) {
+		const shadowPath = normalizeWindowsPath(path.join(directory, entry.name));
+		const child = entry.isDirectory()
+			? pruneOrphanDirectory(isBakeOwned, shadowPath)
+			: pruneOrphanLeaf(isBakeOwned, shadowPath);
+
+		hasDeleted ||= child.hasDeleted;
+		isEmpty &&= child.wasRemoved;
+	}
+
+	if (!isEmpty) {
+		return { hasDeleted, wasRemoved: false };
+	}
+
+	const wasRemoved = tryRemove(() => {
+		fs.rmSync(directory, { recursive: true });
+	});
+	return { hasDeleted: hasDeleted || wasRemoved, wasRemoved };
+}
+
+/**
+ * A directory whose source counterpart is gone takes its whole subtree with it,
+ * `node_modules`/dot-dir children included: nothing under an orphaned parent
+ * can be anything but orphaned, so there is no judgement to withhold. Leaving
+ * such a child behind would strand the stale `foo/` this reconcile exists to
+ * clear from beside a fresh `foo.luau`.
+ *
+ * A bake is the one thing under there that is not stale, and it can be what put
+ * the directory there: it writes to a mount the mirror never reached, so the
+ * directory it creates has no source twin either. Sweeping the subtree
+ * wholesale would take the bake's own file with it and the bake would write
+ * both back the same run — the churn {@link BakeOwnershipMatcher} exists to
+ * stop. So a run that bakes empties the subtree entry by entry, keeps what the
+ * bake owns, and keeps only the directories still holding it.
+ */
+function pruneChildDirectory(
+	context: PruneContext,
+	relativePath: string,
+	shadowPath: string,
+): boolean {
+	const { isBakeOwned, isCopyIgnored, luauRoot } = context;
+	if (!isCopyIgnored(relativePath) && fs.existsSync(path.resolve(luauRoot, relativePath))) {
+		return pruneShadowDirectory(context, shadowPath);
+	}
+
+	if (isBakeOwned === undefined) {
+		return tryRemove(() => {
+			fs.rmSync(shadowPath, { recursive: true });
+		});
+	}
+
+	return pruneOrphanDirectory(isBakeOwned, shadowPath).hasDeleted;
 }
 
 /**
@@ -250,101 +532,133 @@ function isInstrumentableFile(name: string): boolean {
  * `isInstrumentableFile` — prod `.luau` is excluded because `instrumentRoot`
  * writes its instrumented copy into the shadow. `.cov-map.json` sidecars are
  * instrumenter output, not source, so they are excluded too.
+ *
+ * Prod files the coverage universe rules out are the one case this name-only
+ * test cannot see; `syncNonInstrumentedFiles` folds them in by path. So is an
+ * ignored path, for the same reason — both are filtered there.
  */
 function shouldSyncToShadow(name: string): boolean {
 	return !isInstrumentableFile(name) && !name.endsWith(COV_MAP_SUFFIX);
 }
 
 function carryForwardRecords(
-	luauRoot: string,
+	luauRoot: PosixRoot,
 	previousManifest: CoverageManifest,
 	allFiles: Record<string, InstrumentedFileRecord>,
 	skipFiles: Set<string>,
 ): void {
-	const posixRoot = normalizeWindowsPath(luauRoot);
-
 	for (const relativePath of skipFiles) {
-		const fileKey = `${posixRoot}/${relativePath}`;
+		const fileKey = underRoot(luauRoot, relativePath);
 		Object.assign(allFiles, { [fileKey]: previousManifest.files[fileKey] });
 	}
 }
 
-function discoverShadowSyncFiles(
-	directory: string,
-	relativeTo: string,
-	results: Array<string>,
-): void {
-	walkLuauDirectory(directory, relativeTo, shouldSyncToShadow, results);
+/**
+ * Collect everything the shadow must carry verbatim, giving each source
+ * directory a twin on the way past — the root included, so a root of nothing
+ * still has somewhere for its `$path` to land.
+ *
+ * The directory pass rides the walk rather than following it because the walk
+ * reaches a parent before its children, which is the order `mkdirSync` wants
+ * anyway. It is also the only pass that can see a directory holding nothing:
+ * writing a file makes the directories above it, so an empty one would
+ * otherwise never be created, and rojo mounts one as a Folder the runtime can
+ * look up.
+ *
+ * A twin that had to be created is what tells a warm run that a new directory
+ * appeared and the place has to be rebuilt around it. Returns whether any was.
+ */
+function mirrorSourceTree({
+	isCopyIgnored,
+	luauRoot,
+	shadowDirectory,
+}: MirrorSourceTreeOptions): MirroredTree {
+	const syncPaths: Array<string> = [];
+	let hasCreatedDirectory = createShadowDirectory(shadowDirectory);
+
+	walkLuauDirectory(
+		luauRoot,
+		{
+			accept: shouldSyncToShadow,
+			onDirectory: (relativePath) => {
+				if (createShadowDirectory(`${shadowDirectory}/${relativePath}`)) {
+					hasCreatedDirectory = true;
+				}
+			},
+			skip: isCopyIgnored,
+		},
+		syncPaths,
+	);
+
+	return { hasCreatedDirectory, syncPaths };
 }
 
-function syncNonInstrumentedFiles(
-	luauRoot: string,
-	shadowDirectory: string,
-	previousNonInstrumented: Record<string, NonInstrumentedFileRecord> | undefined,
-): SyncResult {
-	const posixRoot = normalizeWindowsPath(luauRoot);
-	const discovered: Array<string> = [];
-	discoverShadowSyncFiles(posixRoot, posixRoot, discovered);
-
-	const files: Record<string, NonInstrumentedFileRecord> = {};
-	let changed = false;
-
-	for (const relativePath of discovered) {
-		const sourcePath = `${posixRoot}/${relativePath}`;
-		const shadowPath = `${shadowDirectory}/${relativePath}`;
-
-		const sourceBuffer = fs.readFileSync(path.resolve(sourcePath));
-		const currentHash = hashBuffer(sourceBuffer);
-
-		const previousRecord = previousNonInstrumented?.[sourcePath];
-		// Reuse the previous record only if both the source hash matches
-		// AND the shadow file it points at still exists. A partial cleanup
-		// could leave the record valid on paper while the file is gone.
-		if (
-			previousRecord?.sourceHash === currentHash &&
-			fs.existsSync(previousRecord.shadowPath)
-		) {
-			files[sourcePath] = previousRecord;
-			continue;
-		}
-
-		const outputDirectory = path.dirname(shadowPath);
-		fs.mkdirSync(outputDirectory, { recursive: true });
-		fs.copyFileSync(path.resolve(sourcePath), shadowPath);
-
-		files[sourcePath] = { shadowPath, sourceHash: currentHash, sourcePath };
-		changed = true;
+function syncNonInstrumentedFiles({
+	excluded,
+	isCopyIgnored,
+	luauRoot,
+	previousNonInstrumented,
+	shadowDir,
+}: SyncNonInstrumentedOptions): SyncResult {
+	const { hasCreatedDirectory, syncPaths } = mirrorSourceTree({
+		isCopyIgnored,
+		luauRoot,
+		shadowDirectory: shadowDir,
+	});
+	// Appended one at a time: spreading a set this size into `push` passes one
+	// argument per element, and a whole-tree universe overflows the limit. No
+	// gate needed on the way in — `discoverRootFiles` built this set from the
+	// same walk, so an ignored path never reached it.
+	for (const relativePath of excluded) {
+		syncPaths.push(relativePath);
 	}
 
-	return { changed, files };
+	const files: Record<string, NonInstrumentedFileRecord> = {};
+	let hasChanged = hasCreatedDirectory;
+
+	for (const relativePath of syncPaths) {
+		const sourcePath = underRoot(luauRoot, relativePath);
+		const previousRecord = previousNonInstrumented?.[sourcePath];
+		const record = syncOneFile(sourcePath, `${shadowDir}/${relativePath}`, previousRecord);
+
+		files[sourcePath] = record;
+		if (record !== previousRecord) {
+			hasChanged = true;
+		}
+	}
+
+	return { changed: hasChanged, files };
 }
 
-function computeSkipFiles(luauRoot: string, previousManifest: CoverageManifest): Set<string> {
+function computeSkipFiles(luauRoot: PosixRoot, previousManifest: CoverageManifest): Set<string> {
 	const skipFiles = new Set<string>();
-	const posixRoot = normalizeWindowsPath(luauRoot);
 
 	for (const [fileKey, record] of Object.entries(previousManifest.files)) {
-		if (!fileKey.startsWith(`${posixRoot}/`)) {
+		const relativePath = relativeToRoot(luauRoot, fileKey);
+		if (relativePath === undefined) {
 			continue;
 		}
 
-		const relativePath = fileKey.slice(posixRoot.length + 1);
 		const sourcePath = path.resolve(record.originalLuauPath);
 
 		if (!fs.existsSync(sourcePath)) {
 			continue;
 		}
 
-		const currentHash = hashBuffer(fs.readFileSync(sourcePath));
+		const currentHash = hashFile(sourcePath);
 		if (currentHash !== record.sourceHash) {
 			continue;
 		}
 
 		// A matching source hash isn't enough: a partial cleanup or an
-		// interrupted run can leave the manifest pointing at outputs that
-		// no longer exist. Force re-instrumentation rather than carry a
-		// record forward whose shadow files are gone.
-		if (!fs.existsSync(record.instrumentedLuauPath) || !fs.existsSync(record.coverageMapPath)) {
+		// interrupted run can leave the manifest pointing at outputs that no
+		// longer exist, or at a directory standing where one of them was.
+		// Force re-instrumentation rather than carry either kind of lie
+		// forward.
+		if (
+			!shadowHoldsFile(record.instrumentedLuauPath) ||
+			!shadowHoldsFile(record.coverageMapPath)
+		) {
 			continue;
 		}
 
@@ -354,11 +668,13 @@ function computeSkipFiles(luauRoot: string, previousManifest: CoverageManifest):
 	return skipFiles;
 }
 
-function countPreviousFilesForRoot(luauRoot: string, previousManifest: CoverageManifest): number {
-	const posixRoot = normalizeWindowsPath(luauRoot);
+function countPreviousFilesForRoot(
+	luauRoot: PosixRoot,
+	previousManifest: CoverageManifest,
+): number {
 	let count = 0;
 	for (const fileKey of Object.keys(previousManifest.files)) {
-		if (fileKey.startsWith(`${posixRoot}/`)) {
+		if (relativeToRoot(luauRoot, fileKey) !== undefined) {
 			count++;
 		}
 	}
@@ -375,44 +691,140 @@ function countPreviousFilesForRoot(luauRoot: string, previousManifest: CoverageM
  * returns non-empty results.
  */
 function computeIncrementalState(
-	luauRoot: string,
-	previousManifest: CoverageManifest,
-): { allCached: boolean; changed: boolean; skipFiles: Set<string> } {
+	{ isCopyIgnored, luauRoot, previousManifest }: IncrementalStateInputs,
+	rootFiles: RootFiles | undefined,
+): IncrementalState {
 	const skipFiles = computeSkipFiles(luauRoot, previousManifest);
 	const previousCount = countPreviousFilesForRoot(luauRoot, previousManifest);
-	const changed = skipFiles.size !== previousCount;
+	const hasChanged = skipFiles.size !== previousCount;
 
-	if (changed) {
-		return { allCached: false, changed, skipFiles };
+	if (hasChanged) {
+		return { allCached: false, changed: hasChanged, skipFiles };
 	}
 
-	// All previous files match. Check if any new files appeared on disk.
-	const discovered = discoverInstrumentableFiles(luauRoot);
-	const allCached = discovered.size === previousCount;
+	// All previous files match. Check if any new files appeared on disk. The
+	// walk is deferred to here when no universe forced it earlier.
+	const discovered = rootFiles ?? discoverRootFiles(luauRoot, { isCopyIgnored });
+	const isFullyCached = discovered.instrumentable.size === previousCount;
 
-	return { allCached, changed, skipFiles };
+	return { allCached: isFullyCached, changed: hasChanged, skipFiles };
 }
 
-function buildFullCacheResult(options: FullCacheOptions): ShadowRootResult {
-	const { luauRoot, previousManifest, shadowDirectory, skipFiles } = options;
-
+function buildFullCacheResult({
+	excluded,
+	isBakeOwned,
+	isCopyIgnored,
+	luauRoot,
+	previousManifest,
+	shadowDir,
+	skipFiles,
+}: FullCacheOptions): ShadowRootResult {
 	const allFiles: Record<string, InstrumentedFileRecord> = {};
 	carryForwardRecords(luauRoot, previousManifest, allFiles, skipFiles);
 
-	const syncResult = syncNonInstrumentedFiles(
+	const syncResult = syncNonInstrumentedFiles({
+		excluded,
+		isCopyIgnored,
 		luauRoot,
-		shadowDirectory,
-		previousManifest.nonInstrumentedFiles,
-	);
+		previousNonInstrumented: previousManifest.nonInstrumentedFiles,
+		shadowDir,
+	});
 	// Call reconcile unconditionally (not inside the `||`) so its cleanup side
 	// effect always runs even when the sync already flagged a change.
-	const reconciled = reconcileShadowToSource(luauRoot, shadowDirectory);
+	const hasReconciled = reconcileShadowToSource({
+		isBakeOwned,
+		isCopyIgnored,
+		luauRoot,
+		shadowDir,
+	});
 
 	return {
-		changed: syncResult.changed || reconciled,
+		changed: syncResult.changed || hasReconciled,
 		files: allFiles,
 		luauRoot,
 		nonInstrumentedFiles: syncResult.files,
-		shadowDir: shadowDirectory,
+		shadowDir,
 	};
+}
+
+/**
+ * Decide what the instrumenter can skip this run, and short-circuit to the
+ * carried-forward result when nothing in the root changed at all.
+ */
+function planIncremental(
+	{
+		isBakeOwned,
+		isCopyIgnored,
+		luauRoot,
+		previousManifest,
+		shadowDir,
+		useIncremental: shouldUseIncremental,
+	}: PrepareShadowRootOptions,
+	rootFiles: RootFiles | undefined,
+): IncrementalPlan {
+	if (!shouldUseIncremental || previousManifest === undefined) {
+		return { hasChanged: false, skipFiles: undefined };
+	}
+
+	const {
+		allCached: isFullyCached,
+		changed: hasChanged,
+		skipFiles,
+	} = computeIncrementalState({ isCopyIgnored, luauRoot, previousManifest }, rootFiles);
+	if (!isFullyCached) {
+		return { hasChanged, skipFiles };
+	}
+
+	return {
+		fullCacheResult: buildFullCacheResult({
+			excluded: rootFiles?.excluded ?? NO_EXCLUSIONS,
+			isBakeOwned,
+			isCopyIgnored,
+			luauRoot,
+			previousManifest,
+			shadowDir,
+			skipFiles,
+		}),
+		hasChanged,
+		skipFiles,
+	};
+}
+
+/**
+ * Instrument everything the plan didn't skip, then fold the skipped files'
+ * previous manifest records back in so the result covers the whole root.
+ */
+function instrumentChangedFiles(
+	{
+		isCopyIgnored,
+		luauRoot,
+		previousManifest,
+		shadowDir,
+		useIncremental: shouldUseIncremental,
+	}: PrepareShadowRootOptions,
+	excluded: Set<string>,
+	skipFiles: Set<string> | undefined,
+	timing: TimingCollector,
+): InstrumentedFiles {
+	// One list for lute: a file it never parses is a file it never pays for.
+	// The two halves stay apart up here because only `skipFiles` has a record
+	// worth carrying forward — an excluded file has none and must gain none.
+	const unparsed =
+		skipFiles === undefined && excluded.size === 0
+			? undefined
+			: new Set([...(skipFiles ?? []), ...excluded]);
+	const files = instrumentRoot({
+		isCopyIgnored,
+		luauRoot,
+		shadowDir,
+		skipFiles: unparsed,
+		timing,
+	});
+	const allFiles = { ...files };
+
+	if (shouldUseIncremental && previousManifest !== undefined && skipFiles !== undefined) {
+		carryForwardRecords(luauRoot, previousManifest, allFiles, skipFiles);
+	}
+
+	return { allFiles, changed: Object.keys(files).length > 0 };
 }
