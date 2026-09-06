@@ -122,6 +122,15 @@ const BOOTSTRAP_SEND_LINES = [
 	"end",
 	"if not sent then",
 	'\tprint("studio-cli: failed to post results to host")',
+	'\t-- Deliver a clean failure envelope instead of letting the run hang until',
+	'\t-- the CLI\'s deadline: EndTest is what the CLI surfaces in its log tail.',
+	'\tmessage = { type = "results", requestId = REQUEST_ID, gameOutput = "[]", jestOutput = HttpService:JSONEncode({ err = "studio-cli: failed to post results to host", success = false }) }',
+	'\tlocal endOk, endErr = pcall(function()',
+	'\t\tStudioTestService:EndTest({ jestOutput = message.jestOutput, gameOutput = message.gameOutput, protocolVersion = payload.protocolVersion })',
+	'\tend)',
+	'\tif not endOk then',
+	'\t\tprint("studio-cli: EndTest fallback failed: " .. tostring(endErr))',
+	'\tend',
 	"end",
 ];
 
@@ -352,6 +361,7 @@ export class StudioCliBackend implements Backend {
 		const placeFile = path.join(workDirectory, PLACE_FILE);
 		await this.buildPlaceAsync({
 			loadStringEnabled: true,
+			httpEnabled: true,
 			packages: [
 				{
 					name: BACKEND_NAME,

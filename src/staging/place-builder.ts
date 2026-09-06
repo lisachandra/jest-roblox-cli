@@ -54,6 +54,13 @@ export interface BuildPlaceOptions {
 	 * LoadString. Forwarded verbatim to {@link synthesize}.
 	 */
 	loadStringEnabled?: boolean | undefined;
+	/**
+	 * Force `HttpService.HttpEnabled = true` on the built place. Used by
+	 * studio-cli's Clean Place, whose bootstrap POSTs its result frame over
+	 * plain HTTP (gated by Studio's 'Allow HTTP requests'). Forwarded verbatim
+	 * to {@link synthesize}.
+	 */
+	httpEnabled?: boolean | undefined;
 	packages: Array<PackageDescriptor>;
 	placeFile: string;
 	projectFile: string;
@@ -82,6 +89,7 @@ interface ReusePlan {
 export async function buildPlaceAsync({
 	contentId,
 	loadStringEnabled,
+	httpEnabled,
 	packages,
 	placeFile,
 	projectFile,
@@ -89,7 +97,7 @@ export async function buildPlaceAsync({
 	wrap,
 }: BuildPlaceOptions): Promise<BuildManifestArtifact> {
 	const projectDirectory = path.dirname(projectFile);
-	const projectJson = synthesize({ contentId, loadStringEnabled, packages, wrap });
+	const projectJson = synthesize({ contentId, httpEnabled, loadStringEnabled, packages, wrap });
 
 	// Planned before anything is written or built, so a reused place pays for
 	// neither of the two passes below — see `PlaceInputsKeyOptions.projectJson`

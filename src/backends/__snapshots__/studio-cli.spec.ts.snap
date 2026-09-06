@@ -37,6 +37,15 @@ while not sent and os.clock() - start < 30 do
 end
 if not sent then
 	print("studio-cli: failed to post results to host")
+	-- Deliver a clean failure envelope instead of letting the run hang until
+	-- the CLI's deadline: EndTest is what the CLI surfaces in its log tail.
+	message = { type = "results", requestId = REQUEST_ID, gameOutput = "[]", jestOutput = HttpService:JSONEncode({ err = "studio-cli: failed to post results to host", success = false }) }
+	local endOk, endErr = pcall(function()
+		StudioTestService:EndTest({ jestOutput = message.jestOutput, gameOutput = message.gameOutput, protocolVersion = payload.protocolVersion })
+	end)
+	if not endOk then
+		print("studio-cli: EndTest fallback failed: " .. tostring(endErr))
+	end
 end
 "
 `;

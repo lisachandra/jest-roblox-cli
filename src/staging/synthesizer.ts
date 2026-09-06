@@ -101,6 +101,16 @@ interface SynthesizeInput {
 	 * its `$path`/children/other properties.
 	 */
 	loadStringEnabled?: boolean | undefined;
+	/**
+	 * Force `HttpService.HttpEnabled = true` on the synthesized place so the
+	 * bootstrap can POST its result frame back over plain HTTP
+	 * (`HttpService:RequestAsync`). Roblox Studio's "Allow HTTP requests"
+	 * setting gates the non-WebSocket HTTP pipeline, and the studio-cli
+	 * transport migrated off WebSockets precisely because Studio caps
+	 * WebStreamClient count. Merged into any existing `HttpService`, preserving
+	 * its `$path`/children/other properties.
+	 */
+	httpEnabled?: boolean | undefined;
 	packages: Array<PackageDescriptor>;
 	/**
 	 * Default `true`: wrap each package under
@@ -638,6 +648,21 @@ function enableLoadString(tree: RojoTreeNode): void {
 }
 
 /**
+ * Force `HttpService.HttpEnabled = true` on a no-wrap tree, creating the
+ * HttpService node if the user's project omits it and merging into any
+ * existing `$properties` so a hand-set property is preserved. studio-cli's
+ * bootstrap posts its result frame over plain HTTP to the CLI's loopback
+ * result server, which Studio gates on the place's "Allow HTTP requests"
+ * setting — so the Clean Place must enable it regardless of what the user's
+ * `.project.json` declares.
+ */
+function enableHttp(tree: RojoTreeNode): void {
+	const service = openService(tree, "HttpService");
+	const properties = isProperties(service.$properties) ? service.$properties : {};
+	service.$properties = { ...properties, HttpEnabled: true };
+}
+
+/**
  * Park the place's content identity where a booted task can read it back, at
  * the service and name `@isentinel/roblox-runner` spells: it owns the guard
  * that reads the stamp, so it owns where the stamp lives.
@@ -662,6 +687,7 @@ function stampPlaceContentId(tree: RojoTreeNode, contentId: string | undefined):
 function synthesizeNoWrap({
 	contentId,
 	loadStringEnabled = false,
+	httpEnabled = false,
 	packages,
 }: SynthesizeInput): string {
 	if (packages.length !== 1) {
@@ -681,6 +707,10 @@ function synthesizeNoWrap({
 
 	if (loadStringEnabled) {
 		enableLoadString(tree);
+	}
+
+	if (httpEnabled) {
+		enableHttp(tree);
 	}
 
 	stampPlaceContentId(tree, contentId);
