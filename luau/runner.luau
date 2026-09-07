@@ -55,6 +55,7 @@ function module.run(
 	local coverageEnabled = config.runnerCoverage
 	local perTestEnabled = config.runnerPerTestCoverage
 
+	_G.__JEST__ = true
 	-- Game Output capture opens at the top of the run so engine warnings
 	-- during findJest/require(Jest) (broken jestPath, missing dep) also land
 	-- in the user-facing `--gameOutput` dump, and stops last during teardown
