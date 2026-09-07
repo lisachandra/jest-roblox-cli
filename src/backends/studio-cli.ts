@@ -102,6 +102,7 @@ const OUTPUT_FILE = "output.log";
  * to. See {@link SOCKET_LINGER_SECONDS}.
  */
 const BOOTSTRAP_SEND_LINES = [
+	"_G.__JEST__ = true",
 	"local encoded = HttpService:JSONEncode(message)",
 	"local sent = false",
 	"local start = os.clock()",
@@ -504,6 +505,7 @@ function bootstrapRunLines(
 	requestId: string,
 ): Array<string> {
 	return [
+		'_G.__JEST__ = true',
 		'local HttpService = game:GetService("HttpService")',
 		'local StudioTestService = game:GetService("StudioTestService")',
 		`local payload = HttpService:JSONDecode(${luauLongString(JSON.stringify(payload))})`,
