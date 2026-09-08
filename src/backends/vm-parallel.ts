@@ -1,47 +1,28 @@
 import type { ParallelOption } from "./interface.ts";
 
 /**
- * How many `Actor` hosts the Studio plugin ships.
+ * The Actor-host pool size the pre-prune plugin shipped (`host1`..`host4`).
  *
- * A build-time property of `plugin/plugin.project.json`, not a runtime one:
- * each host is a declared `Actor` holding its own copy of the runner tree, and
- * Studio only runs plugin scripts that were there when the plugin loaded.
- * Keep this in step with the `vmHosts` entries in that file — the plugin
- * clamps to the hosts it actually finds, so the two disagreeing costs
- * parallelism rather than correctness.
- *
- * A tuning surface: more hosts buy concurrency for wide suites at ~62 KB of
- * plugin size each.
+ * Kept as a stable exported constant so the "Studio-only" validation in
+ * `auto.ts` can keep bounding requests against something meaningful; the
+ * parallel path itself is pruned, so this no longer bounds a real pool.
  */
 export const VM_HOST_POOL_SIZE = 4;
 
+
 /**
- * How many Luau VMs the Studio plugin should actually start for a run of
- * `configCount` projects, or undefined when the run stays sequential.
+ * Resolve the VM count an in-session parallel run would want.
  *
- * Never more VMs than there are configs to put in them, never more than the
- * hosts the plugin ships, and never fewer than two: one VM *is* the sequential
- * path, and taking the parallel branch for it would trade per-project game
- * output for a batch-scoped capture with no concurrency to show for it.
- *
- * Read by the payload builder — which tells the plugin what to do — and by the
- * output layer, which labels the game output for what actually happened. Both
- * must decide the same way, or a run that fell back to sequential would still
- * write its output under a batch label (and lose every project's but the
- * first).
- *
- * The plugin clamps again against the hosts it ships, so this is a request
- * rather than a promise.
+ * The Studio plugin's Actor-host parallel runner has been pruned from the fork
+ * (single-VM-for-stability), so this always returns `undefined` and a run the
+ * CLI was asked to parallelize lands on the sequential path instead. Kept as
+ * the single decision point the payload builder shares with the plugin so
+ * dead code reads as deliberate rather than absent.
  */
 export function resolveVmHostCount(
-	vmParallel: ParallelOption,
-	configCount: number,
+	vmParallel: ParallelOption | undefined,
+	_configCount: number,
 ): number | undefined {
-	if (vmParallel === undefined) {
-		return undefined;
-	}
-
-	const requested = vmParallel === "auto" ? configCount : Math.floor(vmParallel);
-	const hostCount = Math.min(requested, configCount, VM_HOST_POOL_SIZE);
-	return hostCount > 1 ? hostCount : undefined;
+	void vmParallel;
+	return undefined;
 }

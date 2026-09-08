@@ -49,6 +49,8 @@ export const STUDIO_CLI_PROTOCOL_VERSION = 7;
 
 type StudioCliPayload = RunPayload & {
 	protocolVersion: typeof STUDIO_CLI_PROTOCOL_VERSION;
+	requestId?: string;
+	resultsUrl?: string;
 	test: true;
 };
 
@@ -468,9 +470,15 @@ function studioOutputFile(workDirectory: string): string {
 	return path.join(workDirectory, OUTPUT_FILE);
 }
 
-function buildStudioCliPayload(request: RunPayloadRequest): StudioCliPayload {
+function buildStudioCliPayload(
+	request: RunPayloadRequest,
+	resultsUrl?: string,
+	requestId?: string,
+): StudioCliPayload {
 	return {
 		protocolVersion: STUDIO_CLI_PROTOCOL_VERSION,
+		...(requestId === undefined ? {} : { requestId }),
+		...(resultsUrl === undefined ? {} : { resultsUrl }),
 		test: true,
 		...buildRunPayload(request),
 	};
@@ -516,6 +524,9 @@ function bootstrapRunLines(
 		"end)",
 		"local message",
 		"if not ok then",
+		'\t-- If the plugin in Run Mode already posted the results directly to the results server,',
+		'\t-- the host closes the server and terminates Studio, so a failing ExecuteRunModeAsync',
+		'\t-- during post-run boundary teardown is ignored.',
 		'\tmessage = { type = "results", requestId = REQUEST_ID, gameOutput = "[]", jestOutput = HttpService:JSONEncode({ err = tostring(result), success = false }) }',
 		'elseif typeof(result) ~= "table" or result.jestOutput == nil then',
 		'\tmessage = { type = "results", requestId = REQUEST_ID, gameOutput = "[]", jestOutput = HttpService:JSONEncode({ err = "studio-cli: the jest plugin produced no result. Install or update the jest-roblox Studio plugin.", success = false }) }',
@@ -553,9 +564,11 @@ function buildStudioArgs({
 }: StudioArgsOptions): Array<string> {
 	const bootstrapFile = path.join(workDirectory, BOOTSTRAP_FILE);
 	const outputFile = studioOutputFile(workDirectory);
+	const resultsUrl = `http://localhost:${port.toString()}/results`;
+	const payload = buildStudioCliPayload({ jobs, runBudgetMs, vmParallel }, resultsUrl, requestId);
 	fs.writeFileSync(
 		bootstrapFile,
-		buildBootstrap(buildStudioCliPayload({ jobs, runBudgetMs, vmParallel }), port, requestId),
+		buildBootstrap(payload, port, requestId),
 	);
 
 	return [

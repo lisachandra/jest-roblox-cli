@@ -315,7 +315,11 @@ describe(StudioCliBackend, () => {
 		expect(rawResults[0]!.fallbackGameOutput).toBe(fallback);
 	});
 
-	it("should carry the requested VM count in the bootstrap payload", async () => {
+	it("should omit the VM count from the bootstrap payload when vm-parallel is requested", async () => {
+		// The fork pruned the Actor-host (vmHosts) parallel runner for stable
+		// single-VM behaviour, so even an explicit `vmParallel` request never
+		// reaches the plugin: the CLI resolves it to the sequential path and
+		// leaves the field off the bootstrap payload.
 		expect.assertions(1);
 
 		resetVol();
@@ -336,10 +340,14 @@ describe(StudioCliBackend, () => {
 			vmParallel: 2,
 		});
 
-		expect(bootstrap).toContain('"vmParallel":2');
+		expect(bootstrap).not.toContain("vmParallel");
 	});
 
-	it("should tell the plugin the run budget it must finish inside", async () => {
+	it("should not bake a run budget onto an ordinary sequential run", async () => {
+		// The run budget was sent only alongside a VM-parallel request (the
+		// coordinator's wait for its hosts had to end inside the CLI's
+		// timeout). With the fork's single-VM prune every run is sequential,
+		// so no coordinator budget rides in the payload.
 		expect.assertions(1);
 
 		resetVol();
@@ -357,10 +365,9 @@ describe(StudioCliBackend, () => {
 
 		await makeBackend(launch, { timeout: 120_000 }).runTestsAsync({
 			jobs: [job("alpha"), job("beta")],
-			vmParallel: 2,
 		});
 
-		expect(bootstrap).toContain('"runBudgetMs":120000');
+		expect(bootstrap).not.toContain("runBudgetMs");
 	});
 
 	it("should omit the VM count from the bootstrap payload when not vm-parallel", async () => {

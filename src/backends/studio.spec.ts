@@ -12,10 +12,6 @@ import type { JestResult } from "../types/jest-result.ts";
 import type { BackendOptions, ProjectJob } from "./interface.ts";
 import { StudioBackend } from "./studio.ts";
 
-// The backend's own default run timeout, which is what a run that does not
-// override it must tell the plugin to finish inside.
-const DEFAULT_STUDIO_TIMEOUT = 300_000;
-
 const { getLastCreatedServer, MockWebSocket, MockWebSocketServer } = await vi.hoisted(
 	async () => import("../../test/mocks/mock-ws"),
 );
@@ -473,12 +469,16 @@ describe(StudioBackend, () => {
 		// plugin ships), an oversized count is clamped to the configs there
 		// are, and anything that lands on a single VM leaves the field off —
 		// that is the sequential path.
-		it("should send the run budget the coordinator must finish inside", async () => {
+		// The run budget was sent only alongside the (now-pruned) VM-parallel
+		// request, under which the coordinator's wait for its hosts had to end
+		// inside the CLI's timeout. With the parallel seam removed every run is
+		// sequential, so no coordinator budget is sent.
+		it("should leave the run budget off a vm-parallel request", async () => {
 			expect.assertions(1);
 
 			const captured = await captureVmRequestAsync(2, 2);
 
-			expect(captured.runBudgetMs).toBe(DEFAULT_STUDIO_TIMEOUT);
+			expect(captured.runBudgetMs).toBeUndefined();
 		});
 
 		it("should leave the run budget off a sequential run", async () => {
@@ -489,13 +489,17 @@ describe(StudioBackend, () => {
 			expect(captured.runBudgetMs).toBeUndefined();
 		});
 
+		// The fork pruned the Actor-host (vmHosts) parallel runner for stable
+		// single-VM behaviour: whatever the CLI is asked for ("auto", an
+		// explicit count, or a single VM), the plugin always runs sequentially
+		// and so never receives a `vmParallel` field.
 		it.for([
-			{ expected: 2, jobCount: 2, requested: 2 },
-			{ expected: 3, jobCount: 3, requested: "auto" as const },
-			{ expected: 2, jobCount: 2, requested: 5 },
+			{ expected: undefined, jobCount: 2, requested: 2 },
+			{ expected: undefined, jobCount: 3, requested: "auto" as const },
+			{ expected: undefined, jobCount: 2, requested: 5 },
 			{ expected: undefined, jobCount: 2, requested: 1 },
 			{ expected: undefined, jobCount: 2, requested: undefined },
-			{ expected: 4, jobCount: 6, requested: "auto" as const },
+			{ expected: undefined, jobCount: 6, requested: "auto" as const },
 		])(
 			"should send vmParallel $expected for $requested over $jobCount jobs",
 			async ({ expected, jobCount, requested }) => {
