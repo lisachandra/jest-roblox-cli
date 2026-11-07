@@ -1,15 +1,12 @@
 import { fromAny } from "@total-typescript/shoehorn";
 
 import * as path from "node:path";
-import { assert, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { expectedDefaultFormatters } from "#test/mocks/config-default-formatters.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
 import type { CliOptions } from "./schema.ts";
-import { DEFAULT_CONFIG } from "./schema.ts";
-import { buildWorkspaceRunOptions, WorkspaceConsensusError } from "./workspace-run-options.ts";
-
-const stdEnvironmentMock = vi.hoisted(() => ({ isAgent: false }));
-
-vi.mock(import("std-env"), () => stdEnvironmentMock);
+import { buildWorkspaceRunOptions } from "./workspace-run-options.ts";
 
 function emptyCli(): CliOptions {
 	return {};
@@ -19,6 +16,7 @@ describe(buildWorkspaceRunOptions, () => {
 	it.for([
 		["backend", { backend: "open-cloud" }, { backend: "studio" }],
 		["color", { color: true }, { color: false }],
+		["formatters", { formatters: ["json"] }, { formatters: ["agent"] }],
 		["port", { port: 1 }, { port: 2 }],
 		["silent", { test: { silent: true } }, { test: { silent: false } }],
 		["gameOutput", { gameOutput: "a.log" }, { gameOutput: "b.log" }],
@@ -26,6 +24,8 @@ describe(buildWorkspaceRunOptions, () => {
 		["parallel", { parallel: 1 }, { parallel: 2 }],
 		["placeId", { placeId: "1" }, { placeId: "2" }],
 		["studioPath", { studioPath: "a.exe" }, { studioPath: "b.exe" }],
+		["hiddenDesktop", { hiddenDesktop: true }, { hiddenDesktop: false }],
+		["pluginsDirectory", { pluginsDirectory: "/a" }, { pluginsDirectory: "/b" }],
 		["universeId", { universeId: "1" }, { universeId: "2" }],
 		[
 			"workspace.gameOutput",
@@ -53,9 +53,29 @@ describe(buildWorkspaceRunOptions, () => {
 			captured = err;
 		}
 
-		assert(captured instanceof WorkspaceConsensusError);
+		expect(captured).toMatchObject({ name: "WorkspaceConsensusError", field });
+	});
 
-		expect(captured.field).toBe(field);
+	it("should enable workspace bail only when the CLI flag is true", () => {
+		expect.assertions(1);
+
+		expect(
+			buildWorkspaceRunOptions({
+				cli: { bail: true },
+				perPackageConfigs: [{ name: "alpha", config: {} }],
+			}).bail,
+		).toBeTrue();
+	});
+
+	it("should leave workspace bail off when the CLI flag is absent", () => {
+		expect.assertions(1);
+
+		expect(
+			buildWorkspaceRunOptions({
+				cli: emptyCli(),
+				perPackageConfigs: [{ name: "alpha", config: {} }],
+			}).bail,
+		).toBeFalse();
 	});
 
 	describe("happy path: per-package consensus", () => {
@@ -125,9 +145,10 @@ describe(buildWorkspaceRunOptions, () => {
 				thrown = err;
 			}
 
-			assert(thrown instanceof WorkspaceConsensusError);
-
-			expect(thrown.message).toContain("workspace.packages");
+			expect(thrown).toMatchObject({
+				name: "WorkspaceConsensusError",
+				message: expect.stringContaining("workspace.packages"),
+			});
 		});
 
 		it("should throw when packages disagree on workspace.root", () => {
@@ -147,7 +168,7 @@ describe(buildWorkspaceRunOptions, () => {
 						},
 					],
 				});
-			}).toThrow(WorkspaceConsensusError);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 
 		it("should not throw when every package agrees on workspace.root/packages", () => {
@@ -183,10 +204,10 @@ describe(buildWorkspaceRunOptions, () => {
 				],
 			});
 
-			expect(result.backend).toBe(DEFAULT_CONFIG.backend);
-			expect(result.color).toBe(DEFAULT_CONFIG.color);
-			expect(result.silent).toBe(DEFAULT_CONFIG.silent);
-			expect(result.port).toBe(DEFAULT_CONFIG.port);
+			expect(result.backend).toBe(createResolvedConfig().backend);
+			expect(result.color).toBe(createResolvedConfig().color);
+			expect(result.silent).toBe(createResolvedConfig().silent);
+			expect(result.port).toBe(createResolvedConfig().port);
 		});
 
 		it("should leave optional fields undefined when no one declares them", () => {
@@ -202,20 +223,15 @@ describe(buildWorkspaceRunOptions, () => {
 			expect(result.parallel).toBeUndefined();
 		});
 
-		it("should fall back to a non-empty env-detected default formatter list", () => {
-			expect.assertions(2);
+		it("should fall back to the env-detected default formatter list", () => {
+			expect.assertions(1);
 
 			const result = buildWorkspaceRunOptions({
 				cli: emptyCli(),
 				perPackageConfigs: [{ name: "alpha", config: {} }],
 			});
 
-			// Either ["default"] or ["agent"] depending on std-env detection;
-			// CI may also append "github-actions". The contract is "non-empty
-			// with at least one named formatter" — exact values are
-			// env-dependent.
-			expect(result.formatters.length).toBeGreaterThan(0);
-			expect(result.formatters[0]).toMatch(/^(default|agent)$/);
+			expect(result.formatters).toStrictEqual(expectedDefaultFormatters());
 		});
 	});
 
@@ -231,49 +247,7 @@ describe(buildWorkspaceRunOptions, () => {
 						{ name: "beta", config: { backend: "studio" } },
 					],
 				});
-			}).toThrow(WorkspaceConsensusError);
-		});
-
-		it("should list each declared value with the packages declaring it", () => {
-			expect.assertions(5);
-
-			let captured: unknown;
-			try {
-				buildWorkspaceRunOptions({
-					cli: emptyCli(),
-					perPackageConfigs: [
-						{ name: "alpha", config: { backend: "open-cloud" } },
-						{ name: "gamma", config: { backend: "open-cloud" } },
-						{ name: "beta", config: { backend: "studio" } },
-					],
-				});
-			} catch (err) {
-				captured = err;
-			}
-
-			assert(captured instanceof WorkspaceConsensusError);
-
-			expect(captured.name).toBe("WorkspaceConsensusError");
-			expect(captured.field).toBe("backend");
-			expect(captured.groups).toStrictEqual([
-				{ packages: ["alpha", "gamma"], value: "open-cloud" },
-				{ packages: ["beta"], value: "studio" },
-			]);
-			expect(captured.omittedBy).toStrictEqual([]);
-			expect(captured.message).toBe(
-				[
-					"workspace packages disagree on `backend`.",
-					"",
-					'  - "open-cloud" — declared by alpha, gamma',
-					'  - "studio" — declared by beta',
-					"",
-					"In workspace mode this field must be uniform across all selected",
-					"packages — the entire run uses one backend. Either:",
-					"  - Declare it consistently across packages (typically by inheriting",
-					"    from a shared config), OR",
-					"  - Pass the CLI override to set a single value for the run.",
-				].join("\n"),
-			);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 
 		it("should reject mixed values for deep-compared arrays", () => {
@@ -287,7 +261,7 @@ describe(buildWorkspaceRunOptions, () => {
 						{ name: "beta", config: { formatters: ["agent"] } },
 					],
 				});
-			}).toThrow(WorkspaceConsensusError);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 	});
 
@@ -303,47 +277,7 @@ describe(buildWorkspaceRunOptions, () => {
 						{ name: "beta", config: {} },
 					],
 				});
-			}).toThrow(WorkspaceConsensusError);
-		});
-
-		it("should use the partial-variant wording in the error message", () => {
-			expect.assertions(3);
-
-			let captured: unknown;
-			try {
-				buildWorkspaceRunOptions({
-					cli: emptyCli(),
-					perPackageConfigs: [
-						{ name: "alpha", config: { backend: "open-cloud" } },
-						{ name: "gamma", config: { backend: "open-cloud" } },
-						{ name: "beta", config: {} },
-						{ name: "delta", config: {} },
-					],
-				});
-			} catch (err) {
-				captured = err;
-			}
-
-			assert(captured instanceof WorkspaceConsensusError);
-
-			expect(captured.groups).toStrictEqual([
-				{ packages: ["alpha", "gamma"], value: "open-cloud" },
-			]);
-			expect(captured.omittedBy).toStrictEqual(["beta", "delta"]);
-			expect(captured.message).toBe(
-				[
-					"workspace packages disagree on `backend`.",
-					"",
-					'  - declared as "open-cloud" by: alpha, gamma',
-					"  - not declared by: beta, delta",
-					"",
-					"In workspace mode this field must be uniform across all selected",
-					"packages — the entire run uses one backend. Either:",
-					"  - Declare it consistently across packages (typically by inheriting",
-					"    from a shared config), OR",
-					"  - Pass the CLI override to set a single value for the run.",
-				].join("\n"),
-			);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 	});
 
@@ -404,6 +338,96 @@ describe(buildWorkspaceRunOptions, () => {
 		});
 	});
 
+	describe("hiddenDesktop resolution", () => {
+		it("should let the CLI override per-package hiddenDesktop", () => {
+			expect.assertions(1);
+
+			const result = buildWorkspaceRunOptions({
+				cli: { hiddenDesktop: true },
+				perPackageConfigs: [{ name: "alpha", config: { hiddenDesktop: false } }],
+			});
+
+			expect(result.hiddenDesktop).toBeTrue();
+		});
+
+		it("should leave hiddenDesktop to the platform default when no package sets it", () => {
+			expect.assertions(1);
+
+			const result = buildWorkspaceRunOptions({
+				cli: {},
+				perPackageConfigs: [
+					{ name: "alpha", config: {} },
+					{ name: "beta", config: {} },
+				],
+			});
+
+			expect(result.hiddenDesktop).toBeUndefined();
+		});
+
+		it("should reject a hiddenDesktop opt-out only some packages declare", () => {
+			expect.assertions(1);
+
+			expect(() => {
+				return buildWorkspaceRunOptions({
+					cli: {},
+					perPackageConfigs: [
+						{ name: "alpha", config: { hiddenDesktop: false } },
+						{ name: "beta", config: {} },
+					],
+					platform: "win32",
+				});
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
+		});
+
+		it.for(["win32", "darwin"] as const)(
+			"should accept hiddenDesktop true beside an unset package on %s",
+			(platform) => {
+				expect.assertions(1);
+
+				const result = buildWorkspaceRunOptions({
+					cli: {},
+					perPackageConfigs: [
+						{ name: "alpha", config: { hiddenDesktop: true } },
+						{ name: "beta", config: {} },
+					],
+					platform,
+				});
+
+				expect(result.hiddenDesktop).toBeTrue();
+			},
+		);
+
+		it("should accept hiddenDesktop false beside an unset package on linux", () => {
+			expect.assertions(1);
+
+			const result = buildWorkspaceRunOptions({
+				cli: {},
+				perPackageConfigs: [
+					{ name: "alpha", config: { hiddenDesktop: false } },
+					{ name: "beta", config: {} },
+				],
+				platform: "linux",
+			});
+
+			expect(result.hiddenDesktop).toBeFalse();
+		});
+
+		it("should reject hiddenDesktop true beside an unset package on linux", () => {
+			expect.assertions(1);
+
+			expect(() => {
+				return buildWorkspaceRunOptions({
+					cli: {},
+					perPackageConfigs: [
+						{ name: "alpha", config: { hiddenDesktop: true } },
+						{ name: "beta", config: {} },
+					],
+					platform: "linux",
+				});
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
+		});
+	});
+
 	describe("studioPath resolution", () => {
 		it("should let the CLI override studioPath for studio-cli workspace runs", () => {
 			expect.assertions(1);
@@ -442,6 +466,33 @@ describe(buildWorkspaceRunOptions, () => {
 		});
 	});
 
+	describe("pluginsDirectory resolution", () => {
+		it("should propagate per-package pluginsDirectory when all agree", () => {
+			expect.assertions(1);
+
+			const result = buildWorkspaceRunOptions({
+				cli: {},
+				perPackageConfigs: [
+					{ name: "alpha", config: { pluginsDirectory: "/plugins" } },
+					{ name: "beta", config: { pluginsDirectory: "/plugins" } },
+				],
+			});
+
+			expect(result.pluginsDirectory).toBe("/plugins");
+		});
+
+		it("should leave pluginsDirectory out when no one declares it", () => {
+			expect.assertions(1);
+
+			const result = buildWorkspaceRunOptions({
+				cli: {},
+				perPackageConfigs: [{ name: "alpha", config: {} }],
+			});
+
+			expect(result).not.toHaveProperty("pluginsDirectory");
+		});
+	});
+
 	describe("optional-field consensus", () => {
 		it("should propagate per-package universeId when all agree", () => {
 			expect.assertions(1);
@@ -470,21 +521,6 @@ describe(buildWorkspaceRunOptions, () => {
 			});
 
 			expect(result.formatters).toContain("github-actions");
-		});
-
-		it("should pick the agent default when std-env reports an agent runtime", () => {
-			expect.assertions(1);
-
-			stdEnvironmentMock.isAgent = true;
-
-			const result = buildWorkspaceRunOptions({
-				cli: {},
-				perPackageConfigs: [{ name: "alpha", config: {} }],
-			});
-
-			stdEnvironmentMock.isAgent = false;
-
-			expect(result.formatters).toContain("agent");
 		});
 	});
 
@@ -568,7 +604,7 @@ describe(buildWorkspaceRunOptions, () => {
 					],
 					workspaceRoot: "/repo",
 				});
-			}).toThrow(WorkspaceConsensusError);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 	});
 
@@ -612,7 +648,7 @@ describe(buildWorkspaceRunOptions, () => {
 					],
 					workspaceRoot: "/repo",
 				});
-			}).toThrow(WorkspaceConsensusError);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 	});
 
@@ -680,7 +716,7 @@ describe(buildWorkspaceRunOptions, () => {
 					],
 					workspaceRoot: "/repo",
 				});
-			}).toThrow(WorkspaceConsensusError);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 	});
 
@@ -724,7 +760,7 @@ describe(buildWorkspaceRunOptions, () => {
 					],
 					workspaceRoot: "/repo",
 				});
-			}).toThrow(WorkspaceConsensusError);
+			}).toThrow(expect.objectContaining({ name: "WorkspaceConsensusError" }));
 		});
 	});
 
@@ -742,19 +778,5 @@ describe(buildWorkspaceRunOptions, () => {
 
 			expect(result.backend).toBe("open-cloud");
 		});
-	});
-});
-
-describe(WorkspaceConsensusError, () => {
-	it("should default omittedBy to an empty list", () => {
-		expect.assertions(2);
-
-		const error = new WorkspaceConsensusError("backend", [
-			{ packages: ["alpha"], value: "open-cloud" },
-			{ packages: ["beta"], value: "studio" },
-		]);
-
-		expect(error).toBeInstanceOf(Error);
-		expect(error.omittedBy).toStrictEqual([]);
 	});
 });

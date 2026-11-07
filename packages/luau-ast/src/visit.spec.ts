@@ -1,20 +1,13 @@
 import { fromAny } from "@total-typescript/shoehorn";
 
-import { assert, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import type { AstStatBlock } from "./ast.ts";
-import { loadLuauParser } from "./parser.ts";
-import type { LuauVisitor } from "./visit.ts";
+import { astTree as parseBlock } from "#test/helpers/unit/trees";
+import type { AstExpr, LuauVisitor } from "./index.ts";
 import { visitBlock, visitExpression, visitStatement } from "./visit.ts";
 
-function parseBlock(source: string): AstStatBlock {
-	const result = loadLuauParser().parse(source);
-	assert(result.ok);
-	return result.root;
-}
-
 describe(visitBlock, () => {
-	it("should call visitStatBlock and visitStatBlockEnd around the root", async () => {
+	it("should call visitStatBlock and visitStatBlockEnd around the root", () => {
 		expect.assertions(2);
 
 		const root = parseBlock("local x = 1");
@@ -23,11 +16,11 @@ describe(visitBlock, () => {
 
 		visitBlock(root, { visitStatBlock: enter, visitStatBlockEnd: leave });
 
-		expect(enter).toHaveBeenCalledOnce();
-		expect(leave).toHaveBeenCalledOnce();
+		expect(enter).toHaveBeenCalledExactlyOnceWith(root);
+		expect(leave).toHaveBeenCalledExactlyOnceWith(root);
 	});
 
-	it("should skip children when visitStatBlock returns false", async () => {
+	it("should skip children when visitStatBlock returns false", () => {
 		expect.assertions(1);
 
 		const root = parseBlock("local x = 1");
@@ -38,7 +31,7 @@ describe(visitBlock, () => {
 		expect(onLocal).not.toHaveBeenCalled();
 	});
 
-	it("should dispatch each statement kind to its callback", async () => {
+	it("should dispatch each statement kind to its callback", () => {
 		expect.assertions(1);
 
 		const root = parseBlock(
@@ -107,7 +100,7 @@ describe(visitBlock, () => {
 });
 
 describe(visitExpression, () => {
-	it("should dispatch each expression kind to its callback", async () => {
+	it("should dispatch each expression kind to its callback", () => {
 		expect.assertions(1);
 
 		const root = parseBlock(
@@ -124,6 +117,7 @@ describe(visitExpression, () => {
 				"local i = if a then b else c",
 				"local j = t[a]",
 				"local k = t.name",
+				"local l = f<<T>>",
 				"local m = `interp {a}`",
 				"local n = a",
 				"local o = { 1 }",
@@ -153,6 +147,7 @@ describe(visitExpression, () => {
 			visitExprIfElse: see("ifelse"),
 			visitExprIndexExpr: see("indexexpr"),
 			visitExprIndexName: see("indexname"),
+			visitExprInstantiate: see("instantiate"),
 			visitExprInterpString: see("interp"),
 			visitExprLocal: see("local"),
 			visitExprTable: see("table"),
@@ -172,6 +167,7 @@ describe(visitExpression, () => {
 			"ifelse",
 			"indexexpr",
 			"indexname",
+			"instantiate",
 			"interp",
 			"local",
 			"nil",
@@ -183,7 +179,7 @@ describe(visitExpression, () => {
 		]);
 	});
 
-	it("should stop the whole subtree when visitExpr returns false", async () => {
+	it("should stop the whole subtree when visitExpr returns false", () => {
 		expect.assertions(2);
 
 		const root = parseBlock("local a = 1 + 2");
@@ -200,7 +196,7 @@ describe(visitExpression, () => {
 		expect(onEnd).not.toHaveBeenCalled();
 	});
 
-	it("should call visitExprEnd after each expression", async () => {
+	it("should call visitExprEnd after each expression", () => {
 		expect.assertions(1);
 
 		const root = parseBlock("local a = 1 + 2");
@@ -208,11 +204,10 @@ describe(visitExpression, () => {
 
 		visitBlock(root, { visitExprEnd: onEnd });
 
-		// The binary itself plus its two operands.
 		expect(onEnd).toHaveBeenCalledTimes(3);
 	});
 
-	it("should call visitExprFunctionEnd after the function body", async () => {
+	it("should call visitExprFunctionEnd after the function body", () => {
 		expect.assertions(1);
 
 		const root = parseBlock("local fn = function() end");
@@ -233,11 +228,12 @@ describe(visitExpression, () => {
 	it("should ignore an expression kind it does not model", () => {
 		expect.assertions(1);
 
+		const expression: AstExpr = fromAny({ type: "AstExprError" });
 		const onEnd = vi.fn<() => void>();
 
-		visitExpression(fromAny({ type: "AstExprError" }), { visitExprEnd: onEnd });
+		visitExpression(expression, { visitExprEnd: onEnd });
 
-		expect(onEnd).toHaveBeenCalledOnce();
+		expect(onEnd).toHaveBeenCalledExactlyOnceWith(expression);
 	});
 });
 
@@ -270,6 +266,7 @@ describe("skipping children", () => {
 		},
 		{ enter: "visitExprIndexExpr", leaf: "visitExprConstantNumber", source: "local a = t[1]" },
 		{ enter: "visitExprIndexName", leaf: "visitExprGlobal", source: "local a = t.x" },
+		{ enter: "visitExprInstantiate", leaf: "visitExprGlobal", source: "local a = f<<T>>" },
 		{
 			enter: "visitExprInterpString",
 			leaf: "visitExprConstantNumber",
@@ -301,7 +298,7 @@ describe("skipping children", () => {
 		{ enter: "visitStatWhile", leaf: "visitExprGlobal", source: "while a do end" },
 	] as const)(
 		"should skip children when $enter returns false over `$source`",
-		async ({ enter, leaf, source }) => {
+		({ enter, leaf, source }) => {
 			expect.assertions(1);
 
 			const root = parseBlock(source);
@@ -315,7 +312,7 @@ describe("skipping children", () => {
 });
 
 describe("optional branches", () => {
-	it("should visit the step expression when the numeric for has one", async () => {
+	it("should visit the step expression when the numeric for has one", () => {
 		expect.assertions(1);
 
 		const root = parseBlock("for i = 1, 10, 2 do end");
@@ -326,7 +323,7 @@ describe("optional branches", () => {
 		expect(onNumber).toHaveBeenCalledTimes(3);
 	});
 
-	it("should visit computed table keys", async () => {
+	it("should visit computed table keys", () => {
 		expect.assertions(1);
 
 		const root = parseBlock("local t = { [a] = 1 }");
@@ -334,10 +331,12 @@ describe("optional branches", () => {
 
 		visitBlock(root, { visitExprGlobal: onGlobal });
 
-		expect(onGlobal).toHaveBeenCalledOnce();
+		expect(onGlobal).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ global: "a", type: "AstExprGlobal" }),
+		);
 	});
 
-	it("should recurse into a plain else block", async () => {
+	it("should recurse into a plain else block", () => {
 		expect.assertions(1);
 
 		const root = parseBlock("if a then else b() end");
@@ -345,10 +344,15 @@ describe("optional branches", () => {
 
 		visitBlock(root, { visitExprCall: onCall });
 
-		expect(onCall).toHaveBeenCalledOnce();
+		expect(onCall).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				func: expect.objectContaining({ global: "b" }),
+				type: "AstExprCall",
+			}),
+		);
 	});
 
-	it("should recurse through an elseif chain", async () => {
+	it("should recurse through an elseif chain", () => {
 		expect.assertions(1);
 
 		const root = parseBlock("if a then elseif b then elseif c then end");
@@ -357,5 +361,80 @@ describe("optional branches", () => {
 		visitBlock(root, { visitStatIf: onIf });
 
 		expect(onIf).toHaveBeenCalledTimes(3);
+	});
+});
+
+describe("descent order", () => {
+	it.for([
+		{ events: "block Binary ConstantNumber ConstantNumber", source: "local a = 1 + 2" },
+		{ events: "block Call Global ConstantNumber", source: "f(1)" },
+		{
+			events: "block Function function block ConstantNumber",
+			source: "local f = function() return 1 end",
+		},
+		{ events: "block Group ConstantNumber", source: "local a = (1)" },
+		{
+			events: "block IfElse Global ConstantNumber ConstantNumber",
+			source: "local a = if b then 1 else 2",
+		},
+		{ events: "block IndexExpr Global ConstantNumber", source: "local a = t[1]" },
+		{ events: "block IndexName Global", source: "local a = t.x" },
+		{ events: "block Instantiate Global", source: "local a = f<<T>>" },
+		{ events: "block InterpString ConstantNumber", source: "local a = `x{1}`" },
+		{ events: "block Table ConstantNumber", source: "local a = { 1 }" },
+		{ events: "block TypeAssertion ConstantNumber", source: "local a = 1 :: number" },
+		{ events: "block Unary ConstantNumber", source: "local a = -1" },
+		{ events: "block Global ConstantNumber", source: "a = 1" },
+		{ events: "block Global ConstantNumber", source: "a += 1" },
+		{ events: "block ConstantNumber ConstantNumber block", source: "for i = 1, 2 do end" },
+		{ events: "block Global block", source: "for k in f do end" },
+		{ events: "block IndexName Global function block", source: "function t.m() end" },
+		{ events: "block Global block", source: "if a then end" },
+		{ events: "block ConstantNumber", source: "local a = 1" },
+		{
+			events: "block function block ConstantNumber",
+			source: "local function f() return 1 end",
+		},
+		{ events: "block block Global", source: "repeat until a" },
+		{ events: "block ConstantNumber", source: "return 1" },
+		{ events: "block Global block", source: "while a do end" },
+		{ events: "block Table Global ConstantNumber", source: "local t = { [a] = 1 }" },
+		{ events: "block Global block block Call Global", source: "if a then else b() end" },
+	])("should visit every child in order for $source", ({ events, source }) => {
+		expect.assertions(1);
+
+		const visited: Array<string> = [];
+		visitBlock(parseBlock(source), {
+			visitExpr: (node) => {
+				visited.push(node.type.replace("AstExpr", ""));
+				return true;
+			},
+			visitExprFunction: () => {
+				visited.push("function");
+				return true;
+			},
+			visitStatBlock: () => {
+				visited.push("block");
+				return true;
+			},
+		});
+
+		expect(visited).toStrictEqual(events.split(" "));
+	});
+});
+
+describe(visitStatement, () => {
+	it("should descend into a block passed as a statement", () => {
+		expect.assertions(1);
+
+		const visited: Array<number> = [];
+		visitStatement(parseBlock("local a = 1"), {
+			visitExprConstantNumber: ({ value }) => {
+				visited.push(value);
+				return true;
+			},
+		});
+
+		expect(visited).toStrictEqual([1]);
 	});
 });

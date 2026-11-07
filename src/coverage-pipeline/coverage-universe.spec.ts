@@ -2,13 +2,13 @@ import * as path from "node:path";
 import process from "node:process";
 import { describe, expect, it } from "vitest";
 
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import { posixPath } from "#test/mocks/posix-path.ts";
 import {
 	createCoverageUniverseMatcher,
 	filterCoverageUniverse,
 	resolveUniverseAnchor,
 } from "./coverage-universe.ts";
-import type { MappedCoverageResult, MappedFileCoverage } from "./mapper.ts";
+import type { MappedCoverageResult, MappedFileCoverage } from "./mapper-types.ts";
 
 function mappedFile(filePath: string): MappedFileCoverage {
 	return {
@@ -144,6 +144,16 @@ describe(filterCoverageUniverse, () => {
 		expect(keys(filtered)).toStrictEqual(["src/a.ts"]);
 	});
 
+	it("should treat bangs after the first include negation literally", () => {
+		expect.assertions(1);
+
+		const filtered = filterCoverageUniverse(resultFor("src/!generated.ts", "src/main.ts"), {
+			include: ["**/*.ts", "!!generated.ts"],
+		});
+
+		expect(keys(filtered)).toStrictEqual(["src/main.ts"]);
+	});
+
 	it("should drop a file that is included but also ignored", () => {
 		expect.assertions(1);
 
@@ -199,15 +209,30 @@ describe(filterCoverageUniverse, () => {
 		expect.assertions(1);
 
 		const filtered = filterCoverageUniverse(
-			resultFor("src/a.ts", "src/b.ts", "src/Stryker was here"),
+			resultFor("src/a.ts", "src/b.ts", "src/unlisted.ts"),
 			{},
 		);
 
-		expect(keys(filtered)).toStrictEqual(["src/Stryker was here", "src/a.ts", "src/b.ts"]);
+		expect(keys(filtered)).toStrictEqual(["src/a.ts", "src/b.ts", "src/unlisted.ts"]);
 	});
 });
 
 describe(createCoverageUniverseMatcher, () => {
+	it("should make absent and empty ignore lists select the same files", () => {
+		expect.assertions(1);
+
+		const withoutIgnore = createCoverageUniverseMatcher({ include: ["src/**/*.ts"] });
+		const withEmptyIgnore = createCoverageUniverseMatcher({
+			ignore: [],
+			include: ["src/**/*.ts"],
+		});
+
+		expect([withoutIgnore("src/a.ts"), withEmptyIgnore("src/a.ts")]).toStrictEqual([
+			true,
+			true,
+		]);
+	});
+
 	it("should apply empty, path, basename, negated, and ignore patterns exactly", () => {
 		expect.assertions(1);
 
@@ -254,7 +279,11 @@ describe(createCoverageUniverseMatcher, () => {
 });
 
 describe(resolveUniverseAnchor, () => {
-	/** The anchor as a plain string, so an assertion can name one. */
+	/**
+	 * The anchor as a plain string, so an assertion can name one.
+	 * @param rootDirectory - The configured rootDir, if any.
+	 * @returns The resolved anchor.
+	 */
 	function anchorFor(rootDirectory?: string): string {
 		return resolveUniverseAnchor(rootDirectory);
 	}
@@ -281,7 +310,7 @@ describe(resolveUniverseAnchor, () => {
 		expect.assertions(1);
 
 		expect(anchorFor("packages/foo")).toBe(
-			path.posix.join(normalizeWindowsPath(process.cwd()), "packages/foo"),
+			path.posix.join(posixPath(process.cwd()), "packages/foo"),
 		);
 	});
 });

@@ -1,10 +1,11 @@
 import { isRojoTreeNode } from "@isentinel/rojo-utils";
 
 import { type } from "arktype";
-import { vol } from "memfs";
 import { assert } from "vitest";
 
-import type { RojoTreeNode } from "../../src/types/rojo.ts";
+import type { RojoTreeNode } from "#src/types/rojo.ts";
+import type { MemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
 
 /**
  * Where synthesis parks each package's tree, mirroring `STAGE_KEY` in
@@ -19,13 +20,22 @@ const STAGE_KEY = "__pkg_stage";
 /** A project a staging pass has rewritten and handed back as JSON. */
 export const stagedProjectSchema = type({ "[string]": "unknown", "tree": "object" });
 
-/** Resets the memfs volume and seeds it with the files a test needs. */
-export function seed(files: Record<string, string> = {}): void {
-	vol.reset();
-	vol.fromJSON(files);
+/**
+ * A volume of its own, holding the files a test needs.
+ *
+ * @param files - What the staging pass should find on disk.
+ * @returns Memory file system holding `files`.
+ */
+export function seed(files: Record<string, string> = {}): MemoryFileSystem {
+	return createMemoryFileSystem(files);
 }
 
-/** A wrapped project whose single stage holds `stage`. */
+/**
+ * A wrapped project whose single stage holds `stage`.
+ * @param stage - Node the stage holds.
+ * @param globIgnorePaths - Project `globIgnorePaths`, when set.
+ * @returns Serialized project.
+ */
 export function stagedProject(stage: RojoTreeNode, globIgnorePaths?: Array<string>): string {
 	return JSON.stringify({
 		...(globIgnorePaths === undefined ? {} : { globIgnorePaths }),
@@ -39,6 +49,9 @@ export function stagedProject(stage: RojoTreeNode, globIgnorePaths?: Array<strin
 
 /**
  * Walks from the stage down a chain of node keys, short-circuiting on a miss.
+ * @param project - Parsed staged project.
+ * @param keys - Node keys to walk.
+ * @returns The node, or `undefined` when a key is missing.
  */
 export function staged(
 	{ tree }: typeof stagedProjectSchema.infer,
@@ -51,7 +64,12 @@ export function staged(
 	);
 }
 
-/** The `$path` a staged node mounts, or `undefined` when it mounts nothing. */
+/**
+ * The `$path` a staged node mounts, or `undefined` when it mounts nothing.
+ * @param project - Parsed staged project.
+ * @param keys - Node keys to walk.
+ * @returns The `$path`, or `undefined`.
+ */
 export function mountOf(
 	project: typeof stagedProjectSchema.infer,
 	...keys: Array<string>
@@ -63,6 +81,8 @@ export function mountOf(
 /**
  * The attribute a shared-pool marker carries, or `undefined` when the node is
  * no marker.
+ * @param node - Node to read.
+ * @returns The pool key, or `undefined`.
  */
 export function poolKeyOf(node: RojoTreeNode | undefined): string | undefined {
 	const attributes = node?.["$attributes"];
@@ -84,6 +104,9 @@ export function poolKeyOf(node: RojoTreeNode | undefined): string | undefined {
  * narrowing that union asks for — a schema claiming `RojoTreeNode` while
  * checking nothing below the top level would accept an array and hand the
  * caller a `$path` that was never there.
+ * @param node - Parent node.
+ * @param key - Instance name under `node`.
+ * @returns The child node, or `undefined` when absent.
  */
 function child(node: RojoTreeNode, key: string): RojoTreeNode | undefined {
 	const value = node[key];

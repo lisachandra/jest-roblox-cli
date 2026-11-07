@@ -1,35 +1,10 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import fs, { readFileSync } from "node:fs";
+import process from "node:process";
 import { defineConfig, type ExportsOptions } from "tsdown";
 
-import {
-	buildIstanbulHtmlAssetsModule,
-	ISTANBUL_HTML_ASSETS_ID,
-} from "./loaders/istanbul-html-assets.mjs";
-
-/**
- * Puts istanbul's html assets in the bundle. Both builds carry them: the
- * reporters read them from beside their own module otherwise, which only holds
- * for an install with `node_modules` beside it.
- */
-function istanbulHtmlAssetsPlugin() {
-	return {
-		name: "istanbul-html-assets",
-		load(id: string) {
-			if (id !== ISTANBUL_HTML_ASSETS_ID) {
-				return;
-			}
-
-			return buildIstanbulHtmlAssetsModule();
-		},
-		resolveId(id: string) {
-			if (id !== ISTANBUL_HTML_ASSETS_ID) {
-				return;
-			}
-
-			return { id, external: false };
-		},
-	};
-}
+import { virtualModulesPlugin } from "./loaders/virtual-modules.mjs";
+import { resolveSeaExecutable } from "./scripts/sea-executable.ts";
 
 function luauRawPlugin() {
 	return {
@@ -46,7 +21,7 @@ function luauRawPlugin() {
 }
 
 // cspell:ignore giget
-const SEA_STUB_MODULES = new Set(["@typescript/native-preview", "giget", "oxc-parser"]);
+const SEA_STUB_MODULES = new Set(["@typescript/native", "giget", "oxc-parser"]);
 
 type ExportsMap = Parameters<
 	Extract<NonNullable<ExportsOptions["customExports"]>, (...args: never) => void>
@@ -72,11 +47,6 @@ function seaStubPlugin() {
 	};
 }
 
-const [majorPart, minorPart] = process.versions.node.split(".").map((part) => Number(part));
-const major = majorPart ?? 0;
-const minor = minorPart ?? 0;
-const canBuildSea = major > 25 || (major === 25 && minor >= 7);
-
 function sortExports(exportsMap: ExportsMap): ExportsMap {
 	const collator = new Intl.Collator();
 	const sorted = Object.entries(exportsMap).toSorted(([a], [b]) => {
@@ -97,17 +67,22 @@ function isConditionalExport(entry: unknown): entry is Record<string, string> {
 	return typeof entry === "object" && entry !== null;
 }
 
-// tsdown derives `.` from the `src/index.ts` entry. Both subpaths ship the same
-// dist chunk, but their `source` conditions differ: `.` resolves to the slim
-// `source.ts` barrel so a workspace consumer typechecking from source never
-// pulls the CLI's `.luau` graph, and `./artifacts` opts into the full producer
-// API (`prepareArtifacts`, `loadConfig`, …) for the consumers that need it.
+/**
+ * The tsdown build derives `.` from the `src/index.ts` entry. Both subpaths
+ * ship the same dist chunk, but their `source` conditions differ: `.` resolves to the slim
+ * `source.ts` barrel so a workspace consumer typechecking from source never
+ * pulls the CLI's `.luau` graph, and `./artifacts` opts into the full producer
+ * API (`prepareArtifacts`, `loadConfig`, …) for the consumers that need it.
+ * @param exportsMap - Exports tsdown derives.
+ * @returns Exports with the `source` conditions set.
+ */
 function customizeExports(exportsMap: ExportsMap): ExportsMap {
 	const root: unknown = exportsMap["."];
 	return sortExports({
 		...exportsMap,
 		".": isConditionalExport(root) ? { ...root, source: "./src/source.ts" } : root,
 		"./artifacts": root,
+		"./loader": "./loaders/luau-raw.mjs",
 	});
 }
 
@@ -126,7 +101,7 @@ export default defineConfig([
 				"typescript",
 				"ws",
 			],
-			onlyBundle: ["@rbxts/jest", "type-fest"],
+			onlyBundle: ["@rbxts/jest", "remeda", "type-fest"],
 		},
 		dts: {
 			build: true,
@@ -140,31 +115,37 @@ export default defineConfig([
 		},
 		fixedExtension: true,
 		format: ["esm"],
-		plugins: [istanbulHtmlAssetsPlugin(), luauRawPlugin()],
+		plugins: [virtualModulesPlugin(), luauRawPlugin()],
 		publint: true,
 		shims: true,
 		target: ["node24"],
 		unbundle: false,
 	},
-	...(canBuildSea
-		? [
-				{
-					deps: { alwaysBundle: [/.*/] },
-					entry: ["src/sea-entry.ts"],
-					exe: {
-						fileName: "jest-roblox",
-						outDir: "dist/sea",
-						seaConfig: {
-							disableExperimentalSEAWarning: true,
-							useCodeCache: true,
-						},
+	{
+		deps: { alwaysBundle: [/.*/] },
+		entry: ["bin/sea-entry.ts"],
+		exe: {
+			fileName: "jest-roblox",
+			outDir: "dist/sea",
+			seaConfig: {
+				disableExperimentalSEAWarning: true,
+				executable: resolveSeaExecutable({
+					cacheDirectory: "node_modules/.cache/jest-roblox-sea",
+					execPath: process.execPath,
+					fileSystem: fs,
+					platform: process.platform,
+					strip: (file) => {
+						execFileSync("strip", [file], { windowsHide: true });
 					},
-					format: ["cjs" as const],
-					outDir: "dist/sea",
-					plugins: [istanbulHtmlAssetsPlugin(), seaStubPlugin(), luauRawPlugin()],
-					shims: true,
-					target: ["node25"],
-				},
-			]
-		: []),
+					version: process.version,
+				}),
+				useCodeCache: true,
+			},
+		},
+		format: ["cjs"],
+		outDir: "dist/sea",
+		plugins: [virtualModulesPlugin(), seaStubPlugin(), luauRawPlugin()],
+		shims: true,
+		target: ["node25"],
+	},
 ]);

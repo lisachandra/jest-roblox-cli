@@ -1,52 +1,87 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import { formatSourceSnippet } from "../formatters/formatter.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { posixPath } from "#test/mocks/posix-path.ts";
+import type { SourceMapSegment } from "#test/mocks/source-map.ts";
+import { buildSourceMap } from "#test/mocks/source-map.ts";
+import type { FileSystem } from "../utils/file-system.ts";
 import type { SourceMapper } from "./index.ts";
 import { combineSourceMappers, createSourceMapper, getSourceSnippet } from "./index.ts";
-import { getSourceContent, mapFromSourceMap } from "./v3-mapper.ts";
 
-vi.mock(import("node:fs"));
-vi.mock(import("./v3-mapper"));
+/** The rojo tree every roblox-ts case below maps through. */
+const SHARED_PROJECT = { name: "test", tree: { ReplicatedStorage: { $path: "out/shared" } } };
+
+/** The tsconfig mapping that pairs with {@link SHARED_PROJECT}. */
+const SHARED_MAPPINGS = [{ outDir: "out", rootDir: "src" }];
+
+/** Where a frame in `out/shared/test.luau` says its TypeScript lives. */
+const SHARED_SOURCE = "../src/shared/test.ts";
+
+/** That same source as an absolute path, which is what a location reports. */
+const SHARED_SOURCE_PATH = posixPath(path.resolve("out/shared", SHARED_SOURCE));
+
+/**
+ * A volume seeded relative to the working directory, because a rojo `$path`
+ * and a tsconfig `outDir` are both relative and the resolver joins onto them.
+ *
+ * @param files - What the run should find on disk.
+ * @returns The seeded filesystem.
+ */
+function seedProject(files: Record<string, string>): FileSystem {
+	return createMemoryFileSystem(files).fileSystem;
+}
+
+/**
+ * The map beside `out/shared/test.luau`, resolving the generated lines given.
+ *
+ * @param segments - Which generated lines map to which source lines.
+ * @param sourceContent - The source text to embed, when the case needs one.
+ * @returns The `.map` file keyed by its path.
+ */
+function sharedMap(
+	segments: ReadonlyArray<SourceMapSegment>,
+	sourceContent?: string,
+): Record<string, string> {
+	return {
+		"out/shared/test.luau.map": buildSourceMap({
+			file: "test.luau",
+			segments,
+			source: SHARED_SOURCE,
+			...(sourceContent === undefined ? {} : { sourceContent }),
+		}),
+	};
+}
+
+/**
+ * One generated line mapped to one source line, both at column 0.
+ * @param generatedLine - The Luau line.
+ * @param sourceLine - The TypeScript line it maps to.
+ * @returns The segment.
+ */
+function lineToLine(generatedLine: number, sourceLine: number): SourceMapSegment {
+	return { generatedColumn: 0, generatedLine, sourceColumn: 0, sourceLine };
+}
 
 describe(createSourceMapper, () => {
 	it("should map failure message using V3 sourcemap", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		const resolvedTsPath = normalizeWindowsPath(
-			path.resolve("out/shared", "../src/shared/test.ts"),
-		);
-
-		vi.mocked(mapFromSourceMap).mockReturnValue({
-			column: 0,
-			line: 2,
-			source: "../src/shared/test.ts",
+		const fileSystem = seedProject({
+			...sharedMap([lineToLine(2, 2)]),
+			[SHARED_SOURCE_PATH]: "line1\nprint('error here')\nline3",
 		});
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue("line1\nprint('error here')\nline3");
 
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem,
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `Error: test failed
 [string "ReplicatedStorage.test"]:2`;
 
-		const result = mapper.mapFailureWithLocations(input);
-
-		expect(result.message).toContain(`${resolvedTsPath}:2`);
+		expect(mapper.mapFailureWithLocations(input).message).toContain(`${SHARED_SOURCE_PATH}:2`);
 	});
 
 	it("should look up the sourcemap under outDir when rootDir is '.' (rootDirs project)", () => {
@@ -55,70 +90,49 @@ describe(createSourceMapper, () => {
 		// A `rootDirs: ["src", "test"]` tsconfig collapses rootDir to ".". The
 		// spec compiles to `out-test/src/...` and mounts under `server-tests`.
 		// The frame must resolve its sourcemap from the outDir-anchored Luau
-		// path, not a bare `src/...` path that has no `.luau.map` beside it.
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ServerScriptService: {
-					"server-tests": { $path: "out-test/src/server" },
-				},
-			},
-		};
-
-		vi.mocked(mapFromSourceMap).mockReturnValue({
-			column: 0,
-			line: 3,
-			source: "../../../../../src/server/modules/ecs/context.spec.ts",
+		// path, not a bare `src/...` path that has no `.luau.map` beside it —
+		// which is why the map is seeded there and nowhere else.
+		const generated = "out-test/src/server/modules/ecs/context.spec.luau";
+		const source = "../../../../../src/server/modules/ecs/context.spec.ts";
+		const sourcePath = posixPath(path.resolve(path.dirname(generated), source));
+		const fileSystem = seedProject({
+			[`${generated}.map`]: buildSourceMap({
+				file: "context.spec.luau",
+				segments: [lineToLine(20, 3)],
+				source,
+			}),
+			[sourcePath]: "line1\nexpect(x).toBe(1)\nline3",
 		});
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue("line1\nexpect(x).toBe(1)\nline3");
 
 		const mapper = createSourceMapper({
+			fileSystem,
 			mappings: [{ outDir: "out-test", rootDir: "." }],
-			rojoProject,
+			rojoProject: {
+				name: "test",
+				tree: {
+					ServerScriptService: { "server-tests": { $path: "out-test/src/server" } },
+				},
+			},
 		});
 
 		const input = `Error: test failed
 [string "ServerScriptService.server-tests.modules.ecs.context.spec"]:20`;
 
-		mapper.mapFailureWithLocations(input);
-
-		expect(mapFromSourceMap).toHaveBeenCalledWith(
-			"out-test/src/server/modules/ecs/context.spec.luau",
-			20,
-			undefined,
-		);
+		expect(mapper.mapFailureWithLocations(input).message).toContain(`${sourcePath}:3`);
 	});
 
 	it("should snapshot mapped failure message", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		const resolvedTsPath = normalizeWindowsPath(
-			path.resolve("out/shared", "../src/shared/test.ts"),
-		);
-
-		vi.mocked(mapFromSourceMap).mockReturnValue({
-			column: 0,
-			line: 5,
-			source: "../src/shared/test.ts",
+		const fileSystem = seedProject({
+			...sharedMap([lineToLine(10, 5)]),
+			[SHARED_SOURCE_PATH]: 'line1\nline2\nline3\nline4\nexpect(value).toBe("hello")\nline6',
 		});
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			'line1\nline2\nline3\nline4\nexpect(value).toBe("hello")\nline6',
-		);
 
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem,
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `expect(received).toBe(expected)
@@ -129,7 +143,7 @@ Received: "world"
 
 		const result = mapper
 			.mapFailureWithLocations(input)
-			.message.replaceAll(resolvedTsPath, "<mapped>");
+			.message.replaceAll(SHARED_SOURCE_PATH, "<mapped>");
 
 		expect(result).toMatchInlineSnapshot(`
 			"expect(received).toBe(expected)
@@ -143,43 +157,25 @@ Received: "world"
 	it("should resolve test file path by converting slashes to dots", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
-		const result = mapper.resolveTestFilePath("/ReplicatedStorage/test.spec");
-
 		// Path resolver maps DataModel → filesystem relative path
-		expect(result).toBe("src/shared/test.spec.ts");
+		expect(mapper.resolveTestFilePath("/ReplicatedStorage/test.spec")).toBe(
+			"src/shared/test.spec.ts",
+		);
 	});
 
 	it("should map no test file line for a path outside the rojo tree", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		expect(mapper.mapTestFileLine("/Workspace/test.spec", 4)).toBeUndefined();
@@ -188,28 +184,15 @@ Received: "world"
 	it("should return locations from mapFailureWithLocations", () => {
 		expect.assertions(3);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		vi.mocked(mapFromSourceMap).mockReturnValue({
-			column: 0,
-			line: 5,
-			source: "../src/shared/test.ts",
+		const fileSystem = seedProject({
+			...sharedMap([lineToLine(10, 5)]),
+			[SHARED_SOURCE_PATH]: "line1\nline2\nline3\nline4\nexpect(x).toBe(1)\nline6",
 		});
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			"line1\nline2\nline3\nline4\nexpect(x).toBe(1)\nline6",
-		);
 
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem,
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `Error: test failed
@@ -225,20 +208,10 @@ Received: "world"
 	it("should skip unresolvable frames in mapFailureWithLocations", () => {
 		expect.assertions(2);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		vi.mocked(fs.existsSync).mockReturnValue(false);
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `Error: test failed
@@ -253,20 +226,10 @@ Received: "world"
 	it("should emit Luau-only location when no tsconfig (outDir/rootDir undefined)", () => {
 		expect.assertions(4);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					lib: { $path: "lib" },
-				},
-			},
-		};
-
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-
 		const mapper = createSourceMapper({
+			fileSystem: seedProject({ "lib/test.spec.luau": "-- test" }),
 			mappings: [],
-			rojoProject,
+			rojoProject: { name: "test", tree: { ReplicatedStorage: { lib: { $path: "lib" } } } },
 		});
 
 		const input = `Error: test failed
@@ -283,53 +246,27 @@ Received: "world"
 	it("should replace DataModel path with Luau file path for Luau-only frames", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					lib: { $path: "lib" },
-				},
-			},
-		};
-
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-
 		const mapper = createSourceMapper({
+			fileSystem: seedProject({ "lib/test.spec.luau": "-- test" }),
 			mappings: [],
-			rojoProject,
+			rojoProject: { name: "test", tree: { ReplicatedStorage: { lib: { $path: "lib" } } } },
 		});
 
 		const input = `Error: test failed
 [string "ReplicatedStorage.lib.test.spec"]:5`;
 
-		const result = mapper.mapFailureWithLocations(input);
-
-		expect(result.message).not.toContain('[string "ReplicatedStorage.lib.test.spec"]:5');
+		expect(mapper.mapFailureWithLocations(input).message).not.toContain(
+			'[string "ReplicatedStorage.lib.test.spec"]:5',
+		);
 	});
 
 	it("should return location without column when source file missing", () => {
 		expect.assertions(2);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		vi.mocked(mapFromSourceMap).mockReturnValue({
-			column: 0,
-			line: 5,
-			source: "../src/shared/test.ts",
-		});
-		vi.mocked(getSourceContent).mockReturnValue(null);
-		vi.mocked(fs.existsSync).mockReturnValue(false);
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject(sharedMap([lineToLine(10, 5)])),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `Error: test failed
@@ -344,54 +281,30 @@ Received: "world"
 	it("should handle source line beyond file bounds", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		vi.mocked(mapFromSourceMap).mockReturnValue({
-			column: 0,
-			line: 999,
-			source: "../src/shared/test.ts",
+		const fileSystem = seedProject({
+			...sharedMap([lineToLine(10, 999)]),
+			[SHARED_SOURCE_PATH]: "line1\nline2\nline3",
 		});
-		vi.mocked(getSourceContent).mockReturnValue(null);
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue("line1\nline2\nline3");
 
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem,
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `Error: test failed
 [string "ReplicatedStorage.test"]:10`;
 
-		const result = mapper.mapFailureWithLocations(input);
-
-		expect(result.locations[0]!.tsLine).toBe(999);
+		expect(mapper.mapFailureWithLocations(input).locations[0]!.tsLine).toBe(999);
 	});
 
 	it("should only push the first luau-only frame as a location", () => {
 		expect.assertions(2);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		vi.mocked(mapFromSourceMap).mockReturnValue(undefined);
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `Error: test failed
@@ -407,20 +320,10 @@ Received: "world"
 	it("should return luau-only location when source map is unavailable", () => {
 		expect.assertions(4);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
-		vi.mocked(mapFromSourceMap).mockReturnValue(undefined);
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		const input = `Error: test failed
@@ -439,18 +342,13 @@ describe("resolveDisplayPath", () => {
 	it("should rewrite init to index for unmapped Luau path in roblox-ts project", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					"flux:tests": { $path: "out-test" },
-				},
-			},
-		};
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: {
+				name: "test",
+				tree: { ReplicatedStorage: { "flux:tests": { $path: "out-test" } } },
+			},
 		});
 
 		expect(mapper.resolveDisplayPath("/ReplicatedStorage/flux:tests/init.spec")).toBe(
@@ -461,18 +359,10 @@ describe("resolveDisplayPath", () => {
 	it("should rewrite init to index for unresolvable raw path in roblox-ts project", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		expect(mapper.resolveDisplayPath("src/init.spec")).toBe("src/index.spec");
@@ -481,18 +371,10 @@ describe("resolveDisplayPath", () => {
 	it("should leave init untouched in pure-Luau project", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
 		const mapper = createSourceMapper({
+			fileSystem: seedProject({}),
 			mappings: [],
-			rojoProject,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		expect(mapper.resolveDisplayPath("src/init.spec")).toBe("src/init.spec");
@@ -501,18 +383,10 @@ describe("resolveDisplayPath", () => {
 	it("should be idempotent for already-resolved TS path", () => {
 		expect.assertions(1);
 
-		const rojoProject = {
-			name: "test",
-			tree: {
-				ReplicatedStorage: {
-					$path: "out/shared",
-				},
-			},
-		};
-
 		const mapper = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
-			rojoProject,
+			fileSystem: seedProject({}),
+			mappings: SHARED_MAPPINGS,
+			rojoProject: SHARED_PROJECT,
 		});
 
 		expect(mapper.resolveDisplayPath("src/shared/index.spec.ts")).toBe(
@@ -590,11 +464,14 @@ describe(combineSourceMappers, () => {
 	it("should not let a non-owning roblox-ts child rewrite another project's path", () => {
 		expect.assertions(1);
 
+		const fileSystem = seedProject({ "lib/init.spec.luau": "-- test" });
 		const robloxTs = createSourceMapper({
-			mappings: [{ outDir: "out", rootDir: "src" }],
+			fileSystem,
+			mappings: SHARED_MAPPINGS,
 			rojoProject: { name: "ts", tree: { ReplicatedStorage: { $path: "out/shared" } } },
 		});
 		const luauOnly = createSourceMapper({
+			fileSystem,
 			mappings: [],
 			rojoProject: { name: "luau", tree: { ServerStorage: { lib: { $path: "lib" } } } },
 		});
@@ -614,16 +491,9 @@ describe(getSourceSnippet, () => {
 	it("should return snippet with context lines", () => {
 		expect.assertions(3);
 
-		const fileContent = `line 1
-line 2
-line 3
-line 4
-line 5`;
+		const fileSystem = seedProject({ "test.ts": "line 1\nline 2\nline 3\nline 4\nline 5" });
 
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(fileContent);
-
-		const snippet = getSourceSnippet({ context: 1, filePath: "test.ts", line: 3 });
+		const snippet = getSourceSnippet({ context: 1, filePath: "test.ts", fileSystem, line: 3 });
 
 		expect(snippet).toBeDefined();
 		expect(snippet!.failureLine).toBe(3);
@@ -633,14 +503,17 @@ line 5`;
 	it("should include column if provided", () => {
 		expect.assertions(2);
 
-		const fileContent = `line 1
-  expect(true).toBe(false)
-line 3`;
+		const fileSystem = seedProject({
+			"test.ts": "line 1\n  expect(true).toBe(false)\nline 3",
+		});
 
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(fileContent);
-
-		const snippet = getSourceSnippet({ column: 10, context: 1, filePath: "test.ts", line: 2 });
+		const snippet = getSourceSnippet({
+			column: 10,
+			context: 1,
+			filePath: "test.ts",
+			fileSystem,
+			line: 2,
+		});
 
 		expect(snippet).toBeDefined();
 		expect(snippet!.column).toBe(10);
@@ -649,9 +522,11 @@ line 3`;
 	it("should return undefined when file does not exist", () => {
 		expect.assertions(1);
 
-		vi.mocked(fs.existsSync).mockReturnValue(false);
-
-		const snippet = getSourceSnippet({ filePath: "nonexistent.ts", line: 1 });
+		const snippet = getSourceSnippet({
+			filePath: "nonexistent.ts",
+			fileSystem: seedProject({}),
+			line: 1,
+		});
 
 		expect(snippet).toBeUndefined();
 	});
@@ -659,56 +534,55 @@ line 3`;
 	it("should handle lines at start of file", () => {
 		expect.assertions(2);
 
-		const fileContent = `line 1
-line 2
-line 3`;
+		const fileSystem = seedProject({ "test.ts": "line 1\nline 2\nline 3" });
 
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(fileContent);
-
-		const snippet = getSourceSnippet({ filePath: "test.ts", line: 1 });
+		const snippet = getSourceSnippet({ filePath: "test.ts", fileSystem, line: 1 });
 
 		expect(snippet).toBeDefined();
 		expect(snippet!.lines[0]!.num).toBe(1);
 	});
 
-	it("should snapshot rendered snippet with context", () => {
+	it("should return the failing line with its context", () => {
 		expect.assertions(1);
 
-		const fileContent = `import { expect } from "vitest";
+		const fileSystem = seedProject({
+			"math.spec.ts": `import { expect } from "vitest";
 describe("math", () => {
   it("should add", () => {
     expect(2 + 2).toBe(5);
   });
-});`;
+});`,
+		});
 
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(fileContent);
+		const snippet = getSourceSnippet({
+			context: 2,
+			filePath: "math.spec.ts",
+			fileSystem,
+			line: 4,
+		});
 
-		const snippet = getSourceSnippet({ context: 2, filePath: "math.spec.ts", line: 4 });
-
-		expect(formatSourceSnippet(snippet!, "math.spec.ts", { useColor: false }))
-			.toMatchInlineSnapshot(`
-				" ❯ math.spec.ts:4:19
-					2| describe("math", () => {
-					3|   it("should add", () => {
-					4|     expect(2 + 2).toBe(5);
-					 |                   ^
-					5|   });
-					6| });"
-			`);
+		expect(snippet).toStrictEqual({
+			column: 19,
+			failureLine: 4,
+			lines: [
+				{ content: 'describe("math", () => {', num: 2 },
+				{ content: '  it("should add", () => {', num: 3 },
+				{ content: "    expect(2 + 2).toBe(5);", num: 4 },
+				{ content: "  });", num: 5 },
+				{ content: "});", num: 6 },
+			],
+		});
 	});
 
 	it("should use sourceContent when provided instead of reading file", () => {
 		expect.assertions(2);
 
-		const sourceContent = "line1\nline2\nline3";
-
 		const snippet = getSourceSnippet({
 			context: 1,
 			filePath: "nonexistent.ts",
+			fileSystem: seedProject({}),
 			line: 2,
-			sourceContent,
+			sourceContent: "line1\nline2\nline3",
 		});
 
 		expect(snippet).toBeDefined();
@@ -718,12 +592,11 @@ describe("math", () => {
 	it("should handle out-of-bounds line in getSourceSnippet", () => {
 		expect.assertions(2);
 
-		const sourceContent = "line1\nline2\nline3";
-
 		const snippet = getSourceSnippet({
 			filePath: "test.ts",
+			fileSystem: seedProject({}),
 			line: 100,
-			sourceContent,
+			sourceContent: "line1\nline2\nline3",
 		});
 
 		expect(snippet).toBeDefined();
@@ -733,14 +606,11 @@ describe("math", () => {
 	it("should compute column from expect line when not provided", () => {
 		expect.assertions(2);
 
-		const fileContent = `describe("test", () => {
-  expect(2 + 2).toBe(5);
-});`;
+		const fileSystem = seedProject({
+			"test.ts": 'describe("test", () => {\n  expect(2 + 2).toBe(5);\n});',
+		});
 
-		vi.mocked(fs.existsSync).mockReturnValue(true);
-		vi.mocked(fs.readFileSync).mockReturnValue(fileContent);
-
-		const snippet = getSourceSnippet({ context: 1, filePath: "test.ts", line: 2 });
+		const snippet = getSourceSnippet({ context: 1, filePath: "test.ts", fileSystem, line: 2 });
 
 		expect(snippet).toBeDefined();
 		// '  expect(2 + 2).toBe' -> 'toBe' starts at col 17 (1-indexed)

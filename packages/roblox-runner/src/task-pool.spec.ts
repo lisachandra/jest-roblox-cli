@@ -2,18 +2,10 @@ import { ApiError, RateLimitError } from "@bedrock-rbx/ocale";
 
 import { describe, expect, it, vi } from "vitest";
 
+import type { ScriptResult } from "./runner-types.ts";
 import { runTaskPoolAsync } from "./task-pool.ts";
 import type { TaskPoolBackoff, TaskPoolPlace } from "./task-pool.ts";
-import type { ScriptResult } from "./types.ts";
 
-/** Envelope a task returns when it finds the shared queue already drained. */
-const EMPTY_MARKER = "EMPTY";
-
-/**
- * What a pool task rejects with. The pool surfaces an `Error` as-is and
- * normalizes anything else into one, carrying the original as `cause` — the
- * plain-object arm is what drives that second path.
- */
 type TaskRejection = Error | { readonly code: string };
 
 interface AttemptCounter {
@@ -37,30 +29,29 @@ function makeDeferred(): Deferred {
 }
 
 function makeScriptResult(outputs: Array<string> = ["[]"]): ScriptResult {
-	return { durationMs: 1, outputs };
+	return {
+		durationMs: 1,
+		outputs,
+		terminalTask: {
+			ref: { sessionId: "session-1", taskId: "task-1" },
+			state: "COMPLETE",
+		},
+	};
 }
 
-/** Flush the microtask queue so settled-task continuations run. */
-async function flushAsync(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
-}
-
-function hasEvery(seen: ReadonlySet<string>, entries: ReadonlyArray<string>): boolean {
-	return entries.every((entry) => seen.has(entry));
-}
-
-/** A task that hands out the next queued item, or {@link EMPTY_MARKER}. */
 function makeQueueDrainingTask(queue: Array<string>): () => Promise<ScriptResult> {
 	return async () => makeScriptResult([queue.shift() ?? EMPTY_MARKER]);
 }
 
-/** A place drawing from `queue`, tallying its launches in `placeCalls`. */
-function makeSharedQueuePlace(
-	queue: Array<string>,
-	placeCalls: Array<number>,
-	placeIndex: number,
-): TaskPoolPlace {
+function makeSharedQueuePlace({
+	placeCalls,
+	placeIndex,
+	queue,
+}: {
+	placeCalls: Array<number>;
+	placeIndex: number;
+	queue: Array<string>;
+}): TaskPoolPlace {
 	const drainAsync = makeQueueDrainingTask(queue);
 	return {
 		runTask: async () => {
@@ -79,17 +70,19 @@ function makeNonEmptyCollector(processed: Array<string>): (result: ScriptResult)
 	};
 }
 
-/** A task throwing on `throwingAttempt`, returning an envelope after. */
-function makeThrowingTask(
-	counter: AttemptCounter,
-	throwingAttempt: number,
-	makeError: () => TaskRejection,
-): () => Promise<ScriptResult> {
+function makeThrowingTask({
+	counter,
+	makeError,
+	throwingAttempt,
+}: {
+	counter: AttemptCounter;
+	makeError: () => TaskRejection;
+	throwingAttempt: number;
+}): () => Promise<ScriptResult> {
 	return async () => {
 		counter.attempt += 1;
 		if (counter.attempt === throwingAttempt) {
-			// A non-Error rejection is one of the cases the pool normalizes.
-			// eslint-disable-next-line ts/only-throw-error -- see above
+			// oxlint-disable-next-line typescript/only-throw-error -- fixture exercises normalization of non-Error rejections
 			throw makeError();
 		}
 
@@ -101,19 +94,14 @@ function throwOnceThenSucceed(
 	counter: AttemptCounter,
 	error: TaskRejection,
 ): () => Promise<ScriptResult> {
-	return makeThrowingTask(counter, 1, () => error);
+	return makeThrowingTask({ counter, makeError: () => error, throwingAttempt: 1 });
 }
 
 describe(runTaskPoolAsync, () => {
 	it("should fill to concurrency on start", async () => {
 		expect.assertions(2);
 
-		const pending: Array<Deferred> = [];
-		const runTask = vi.fn<() => Promise<ScriptResult>>(async () => {
-			const deferred = makeDeferred();
-			pending.push(deferred);
-			return deferred.promise;
-		});
+		const { pending, runTask } = makePendingTask();
 
 		let isDone = false;
 		const pool = runTaskPoolAsync({
@@ -136,12 +124,7 @@ describe(runTaskPoolAsync, () => {
 	it("should report each settled task under its own stable slot index", async () => {
 		expect.assertions(2);
 
-		const pending: Array<Deferred> = [];
-		const runTask = vi.fn<() => Promise<ScriptResult>>(async () => {
-			const deferred = makeDeferred();
-			pending.push(deferred);
-			return deferred.promise;
-		});
+		const { pending, runTask } = makePendingTask();
 
 		const slots: Array<number> = [];
 		let isDone = false;
@@ -174,12 +157,7 @@ describe(runTaskPoolAsync, () => {
 	it("should relaunch a slot when a task returns while work remains", async () => {
 		expect.assertions(3);
 
-		const pending: Array<Deferred> = [];
-		const runTask = vi.fn<() => Promise<ScriptResult>>(async () => {
-			const deferred = makeDeferred();
-			pending.push(deferred);
-			return deferred.promise;
-		});
+		const { pending, runTask } = makePendingTask();
 
 		let isDone = false;
 		const pool = runTaskPoolAsync({
@@ -189,7 +167,7 @@ describe(runTaskPoolAsync, () => {
 			places: [{ runTask }],
 		});
 
-		expect(runTask).toHaveBeenCalledOnce();
+		expect(runTask).toHaveBeenCalledExactlyOnceWith(0);
 
 		pending[0]!.resolve(makeScriptResult());
 		await flushAsync();
@@ -205,12 +183,7 @@ describe(runTaskPoolAsync, () => {
 	it("should stop launching once done and resolve after in-flight settle", async () => {
 		expect.assertions(2);
 
-		const pending: Array<Deferred> = [];
-		const runTask = vi.fn<() => Promise<ScriptResult>>(async () => {
-			const deferred = makeDeferred();
-			pending.push(deferred);
-			return deferred.promise;
-		});
+		const { pending, runTask } = makePendingTask();
 
 		let isDone = false;
 		const pool = runTaskPoolAsync({
@@ -279,7 +252,7 @@ describe(runTaskPoolAsync, () => {
 	});
 
 	it("should normalize a non-Error task rejection before surfacing it", async () => {
-		expect.assertions(3);
+		expect.assertions(1);
 
 		const counter = { attempt: 0 };
 		const rejection = { code: "transient" };
@@ -296,12 +269,13 @@ describe(runTaskPoolAsync, () => {
 			places: [{ runTask }],
 		});
 
-		expect(onError).toHaveBeenCalledOnce();
-
-		const error = onError.mock.calls[0]![0];
-
-		expect(error.message).toBe("Task failed with a non-Error rejection");
-		expect(error.cause).toBe(rejection);
+		expect(onError).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				cause: rejection,
+				message: "Task failed with a non-Error rejection",
+			}),
+			0,
+		);
 	});
 
 	it("should swallow a task error when no onError handler is provided", async () => {
@@ -363,6 +337,60 @@ describe(runTaskPoolAsync, () => {
 
 		expect(runTask).not.toHaveBeenCalled();
 	});
+
+	it("should skip a launch while the consumer reports the remaining work covered", async () => {
+		expect.assertions(4);
+
+		const { pending, runTask } = makePendingTask();
+		const isWorkCovered = vi.fn<(liveTasks: number) => boolean>((liveTasks) => liveTasks >= 1);
+
+		let isDone = false;
+		const pool = runTaskPoolAsync({
+			concurrency: 3,
+			isDone: () => isDone,
+			isWorkCovered,
+			onResult: () => {},
+			places: [{ runTask }],
+		});
+
+		expect(runTask).toHaveBeenCalledOnce();
+
+		await flushAsync();
+
+		expect(isWorkCovered).toHaveBeenCalledTimes(2);
+
+		pending[0]!.resolve(makeScriptResult());
+		await flushAsync();
+
+		expect(runTask).toHaveBeenCalledTimes(2);
+
+		isDone = true;
+		pending[1]!.resolve(makeScriptResult());
+		await pool;
+
+		expect(isWorkCovered).not.toHaveBeenCalledWith(0);
+	});
+
+	it("should launch while covered when no task is live", async () => {
+		expect.assertions(2);
+
+		const counter = { attempt: 0 };
+		const runTask = vi.fn<(slot: number) => Promise<ScriptResult>>(async () => {
+			counter.attempt += 1;
+			return makeScriptResult();
+		});
+
+		await runTaskPoolAsync({
+			concurrency: 2,
+			isDone: () => counter.attempt >= 3,
+			isWorkCovered: () => true,
+			onResult: () => {},
+			places: [{ runTask }],
+		});
+
+		expect(runTask).toHaveBeenCalledTimes(3);
+		expect(runTask.mock.calls).toStrictEqual([[0], [0], [0]]);
+	});
 });
 
 describe("runTaskPool multi-place fan-out", () => {
@@ -378,8 +406,8 @@ describe("runTaskPool multi-place fan-out", () => {
 			isDone: () => queue.length === 0,
 			onResult: makeNonEmptyCollector(processed),
 			places: [
-				makeSharedQueuePlace(queue, placeCalls, 0),
-				makeSharedQueuePlace(queue, placeCalls, 1),
+				makeSharedQueuePlace({ placeCalls, placeIndex: 0, queue }),
+				makeSharedQueuePlace({ placeCalls, placeIndex: 1, queue }),
 			],
 		});
 
@@ -426,7 +454,9 @@ describe("runTaskPool multi-place fan-out", () => {
 
 		expect(runTaskA).toHaveBeenCalledTimes(10);
 		expect(runTaskB).toHaveBeenCalledTimes(10);
-		expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("exceeds"));
+		expect(warn).toHaveBeenCalledExactlyOnceWith(
+			"runTaskPool concurrency 25 exceeds 2 place(s) × 10 = 20; clamping to 20",
+		);
 	});
 
 	it("should warn through console.warn by default", () => {
@@ -442,7 +472,7 @@ describe("runTaskPool multi-place fan-out", () => {
 			places: [{ runTask }],
 		});
 
-		expect(consoleWarn).toHaveBeenCalledOnce();
+		expect(consoleWarn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("exceeds"));
 	});
 });
 
@@ -471,8 +501,54 @@ describe("runTaskPool backoff", () => {
 		});
 
 		expect(runTask).toHaveBeenCalledTimes(2);
-		expect(sleep).toHaveBeenCalledExactlyOnceWith(7000);
+		expect(sleep).toHaveBeenCalledExactlyOnceWith(7000, undefined);
 		expect(onError).not.toHaveBeenCalled();
+	});
+
+	it("should end a backoff wait once the signal aborts", async () => {
+		expect.assertions(2);
+
+		const controller = new AbortController();
+		const runTask = vi.fn<() => Promise<ScriptResult>>(async () => {
+			throw new RateLimitError("slow down", { retryAfterSeconds: 600 });
+		});
+
+		const pool = runTaskPoolAsync({
+			concurrency: 1,
+			isDone: () => controller.signal.aborted,
+			now: () => 0,
+			onResult: () => {},
+			places: [{ runTask }],
+			signal: controller.signal,
+		});
+		await flushAsync();
+		controller.abort();
+
+		await expect(pool).resolves.toBeUndefined();
+		expect(runTask).toHaveBeenCalledOnce();
+	});
+
+	it("should surface a backoff sleep failure that is not an abort", async () => {
+		expect.assertions(1);
+
+		const controller = new AbortController();
+		const runTask = vi.fn<() => Promise<ScriptResult>>(async () => {
+			throw new RateLimitError("slow down", { retryAfterSeconds: 7 });
+		});
+
+		const pool = runTaskPoolAsync({
+			concurrency: 1,
+			isDone: () => false,
+			now: () => 0,
+			onResult: () => {},
+			places: [{ runTask }],
+			signal: controller.signal,
+			sleep: async () => {
+				throw new Error("timer broke");
+			},
+		});
+
+		await expect(pool).rejects.toThrow("timer broke");
 	});
 
 	it("should floor a zero retry-after to the default delay, not spin", async () => {
@@ -488,17 +564,10 @@ describe("runTaskPool backoff", () => {
 		);
 		const sleep = vi.fn<(ms: number) => Promise<void>>().mockResolvedValue();
 
-		await runTaskPoolAsync({
-			concurrency: 1,
-			isDone: () => counter.attempt >= 2,
-			now: () => 0,
-			onResult: () => {},
-			places: [{ runTask }],
-			sleep,
-		});
+		await runRetryPoolAsync({ counter, runTask, sleep });
 
 		expect(runTask).toHaveBeenCalledTimes(2);
-		expect(sleep).toHaveBeenCalledExactlyOnceWith(5000);
+		expect(sleep).toHaveBeenCalledExactlyOnceWith(5000, undefined);
 	});
 
 	it("should back off a genuinely-full place by the default delay and retry", async () => {
@@ -513,30 +582,28 @@ describe("runTaskPool backoff", () => {
 		);
 		const sleep = vi.fn<(ms: number) => Promise<void>>().mockResolvedValue();
 
-		await runTaskPoolAsync({
-			concurrency: 1,
-			isDone: () => counter.attempt >= 2,
-			now: () => 0,
-			onResult: () => {},
-			places: [{ runTask }],
-			sleep,
-		});
+		await runRetryPoolAsync({ counter, runTask, sleep });
 
 		expect(runTask).toHaveBeenCalledTimes(2);
-		expect(sleep).toHaveBeenCalledExactlyOnceWith(5000);
+		expect(sleep).toHaveBeenCalledExactlyOnceWith(5000, undefined);
 	});
 
-	it("should treat a backoff signal right after a completion as recycle lag, not place-full", async () => {
+	it.for([
+		{ elapsedMs: 2000, expectedWaitMs: 8000 },
+		{ elapsedMs: 10000, expectedWaitMs: 30000 },
+	])("should bound the recycle window: %j", async ({ elapsedMs, expectedWaitMs }) => {
 		expect.assertions(2);
 
 		const counter = { attempt: 0 };
 		const clock = { ms: 0 };
 		const runTask = vi.fn<() => Promise<ScriptResult>>(
-			makeThrowingTask(counter, 2, () => {
-				// 2s after the first task completed (at clock 0): inside the ~10s
-				// recycle window, so the long server retry-after must NOT win.
-				clock.ms = 2000;
-				return new RateLimitError("slow down", { retryAfterSeconds: 30 });
+			makeThrowingTask({
+				counter,
+				makeError: () => {
+					clock.ms = elapsedMs;
+					return new RateLimitError("slow down", { retryAfterSeconds: 30 });
+				},
+				throwingAttempt: 2,
 			}),
 		);
 		const sleep = vi.fn<(ms: number) => Promise<void>>().mockResolvedValue();
@@ -551,8 +618,7 @@ describe("runTaskPool backoff", () => {
 		});
 
 		expect(runTask).toHaveBeenCalledTimes(3);
-		// Recycle remainder (10s − 2s elapsed), not the 30s rate-limit delay.
-		expect(sleep).toHaveBeenCalledExactlyOnceWith(8000);
+		expect(sleep).toHaveBeenCalledExactlyOnceWith(expectedWaitMs, undefined);
 	});
 
 	it("should unwrap a backoff signal carried on the error cause chain", async () => {
@@ -569,17 +635,10 @@ describe("runTaskPool backoff", () => {
 		);
 		const sleep = vi.fn<(ms: number) => Promise<void>>().mockResolvedValue();
 
-		await runTaskPoolAsync({
-			concurrency: 1,
-			isDone: () => counter.attempt >= 2,
-			now: () => 0,
-			onResult: () => {},
-			places: [{ runTask }],
-			sleep,
-		});
+		await runRetryPoolAsync({ counter, runTask, sleep });
 
 		expect(runTask).toHaveBeenCalledTimes(2);
-		expect(sleep).toHaveBeenCalledExactlyOnceWith(3000);
+		expect(sleep).toHaveBeenCalledExactlyOnceWith(3000, undefined);
 	});
 
 	it("should surface an API error it does not back off on rather than backing off", async () => {
@@ -666,5 +725,93 @@ describe("runTaskPool backoff", () => {
 			slot: 1,
 			waitMs: 5000,
 		});
+	});
+});
+
+const EMPTY_MARKER = "EMPTY";
+
+async function flushAsync(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+function hasEvery(seen: ReadonlySet<string>, entries: ReadonlyArray<string>): boolean {
+	return entries.every((entry) => seen.has(entry));
+}
+
+function makePendingTask() {
+	const pending: Array<Deferred> = [];
+	const runTask = vi.fn<() => Promise<ScriptResult>>(async () => {
+		const deferred = makeDeferred();
+		pending.push(deferred);
+		return deferred.promise;
+	});
+	return { pending, runTask };
+}
+
+async function runRetryPoolAsync({
+	counter,
+	runTask,
+	sleep,
+}: {
+	counter: AttemptCounter;
+	runTask: () => Promise<ScriptResult>;
+	sleep: (ms: number) => Promise<void>;
+}): Promise<void> {
+	await runTaskPoolAsync({
+		concurrency: 1,
+		isDone: () => counter.attempt >= 2,
+		now: () => 0,
+		onResult: () => {},
+		places: [{ runTask }],
+		sleep,
+	});
+}
+
+describe("pool boundaries", () => {
+	it("should avoid warning when requested concurrency exactly equals place capacity", () => {
+		expect.assertions(2);
+
+		const runTask = vi.fn<() => Promise<ScriptResult>>(async () => makeDeferred().promise);
+		const warn = vi.fn<(message: string) => void>();
+		void runTaskPoolAsync({
+			concurrency: 10,
+			isDone: () => false,
+			onResult: () => {},
+			places: [{ runTask }],
+			warn,
+		});
+
+		expect(runTask).toHaveBeenCalledTimes(10);
+		expect(warn).not.toHaveBeenCalled();
+	});
+});
+
+describe("failed task backpressure", () => {
+	it("should free failed work before deciding whether another launch is covered", async () => {
+		expect.assertions(2);
+
+		const pending = makeDeferred();
+		const runTask = vi
+			.fn<() => Promise<ScriptResult>>()
+			.mockRejectedValueOnce(new Error("failed"))
+			.mockImplementation(async () => pending.promise);
+		let isDone = false;
+		const pool = runTaskPoolAsync({
+			concurrency: 1,
+			isDone: () => isDone,
+			isWorkCovered: (live) => live >= 1,
+			onResult: () => {
+				isDone = true;
+			},
+			places: [{ runTask }],
+		});
+		await flushAsync();
+
+		expect(runTask).toHaveBeenCalledTimes(2);
+
+		pending.resolve(makeScriptResult());
+
+		await expect(pool).resolves.toBeUndefined();
 	});
 });

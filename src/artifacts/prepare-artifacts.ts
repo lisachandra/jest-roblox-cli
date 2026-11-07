@@ -1,8 +1,8 @@
 import * as path from "node:path";
 
 import { mergeCliWithConfig } from "../config/merge.ts";
-import { resolveAllProjects } from "../config/projects.ts";
 import type { CliOptions, ResolvedConfig } from "../config/schema.ts";
+import { collectStubMounts } from "../config/stubs.ts";
 import type { AttributionResult } from "../coverage-pipeline/attribution.ts";
 import { applyAttribution } from "../coverage-pipeline/attribution.ts";
 import type {
@@ -11,25 +11,31 @@ import type {
 	CoverageArtifacts,
 } from "../coverage-pipeline/build-manifest.ts";
 import { emitBuildManifest } from "../coverage-pipeline/build-manifest.ts";
+import type { RawCoverageData } from "../coverage-pipeline/coverage-types.ts";
+import type { InstrumentUniverse } from "../coverage-pipeline/instrument-universe.ts";
+import { findRojoProject } from "../coverage-pipeline/luau-roots.ts";
 import type { CoverageManifest } from "../coverage-pipeline/manifest.ts";
 import { readManifest, writeManifest } from "../coverage-pipeline/manifest.ts";
+import { PLACE_DIR } from "../coverage-pipeline/place-build.ts";
 import { computePlaceContentId } from "../coverage-pipeline/place-content-id.ts";
 import {
 	COVERAGE_BUILD_MANIFEST_PATH,
 	COVERAGE_MANIFEST_PATH,
-	findRojoProject,
 } from "../coverage-pipeline/prepare.ts";
-import type { RawCoverageData } from "../coverage-pipeline/types.ts";
-import { runSingleOrMultiAsync } from "../run.ts";
-import { loadRojoTree } from "../run/multi.ts";
-import { collectStubMounts } from "../run/staging.ts";
+import type { RunEntryOptions } from "../run.ts";
+import { nodeRunDispatch, runSingleOrMultiAsync } from "../run.ts";
+import type { RunSeams } from "../run/seams.ts";
+import { nodeRunSeams } from "../run/seams.ts";
 import { buildPlaceAsync } from "../staging/place-builder.ts";
-import type { PackageDescriptor } from "../staging/synthesizer.ts";
+import type { StubMount, UnwrappedPackageDescriptor } from "../staging/synthesizer-types.ts";
+import type { TimingCollector } from "../timing/orchestration-collector.ts";
 import { createTimingCollector } from "../timing/orchestration-collector.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
+import { resolveProjectsAsync } from "./place-projects.ts";
 
-const COVERAGE_DIR = path.dirname(COVERAGE_BUILD_MANIFEST_PATH);
-const CLEAN_PLACE_FILE = path.join(COVERAGE_DIR, "clean.rbxl");
-const CLEAN_PROJECT_FILE = path.join(COVERAGE_DIR, "clean.project.json");
+const CLEAN_PLACE_FILE = path.join(PLACE_DIR, "clean.rbxl");
+const CLEAN_PROJECT_FILE = path.join(PLACE_DIR, "clean.project.json");
 const CACHE_DIR = path.join(".jest-roblox", "cache");
 
 /**
@@ -38,16 +44,33 @@ const CACHE_DIR = path.join(".jest-roblox", "cache");
  * of the sibling manifests, all sharing one `buildId`.
  */
 export interface ArtifactBundle {
+	/** Build id shared by both places and the sibling manifests. */
 	buildId: string;
+	/** The Build Manifest's path. */
 	buildManifestPath: string;
+	/** The uninstrumented Clean Place. */
 	cleanPlace: BuildManifestArtifact;
+	/** Coverage hit data from the instrumented run, if any. */
 	coverageData?: RawCoverageData | undefined;
+	/** The coverage-data sibling manifest's path. */
 	coverageManifestPath: string;
+	/** The Coverage-Instrumented Place. */
 	coveragePlace: BuildManifestArtifact;
 	/**
 	 * Per-project DataModel paths the kernel consumes, resolved from the run.
 	 */
 	projects: Array<BuildManifestProject>;
+}
+
+/** Options for `prepareArtifactsAsync`. */
+export interface PrepareArtifactsOptions extends RunEntryOptions {
+	/** Instrument universe passed to the coverage step, if set. */
+	instrumentUniverse?: InstrumentUniverse | undefined;
+}
+
+interface ProduceArtifactsOptions extends Required<RunEntryOptions> {
+	config: ResolvedConfig;
+	timing: TimingCollector;
 }
 
 /**
@@ -57,50 +80,58 @@ export interface ArtifactBundle {
  * the Build Manifest with both places in a single atomic write.
  * `runJestRobloxAsync` / the CLI never build a Clean Place — opting in is
  * calling this entry point.
+ *
+ * @param config - Resolved config for the run.
+ * @param options - Optional seams and instrument universe.
+ * @returns Both places, coverage data and the manifest paths.
  */
-export async function prepareArtifactsAsync(config: ResolvedConfig): Promise<ArtifactBundle> {
-	const cli: CliOptions = {};
+export async function prepareArtifactsAsync(
+	config: ResolvedConfig,
+	{
+		dispatch = nodeRunDispatch(),
+		fileSystem = nodeFileSystem,
+		instrumentUniverse,
+		seams = nodeRunSeams(),
+	}: PrepareArtifactsOptions = {},
+): Promise<ArtifactBundle> {
 	const timing = createTimingCollector();
 	try {
-		const merged = mergeCliWithConfig(cli, {
-			...config,
-			collectCoverage: true,
-			collectPerTestCoverage: true,
+		return await produceArtifactsAsync({
+			config,
+			dispatch,
+			fileSystem,
+			seams: withInstrumentUniverse(seams, instrumentUniverse),
+			timing,
 		});
-		const result = await runSingleOrMultiAsync(cli, merged, timing);
-		const coverageArtifacts = requireCoverageArtifacts(result.coverageArtifacts);
-		// Stamped from the manifest the instrument step just published, so the
-		// id the place carries is the identity of the build the collector read.
-		const coverageManifest = requireCoverageManifest(COVERAGE_MANIFEST_PATH);
-		const contentId = computePlaceContentId(coverageManifest);
-		const cleanPlace = await buildCleanPlaceAsync(merged, contentId);
-
-		// One atomic write that knows both places — never write-then-patch.
-		emitBuildManifest(COVERAGE_BUILD_MANIFEST_PATH, coverageArtifacts, cleanPlace);
-
-		// Fold per-test attribution into the coverage manifest the instrument
-		// step already published, so the consumer reads tests[] + coveringTestIds
-		// from the same artifact as the file records.
-		writeManifestAttribution(coverageManifest, result.merged.attribution);
-
-		return {
-			buildId: coverageArtifacts.buildId,
-			buildManifestPath: COVERAGE_BUILD_MANIFEST_PATH,
-			cleanPlace,
-			coverageData: result.merged.coverageData,
-			coverageManifestPath: COVERAGE_MANIFEST_PATH,
-			coveragePlace: coverageArtifacts.coveragePlace,
-			projects: coverageArtifacts.projects,
-		};
 	} finally {
 		timing.flushTimingReport();
 	}
+}
+
+function withInstrumentUniverse(
+	seams: RunSeams,
+	instrumentUniverse: InstrumentUniverse | undefined,
+): RunSeams {
+	if (instrumentUniverse === undefined) {
+		return seams;
+	}
+
+	return {
+		...seams,
+		prepareCoverage: async (config, options) => {
+			return seams.prepareCoverage(config, { ...options, instrumentUniverse });
+		},
+	};
 }
 
 /**
  * A `typecheckOnly` config, or a project with no runtime tests, produces no
  * coverage artifacts — which makes the whole bundle meaningless. Fail loud
  * rather than emit a half-written Build Manifest.
+ *
+ * @param coverageArtifacts - Artifacts from the coverage run, if any.
+ * @returns The same artifacts, known to be present.
+ * @throws {Error} When `coverageArtifacts` is undefined.
  */
 function requireCoverageArtifacts(
 	coverageArtifacts: CoverageArtifacts | undefined,
@@ -118,9 +149,14 @@ function requireCoverageArtifacts(
  * The manifest the instrument step published for this run. Unreadable is a
  * fault rather than a degraded bundle: it is what the Place Content Id is taken
  * over, and a place stamped from anything less proves less than it claims.
+ *
+ * @param manifestPath - Where the instrument step wrote it.
+ * @param fileSystem - File system to read it from.
+ * @returns The parsed coverage manifest.
+ * @throws {Error} When the manifest cannot be read.
  */
-function requireCoverageManifest(manifestPath: string): CoverageManifest {
-	const read = readManifest(manifestPath);
+function requireCoverageManifest(manifestPath: string, fileSystem: FileSystem): CoverageManifest {
+	const read = readManifest(manifestPath, fileSystem);
 	if (read.kind !== "ok") {
 		throw new Error(
 			`prepareArtifacts: could not read the coverage manifest at ${manifestPath}, so the Clean Place has no build to be stamped with.`,
@@ -134,47 +170,110 @@ function requireCoverageManifest(manifestPath: string): CoverageManifest {
  * Re-publish the coverage manifest with attribution folded in. A run that
  * produced no attribution is a no-op — the file records the instrument step
  * wrote stay as published.
+ *
+ * @param options - Attribution, file system and the manifest to update.
  */
-function writeManifestAttribution(
-	manifest: CoverageManifest,
-	attribution: AttributionResult | undefined,
-): void {
+function writeManifestAttribution({
+	attribution,
+	fileSystem,
+	manifest,
+}: {
+	attribution: AttributionResult | undefined;
+	fileSystem: FileSystem;
+	manifest: CoverageManifest;
+}): void {
 	if (attribution === undefined) {
 		return;
 	}
 
-	writeManifest(COVERAGE_MANIFEST_PATH, applyAttribution(manifest, attribution));
+	writeManifest({
+		filePath: COVERAGE_MANIFEST_PATH,
+		fileSystem,
+		manifest: applyAttribution(manifest, attribution),
+	});
+}
+
+async function resolveCleanStubMountsAsync(
+	config: ResolvedConfig,
+	entry: Required<RunEntryOptions>,
+): Promise<Array<StubMount>> {
+	return collectStubMounts({
+		cacheRoot: path.resolve(config.rootDir, CACHE_DIR),
+		projects: await resolveProjectsAsync(config, entry),
+	});
 }
 
 /**
  * Build the uninstrumented Clean Place from the same rojo project as the
- * Coverage-Instrumented Place, minus `coverageRoots`. In multi mode the place
- * carries the same `jest.config` stub mounts the coverage run already wrote to
- * the cache, so the Clean Place is runnable.
+ * Coverage-Instrumented Place, minus `coverageRoots`. The place carries the
+ * same `jest.config` stub mounts the coverage run already wrote to the cache,
+ * so the Clean Place is runnable.
+ *
+ * @param options - Config, content id and run entry seams.
+ * @returns The built Clean Place artifact.
  */
-async function buildCleanPlaceAsync(
-	config: ResolvedConfig,
-	contentId: string,
-): Promise<BuildManifestArtifact> {
-	const descriptor: PackageDescriptor = {
-		name: "jest-roblox-clean",
+async function buildCleanPlaceAsync({
+	config,
+	contentId,
+	entry,
+}: {
+	config: ResolvedConfig;
+	contentId: string;
+	entry: Required<RunEntryOptions>;
+}): Promise<BuildManifestArtifact> {
+	const { fileSystem, seams } = entry;
+	const descriptor: UnwrappedPackageDescriptor = {
 		packageDirectory: path.resolve(config.rootDir),
-		rojoProjectPath: path.resolve(findRojoProject(config)),
+		rojoProjectPath: path.resolve(findRojoProject(config, fileSystem)),
+		stubMounts: await resolveCleanStubMountsAsync(config, entry),
 	};
 
-	const rawProjects = config.projects;
-	if (rawProjects !== undefined && rawProjects.length > 0) {
-		const cacheRoot = path.resolve(config.rootDir, CACHE_DIR);
-		const rojoTree = loadRojoTree(config);
-		const projects = await resolveAllProjects(rawProjects, config, rojoTree, config.rootDir);
-		descriptor.stubMounts = collectStubMounts(projects, config.rootDir, cacheRoot);
-	}
-
 	return buildPlaceAsync({
+		childProcess: seams.childProcess,
 		contentId,
+		fileSystem,
 		packages: [descriptor],
 		placeFile: CLEAN_PLACE_FILE,
 		projectFile: CLEAN_PROJECT_FILE,
 		wrap: false,
 	});
+}
+
+async function produceArtifactsAsync({
+	config,
+	timing,
+	...entry
+}: ProduceArtifactsOptions): Promise<ArtifactBundle> {
+	const { fileSystem } = entry;
+	const cli: CliOptions = {};
+	const merged = mergeCliWithConfig(cli, {
+		...config,
+		collectCoverage: true,
+		collectPerTestCoverage: true,
+	});
+	const result = await runSingleOrMultiAsync({ cli, rootConfig: merged, timing, ...entry });
+	const artifacts = requireCoverageArtifacts(result.coverageArtifacts);
+	const coverageManifest = requireCoverageManifest(COVERAGE_MANIFEST_PATH, fileSystem);
+	const cleanPlace = await buildCleanPlaceAsync({
+		config: merged,
+		contentId: computePlaceContentId(coverageManifest),
+		entry,
+	});
+
+	// One atomic write that knows both places — never write-then-patch.
+	const filePath = COVERAGE_BUILD_MANIFEST_PATH;
+	emitBuildManifest({ artifacts, cleanPlace, filePath, fileSystem });
+
+	const { attribution } = result.merged;
+	writeManifestAttribution({ attribution, fileSystem, manifest: coverageManifest });
+
+	return {
+		buildId: artifacts.buildId,
+		buildManifestPath: COVERAGE_BUILD_MANIFEST_PATH,
+		cleanPlace,
+		coverageData: result.merged.coverageData,
+		coverageManifestPath: COVERAGE_MANIFEST_PATH,
+		coveragePlace: artifacts.coveragePlace,
+		projects: artifacts.projects,
+	};
 }

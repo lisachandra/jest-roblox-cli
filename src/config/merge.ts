@@ -1,6 +1,4 @@
-import process from "node:process";
-import { isAgent } from "std-env";
-
+import { defaultFormatters } from "./default-formatters.ts";
 import type { CliOptions, FormatterEntry, ResolvedConfig } from "./schema.ts";
 
 type CoverageKey =
@@ -10,6 +8,13 @@ type CoverageKey =
 	| "coverageDirectory"
 	| "coverageReporters";
 
+/**
+ * Overlay CLI options on a resolved config; a CLI value wins when set.
+ *
+ * @param cli - Parsed CLI options.
+ * @param config - Resolved config.
+ * @returns The merged config.
+ */
 export function mergeCliWithConfig(cli: CliOptions, config: ResolvedConfig): ResolvedConfig {
 	return {
 		...config,
@@ -19,6 +24,7 @@ export function mergeCliWithConfig(cli: CliOptions, config: ResolvedConfig): Res
 		experimentalVmParallel: cli.experimentalVmParallel,
 		formatters: resolveFormatters(cli, config),
 		gameOutput: cli.gameOutput ?? config.gameOutput,
+		hiddenDesktop: cli.hiddenDesktop ?? config.hiddenDesktop,
 		outputFile: cli.outputFile ?? config.outputFile,
 		parallel: cli.parallel ?? config.parallel,
 		passWithNoTests: cli.passWithNoTests ?? config.passWithNoTests,
@@ -53,16 +59,5 @@ function resolveCoverage(
 }
 
 function resolveFormatters(cli: CliOptions, config: ResolvedConfig): Array<FormatterEntry> {
-	const explicit = cli.formatters ?? config.formatters;
-	if (explicit !== undefined) {
-		return explicit;
-	}
-
-	const defaults: Array<FormatterEntry> = isAgent ? ["agent"] : ["default"];
-
-	if (process.env["GITHUB_ACTIONS"] === "true") {
-		defaults.push("github-actions");
-	}
-
-	return defaults;
+	return cli.formatters ?? config.formatters ?? defaultFormatters();
 }

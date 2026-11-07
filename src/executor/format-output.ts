@@ -7,13 +7,18 @@ import type { FormatOptions } from "../formatters/formatter.ts";
 import { formatResult } from "../formatters/formatter.ts";
 import { formatJson } from "../formatters/json.ts";
 import { DEFAULT_MAX_FAILURES, findFormatterOptions, hasFormatter } from "../formatters/utils.ts";
-import type { FormatOutputOptions } from "./types.ts";
+import type { FormatOutputOptions } from "./executor-types.ts";
 
 interface ResolvedOutputPaths {
 	gameOutput: string | undefined;
 	outputFile: string | undefined;
 }
 
+/**
+ * Format one project's result for the terminal.
+ * @param options - The result, config and timing to format.
+ * @returns The formatted output, or an empty string when `config.silent` is set.
+ */
 export function formatExecuteOutput(options: FormatOutputOptions): string {
 	const { config, result, sourceMapper, timing } = options;
 	if (config.silent) {
@@ -22,7 +27,7 @@ export function formatExecuteOutput(options: FormatOutputOptions): string {
 
 	const paths = resolveOutputPaths(config);
 
-	const agentOptions = findFormatterOptions(config.formatters ?? [], "agent");
+	const agentOptions = findFormatterOptions(config.formatters, "agent");
 
 	if (agentOptions !== undefined && !config.verbose) {
 		return formatAgent(result, {
@@ -36,10 +41,10 @@ export function formatExecuteOutput(options: FormatOutputOptions): string {
 	}
 
 	if (hasFormatter(config.formatters, "json")) {
-		return formatJson(result);
+		return formatJson(result, config.rootDir);
 	}
 
-	return formatResult(result, timing, buildResultOptions(options, paths));
+	return formatResult({ options: buildResultOptions(options, paths), result, timing });
 }
 
 function resolveOutputPaths(config: ResolvedConfig): ResolvedOutputPaths {

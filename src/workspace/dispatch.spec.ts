@@ -3,20 +3,12 @@ import { fromAny } from "@total-typescript/shoehorn";
 import process from "node:process";
 import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { type Backend, isShardedParallel, type ProjectJob } from "../backends/interface.ts";
-import {
-	buildProjectJob,
-	type ExecuteResult,
-	runProjectsAsync,
-	type RunProjectsResult,
-} from "../executor.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
+import type { Backend, ProjectJob } from "../backends/interface.ts";
+import type { ExecuteResult, runProjectsAsync, RunProjectsResult } from "../executor.ts";
 import type { TsconfigMappingCache } from "../executor/tsconfig-mappings.ts";
-import { prepareWorkStealingQueueAsync } from "../memory-store/work-stealing.ts";
-import {
-	generateMaterializerScript,
-	generateWorkStealingScript,
-	type MaterializerInput,
-} from "../staging/test-script-staged.ts";
+import type { prepareWorkStealingQueueAsync } from "../memory-store/work-stealing.ts";
 import type { TimingCollector } from "../timing/orchestration-collector.ts";
 import {
 	buildWorkspaceJobs,
@@ -24,20 +16,38 @@ import {
 	runDispatchedProjectsAsync,
 	type WorkspaceJob,
 } from "./dispatch.ts";
-import type { PendingEntry } from "./test-selection.ts";
+import type { PendingEntry } from "./pending-entry.ts";
 
-vi.mock(import("../backends/interface.ts"));
-vi.mock(import("../executor.ts"));
-vi.mock(import("../memory-store/work-stealing.ts"));
-vi.mock(import("../staging/test-script-staged.ts"));
+interface DispatchedPayload {
+	bail?: boolean;
+	entries: Array<{ pkg: string; project: string }>;
+	invisibilityWindowSeconds?: number;
+	queueId?: string;
+	queueTtlSeconds?: number;
+}
 
-function makeJob(
-	packageName: string,
-	displayName: string,
-	config: { projectTimeout?: number; timeout?: number } = {},
-): WorkspaceJob {
+function payloadOf(script: string): DispatchedPayload {
+	const embedded = /\[==\[([\S\s]*?)]==]/.exec(script);
+	assert(embedded !== null);
+	return fromAny<DispatchedPayload, JSONValue>(JSON.parse(embedded[1]!));
+}
+
+function dispatchedPairs(script: string): Array<string> {
+	return payloadOf(script).entries.map((entry) => `${entry.pkg}/${entry.project}`);
+}
+
+function makeJob({
+	config = {},
+	displayName,
+	packageName,
+}: {
+	readonly config?: { projectTimeout?: number; timeout?: number };
+	readonly displayName: string;
+	readonly packageName: string;
+}): WorkspaceJob {
 	return fromAny({
 		config: {
+			...createResolvedConfig(),
 			projectTimeout: 60_000,
 			rootDir: `/repo/${packageName}`,
 			timeout: 300_000,
@@ -49,15 +59,6 @@ function makeJob(
 	});
 }
 
-function materializerInput(job: WorkspaceJob): MaterializerInput {
-	return {
-		config: job.config,
-		pkg: job.pkg,
-		project: job.displayName,
-		testFiles: job.testFiles,
-	};
-}
-
 function createTiming(): TimingCollector {
 	return fromAny({
 		profileAsync: vi.fn<(name: string, action: () => Promise<unknown>) => Promise<unknown>>(
@@ -66,30 +67,42 @@ function createTiming(): TimingCollector {
 	});
 }
 
+function stubQueue(): ReturnType<typeof vi.fn<typeof prepareWorkStealingQueueAsync>> {
+	return vi.fn<typeof prepareWorkStealingQueueAsync>(async (options) => {
+		return {
+			invisibilityWindowSeconds: options.perPackageTimeoutSeconds + 30,
+			queueId: "queue-1",
+			ttlSeconds: 600,
+		};
+	});
+}
+
 describe(runDispatchedProjectsAsync, () => {
 	it("should run the exact prepared jobs and return both result arrays", async () => {
 		expect.assertions(3);
 
-		const jobs = [makeJob("pkg-a", "unit")];
+		const jobs = [makeJob({ displayName: "unit", packageName: "pkg-a" })];
 		const timing = createTiming();
 		const backend = fromAny<Backend, unknown>({ kind: "open-cloud" });
 		const tsconfigCache: TsconfigMappingCache = new Map();
 		const executeResult = fromAny<ExecuteResult, unknown>({ success: true });
-		vi.mocked(runProjectsAsync).mockResolvedValue(
-			fromAny<RunProjectsResult, unknown>({
+		const runProjects = vi.fn<typeof runProjectsAsync>(async () => {
+			return fromAny<RunProjectsResult, unknown>({
 				backendTiming: {},
 				ranProjectIndices: [0],
 				results: [executeResult],
-			}),
-		);
+			});
+		});
 		const scriptFactory = vi.fn<(jobs: ReadonlyArray<ProjectJob>) => string>(
 			() => "retry-script",
 		);
 
 		const result = await runDispatchedProjectsAsync({
 			backend,
+			codeBundle: undefined,
 			dispatchSpec: { parallel: 2, scriptFactory, scriptOverride: "initial-script" },
 			jobs,
+			runProjects,
 			startTime: 123,
 			timing,
 			tsconfigCache,
@@ -97,7 +110,7 @@ describe(runDispatchedProjectsAsync, () => {
 		});
 
 		expect(result).toStrictEqual({ ranProjectIndices: [0], results: [executeResult] });
-		expect(runProjectsAsync).toHaveBeenCalledExactlyOnceWith({
+		expect(runProjects).toHaveBeenCalledExactlyOnceWith({
 			backend,
 			deferFormatting: true,
 			parallel: 2,
@@ -109,24 +122,28 @@ describe(runDispatchedProjectsAsync, () => {
 			tsconfigCache,
 			version: "1.2.3",
 		});
-		expect(timing.profileAsync).toHaveBeenCalledOnce();
+		expect(timing.profileAsync).toHaveBeenCalledExactlyOnceWith(
+			"runProjects",
+			expect.any(Function),
+		);
 	});
 });
 
 describe(buildWorkspaceJobs, () => {
 	it("should pin the shared place and package onto every built job", () => {
-		expect.assertions(2);
+		expect.assertions(1);
 
-		const built = fromAny<ProjectJob, unknown>({
-			config: { rootDir: "/repo" },
-			displayName: "unit",
-		});
-		vi.mocked(buildProjectJob).mockReturnValue(built);
-		const tsconfigCache: TsconfigMappingCache = new Map();
-		const projectConfig = { placeFile: "old.rbxl", rootDir: "/repo" };
+		const { fileSystem } = createMemoryFileSystem();
+		const projectConfig = {
+			...createResolvedConfig(),
+			placeFile: "old.rbxl",
+			rootDir: "/repo",
+			snapshotFormat: { printBasicPrototype: true },
+		};
 
-		const result = buildWorkspaceJobs(
-			[
+		const result = buildWorkspaceJobs({
+			fileSystem,
+			pending: [
 				fromAny<PendingEntry, unknown>({
 					pkg: "pkg-a",
 					project: { displayColor: "cyan", displayName: "unit" },
@@ -134,34 +151,31 @@ describe(buildWorkspaceJobs, () => {
 					testFiles: ["unit.spec.ts"],
 				}),
 			],
-			"workspace.rbxl",
-			tsconfigCache,
-		);
+			placeFile: "workspace.rbxl",
+			tsconfigCache: new Map(),
+			tsconfigReader: () => null,
+		});
 
-		expect(buildProjectJob).toHaveBeenCalledExactlyOnceWith(
+		expect(result).toStrictEqual([
 			{
 				config: { ...projectConfig, placeFile: "workspace.rbxl" },
 				displayColor: "cyan",
 				displayName: "unit",
 				pkg: "pkg-a",
+				runtimeInjectionPaths: undefined,
 				testFiles: ["unit.spec.ts"],
 			},
-			tsconfigCache,
-		);
-		expect(result).toStrictEqual([{ ...built, pkg: "pkg-a" }]);
+		]);
 	});
 });
 
 describe(prepareWorkspaceDispatchAsync, () => {
 	it("should build a script from exact package and project matches", async () => {
-		expect.assertions(3);
+		expect.assertions(4);
 
-		const unitA = makeJob("pkg-a", "unit");
-		const unitB = makeJob("pkg-b", "unit");
-		const e2eA = makeJob("pkg-a", "e2e");
-		vi.mocked(generateMaterializerScript).mockImplementation((inputs, options) => {
-			return JSON.stringify({ inputs, options });
-		});
+		const unitA = makeJob({ displayName: "unit", packageName: "pkg-a" });
+		const unitB = makeJob({ displayName: "unit", packageName: "pkg-b" });
+		const e2eA = makeJob({ displayName: "e2e", packageName: "pkg-a" });
 
 		const spec = await prepareWorkspaceDispatchAsync({
 			bail: true,
@@ -171,250 +185,88 @@ describe(prepareWorkspaceDispatchAsync, () => {
 		});
 		assert(spec.scriptFactory !== undefined);
 
-		expect(JSON.parse(spec.scriptFactory([unitA, unitB, e2eA]))).toStrictEqual({
-			inputs: [materializerInput(unitA), materializerInput(unitB), materializerInput(e2eA)],
-			options: { bail: true },
-		});
-		expect(JSON.parse(spec.scriptFactory([unitA]))).toStrictEqual({
-			inputs: [materializerInput(unitA)],
-			options: { bail: true },
-		});
+		const whole = payloadOf(spec.scriptFactory([unitA, unitB, e2eA]));
+
+		expect(whole.entries.map((entry) => `${entry.pkg}/${entry.project}`)).toStrictEqual([
+			"pkg-a/unit",
+			"pkg-b/unit",
+			"pkg-a/e2e",
+		]);
+		expect(whole.bail).toBeTrue();
+		expect(dispatchedPairs(spec.scriptFactory([unitA]))).toStrictEqual(["pkg-a/unit"]);
 		expect(spec).not.toHaveProperty("workStealing");
 	});
 
-	it("should return a work-stealing script when queue setup succeeds", async () => {
-		expect.assertions(2);
-
-		const job = makeJob("pkg-a", "unit");
-		vi.mocked(isShardedParallel).mockReturnValue(true);
-		vi.mocked(prepareWorkStealingQueueAsync).mockResolvedValue({
-			invisibilityWindowSeconds: 90,
-			queueId: "queue-1",
-			ttlSeconds: 600,
-		});
-		vi.mocked(generateWorkStealingScript).mockReturnValue("stealing-script");
-		const credentials = { apiKey: "key", baseUrl: "https://example.test", universeId: "42" };
+	it("should hand --bail to a backend that builds its own payload", async () => {
+		expect.assertions(1);
 
 		const spec = await prepareWorkspaceDispatchAsync({
-			jobs: [job],
-			parallel: "auto",
-			testProgressMapId: "progress-uuid",
-			workStealingCredentials: credentials,
-		});
-
-		expect(prepareWorkStealingQueueAsync).toHaveBeenCalledExactlyOnceWith({
-			baseUrl: "https://example.test",
-			credentials: { apiKey: "key", universeId: "42" },
-			packages: [{ pkg: "pkg-a", project: "unit" }],
-			perPackageTimeoutSeconds: 60,
-		});
-		expect(spec).toStrictEqual({
-			parallel: "auto",
-			scriptOverride: "stealing-script",
-			testProgressMapId: "progress-uuid",
-			workStealing: true,
-		});
-	});
-
-	it("should size the invisibility window off the slowest package's budget", async () => {
-		expect.assertions(1);
-
-		vi.mocked(isShardedParallel).mockReturnValue(true);
-		vi.mocked(prepareWorkStealingQueueAsync).mockResolvedValue({
-			invisibilityWindowSeconds: 210,
-			queueId: "queue-1",
-			ttlSeconds: 600,
-		});
-		vi.mocked(generateWorkStealingScript).mockReturnValue("stealing-script");
-
-		await prepareWorkspaceDispatchAsync({
-			jobs: [makeJob("pkg-a", "unit"), makeJob("pkg-b", "unit", { projectTimeout: 180_000 })],
-			parallel: "auto",
-			workStealingCredentials: { apiKey: "key", universeId: "42" },
-		});
-
-		expect(prepareWorkStealingQueueAsync).toHaveBeenCalledWith(
-			expect.objectContaining({ perPackageTimeoutSeconds: 180 }),
-		);
-	});
-
-	// A package with no budget of its own is bounded only by the deadline
-	// Roblox gives the whole task, so that is the window a sibling must wait
-	// out before reclaiming it.
-	it("should fall back to the task deadline for a package with no budget", async () => {
-		expect.assertions(1);
-
-		vi.mocked(isShardedParallel).mockReturnValue(true);
-		vi.mocked(prepareWorkStealingQueueAsync).mockResolvedValue({
-			invisibilityWindowSeconds: 330,
-			queueId: "queue-1",
-			ttlSeconds: 600,
-		});
-		vi.mocked(generateWorkStealingScript).mockReturnValue("stealing-script");
-
-		await prepareWorkspaceDispatchAsync({
-			jobs: [makeJob("pkg-a", "unit", { projectTimeout: 0 })],
-			parallel: "auto",
-			workStealingCredentials: { apiKey: "key", universeId: "42" },
-		});
-
-		expect(prepareWorkStealingQueueAsync).toHaveBeenCalledWith(
-			expect.objectContaining({ perPackageTimeoutSeconds: 300 }),
-		);
-	});
-
-	// Every task runs under the first job's `timeout`, so a later package's own
-	// run timeout is not the deadline it will be worked on under. Reading it as
-	// one sizes the window under the deadline, and the item is reclaimed and
-	// run a second time while the first task is still inside it.
-	it("should take an unbudgeted package's deadline from the first job", async () => {
-		expect.assertions(1);
-
-		vi.mocked(isShardedParallel).mockReturnValue(true);
-		vi.mocked(prepareWorkStealingQueueAsync).mockResolvedValue({
-			invisibilityWindowSeconds: 330,
-			queueId: "queue-1",
-			ttlSeconds: 600,
-		});
-		vi.mocked(generateWorkStealingScript).mockReturnValue("stealing-script");
-
-		await prepareWorkspaceDispatchAsync({
-			jobs: [
-				makeJob("pkg-a", "unit"),
-				makeJob("pkg-b", "unit", { projectTimeout: 0, timeout: 60_000 }),
-			],
-			parallel: "auto",
-			workStealingCredentials: { apiKey: "key", universeId: "42" },
-		});
-
-		expect(prepareWorkStealingQueueAsync).toHaveBeenCalledWith(
-			expect.objectContaining({ perPackageTimeoutSeconds: 300 }),
-		);
-	});
-
-	// A budget past the task deadline cannot be reached: Roblox ends the task
-	// first. Waiting it out only delays the reclaim of an item whose worker is
-	// already gone.
-	it("should cap a package budget at the task deadline", async () => {
-		expect.assertions(1);
-
-		vi.mocked(isShardedParallel).mockReturnValue(true);
-		vi.mocked(prepareWorkStealingQueueAsync).mockResolvedValue({
-			invisibilityWindowSeconds: 330,
-			queueId: "queue-1",
-			ttlSeconds: 600,
-		});
-		vi.mocked(generateWorkStealingScript).mockReturnValue("stealing-script");
-
-		await prepareWorkspaceDispatchAsync({
-			jobs: [makeJob("pkg-a", "unit", { projectTimeout: 900_000 })],
-			parallel: "auto",
-			workStealingCredentials: { apiKey: "key", universeId: "42" },
-		});
-
-		expect(prepareWorkStealingQueueAsync).toHaveBeenCalledWith(
-			expect.objectContaining({ perPackageTimeoutSeconds: 300 }),
-		);
-	});
-
-	it("should carry one progress map into both the script and the spec", async () => {
-		expect.assertions(2);
-
-		const job = makeJob("pkg-a", "unit");
-		vi.mocked(isShardedParallel).mockReturnValue(false);
-		vi.mocked(generateMaterializerScript).mockImplementation((inputs, options) => {
-			return JSON.stringify({ inputs, options });
-		});
-
-		const spec = await prepareWorkspaceDispatchAsync({
-			jobs: [job],
-			parallel: 1,
-			testProgressMapId: "progress-uuid",
-			workStealingCredentials: { apiKey: "key", universeId: "42" },
-		});
-		assert(spec.scriptFactory !== undefined);
-
-		expect(spec.testProgressMapId).toBe("progress-uuid");
-		expect(JSON.parse(spec.scriptFactory([job]))).toStrictEqual({
-			inputs: [materializerInput(job)],
-			options: { bail: false, testProgressMapId: "progress-uuid" },
-		});
-	});
-
-	it("should keep no progress map when the run resolved none", async () => {
-		expect.assertions(2);
-
-		vi.mocked(isShardedParallel).mockReturnValue(false);
-		vi.mocked(generateMaterializerScript).mockImplementation((inputs, options) => {
-			return JSON.stringify({ inputs, options });
-		});
-
-		const job = makeJob("pkg-a", "unit");
-		const spec = await prepareWorkspaceDispatchAsync({
-			jobs: [job],
+			bail: true,
+			jobs: [makeJob({ displayName: "unit", packageName: "pkg-a" })],
 			parallel: 1,
 			workStealingCredentials: undefined,
 		});
-		assert(spec.scriptFactory !== undefined);
 
-		expect(spec.testProgressMapId).toBeUndefined();
-		expect(JSON.parse(spec.scriptFactory([job]))).toStrictEqual({
-			inputs: [materializerInput(job)],
-			options: { bail: false },
-		});
+		expect(spec.bail).toBeTrue();
 	});
 
-	it("should build a work-stealing script without a map when the run has none", async () => {
-		expect.assertions(2);
-
-		vi.mocked(isShardedParallel).mockReturnValue(true);
-		vi.mocked(prepareWorkStealingQueueAsync).mockResolvedValue({
-			invisibilityWindowSeconds: 90,
-			queueId: "queue-1",
-			ttlSeconds: 600,
-		});
-		vi.mocked(generateWorkStealingScript).mockReturnValue("stealing-script");
+	it("should not bail unless asked", async () => {
+		expect.assertions(1);
 
 		const spec = await prepareWorkspaceDispatchAsync({
-			jobs: [makeJob("pkg-a", "unit")],
-			parallel: "auto",
-			workStealingCredentials: { apiKey: "key", universeId: "42" },
+			jobs: [makeJob({ displayName: "unit", packageName: "pkg-a" })],
+			parallel: 1,
+			workStealingCredentials: undefined,
 		});
 
-		expect(spec.testProgressMapId).toBeUndefined();
-		expect(vi.mocked(generateWorkStealingScript).mock.calls[0]![3]).toStrictEqual({
-			bail: false,
-			queueTtlSeconds: 600,
-			testProgressMapId: undefined,
-		});
+		expect(spec.bail).toBeFalse();
 	});
 
-	it("should warn and fall back to a sequential script when queue setup fails", async () => {
-		expect.assertions(3);
+	it("should hand the VM count to a backend that builds its own payload", async () => {
+		expect.assertions(1);
+
+		const spec = await prepareWorkspaceDispatchAsync({
+			jobs: [makeJob({ displayName: "unit", packageName: "pkg-a" })],
+			parallel: 1,
+			vmParallel: "auto",
+			workStealingCredentials: undefined,
+		});
+
+		expect(spec.vmParallel).toBe("auto");
+	});
+
+	it("should fall back to a bucketed script when queue setup fails", async () => {
+		expect.assertions(2);
 
 		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
 		onTestFinished(() => {
 			stderr.mockRestore();
 		});
-		vi.mocked(isShardedParallel).mockReturnValue(true);
-		vi.mocked(prepareWorkStealingQueueAsync).mockRejectedValue(new Error("missing scope"));
-		vi.mocked(generateMaterializerScript).mockReturnValue("sequential-script");
-
 		const spec = await prepareWorkspaceDispatchAsync({
-			jobs: [makeJob("pkg-a", "unit")],
+			jobs: [makeJob({ displayName: "unit", packageName: "pkg-a" })],
 			parallel: 2,
+			prepareWorkStealingQueue: vi.fn<typeof prepareWorkStealingQueueAsync>(async () => {
+				throw new Error("missing scope");
+			}),
 			workStealingCredentials: { apiKey: "key", universeId: "42" },
 		});
 
-		expect(stderr).toHaveBeenCalledExactlyOnceWith(
-			"Warning: could not set up the work-stealing queue, running packages " +
-				"with no work-stealing: missing scope\n" +
-				"Grant the API key memory-store.queue:add/dequeue/discard so tasks " +
-				"can rebalance instead of running a fixed share each.\n",
-		);
 		expect(spec.scriptFactory).toBeTypeOf("function");
 		// The fallback loses work-stealing, not concurrency: the backend
 		// buckets the entries statically, which needs the count to survive.
 		expect(spec.parallel).toBe(2);
+	});
+
+	it("should dispatch a work-stealing spec when queue setup succeeds", async () => {
+		expect.assertions(1);
+
+		const spec = await prepareWorkspaceDispatchAsync({
+			jobs: [makeJob({ displayName: "unit", packageName: "pkg-a" })],
+			parallel: "auto",
+			prepareWorkStealingQueue: stubQueue(),
+			workStealingCredentials: { apiKey: "key", universeId: "42" },
+		});
+
+		expect(spec.workStealing).toBeTrue();
 	});
 });

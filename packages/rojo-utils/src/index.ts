@@ -1,20 +1,31 @@
+export type { FileSystem } from "./file-system.ts";
 export { loadRojoProject } from "./loader.ts";
 export { collectMounts, pruneAncestors } from "./mount-collector.ts";
 export type { Mount, PathClassifier, PathKind } from "./mount-collector.ts";
+export {
+	collectPaths,
+	collectRequiredPaths,
+	rebaseTreePaths,
+	resolveMountPath,
+} from "./mount-paths.ts";
 export { mapFsPathToDataModel, mapFsRootToDataModel } from "./path-mapper.ts";
 export { RbxPathParent } from "./rbx-path.ts";
 export type { PartitionInfo, RbxPath, RelativeRbxPath } from "./rbx-path.ts";
+export {
+	CLIENT_SUB_EXTENSION,
+	convertToLuau,
+	INIT_NAME,
+	JSON_EXT,
+	ROJO_SCRIPT_EXTS,
+	SERVER_SUB_EXTENSION,
+	stripRojoExtensions,
+} from "./rojo-file-paths.ts";
 export { FileRelation, NetworkType, RbxType, RojoResolver } from "./rojo-resolver.ts";
 export type { RojoConfigFileResult, RojoResolverState } from "./rojo-resolver.ts";
-export {
-	collectPaths,
-	rebaseTreePaths,
-	resolveMountPath,
-	resolveNestedProjects,
-	resolveNestedProjectSources,
-} from "./rojo-tree.ts";
+export { resolveNestedProjects, resolveNestedProjectSources } from "./rojo-tree.ts";
 export type { ResolvedNestedProjectSources } from "./rojo-tree.ts";
+export type { LoadedRojoProject, RojoProject, RojoTreeNode } from "./rojo-types.ts";
 export type { RojoTree } from "./rojo-walker.ts";
 export { findInTree, matchNodePath } from "./tree-mapper.ts";
-export { isRojoTreeNode } from "./types.ts";
-export type { LoadedRojoProject, RojoProject, RojoTreeNode } from "./types.ts";
+
+export { isOptionalPath, isRojoTreeNode, unwrapPath } from "./tree-node.ts";

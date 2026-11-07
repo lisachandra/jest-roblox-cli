@@ -4,16 +4,53 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local StudioTestService = game:GetService("StudioTestService")
 
-if not RunService:IsRunning() then
-	return
+-- Must stay below `NIL_RETURN_PLUGIN_WAIT_MS` in `src/backends/studio-cli.ts`.
+local RUNNING_WAIT_SECONDS = 10
+local RUNNING_POLL_SECONDS = 0.05
+
+-- Mirrors `src/backends/studio-cli.ts`.
+local SIDE_CHANNEL_ATTRIBUTE = "JestRobloxRunSideChannel"
+
+local function waitUntilRunning(): boolean
+	local deadline = os.clock() + RUNNING_WAIT_SECONDS
+	while not RunService:IsRunning() do
+		if os.clock() >= deadline then
+			return false
+		end
+
+		task.wait(RUNNING_POLL_SECONDS)
+	end
+
+	return true
 end
+
+if not RunService:IsRunning() then
+	if RunService:IsEdit() then
+		return
+	end
+
+	if not waitUntilRunning() then
+		if typeof(ReplicatedStorage:GetAttribute(SIDE_CHANNEL_ATTRIBUTE)) == "string" then
+			warn(
+				"[jest-roblox] the play server did not start running within "
+					.. tostring(RUNNING_WAIT_SECONDS)
+					.. "s; this copy of the run-mode plugin stands down"
+			)
+		end
+		return
+	end
+end
+
 _G.__JEST__ = true
 
 -- Plugin/CLI protocol version. Must match `STUDIO_PROTOCOL_VERSION` in
 -- `src/backends/studio.ts` and `STUDIO_CLI_PROTOCOL_VERSION` in
--- `src/backends/studio-cli.ts`. v7 adds the `runnerTimeoutMs` argv the runner
--- bounds a project's run with and strips before calling Jest, so a v6 plugin
--- handed one runs unbounded and passes the key on to Jest; v6 adds the plugin's
+-- `src/backends/studio-cli.ts`. v9 adds the workspace payload's `vmParallel`
+-- count, which a v8 plugin would run sequentially; v8 adds the `pluginKey`
+-- the run asks for, so a copy built for another key stands down; v7 adds the
+-- `runnerTimeoutMs` argv the runner bounds a project's run with and strips
+-- before calling Jest, so a v6 plugin handed one runs unbounded and passes the
+-- key on to Jest; v6 adds the plugin's
 -- own release version to the result and the claim below; v5 added the optional
 -- `vmParallel` count: a
 -- plugin predating it would run a parallel request sequentially and say
@@ -23,7 +60,7 @@ _G.__JEST__ = true
 -- the version the CLI sent and echoes its own in `EndTest`, so the CLI
 -- surfaces a clean error against a mismatched plugin rather than running with
 -- stale runtime semantics.
-local PROTOCOL_VERSION = 7
+local PROTOCOL_VERSION = 10
 
 -- Written by `scripts/stamp-plugin-version.ts` at build time, and absent from a
 -- tree served straight out of source control. Diagnostic only — see the same
@@ -31,6 +68,13 @@ local PROTOCOL_VERSION = 7
 local versionOk, PluginVersion = pcall(require, script.Parent:FindFirstChild("version") :: any)
 if not versionOk or typeof(PluginVersion) ~= "string" then
 	PluginVersion = "unknown"
+end
+
+-- The Plugin Key `studio-cli` stamps into its Managed Plugin. A Manual Plugin
+-- carries none, so it never matches a run that asks for one.
+local keyOk, PluginKey = pcall(require, script.Parent:FindFirstChild("pluginKey") :: any)
+if not keyOk or typeof(PluginKey) ~= "string" then
+	PluginKey = nil
 end
 
 -- Set by whichever installed copy of the plugin can serve this run. Studio
@@ -46,52 +90,93 @@ local RUN_CLAIM_ATTRIBUTE = "JestRobloxRunClaimed"
 -- the mismatch is the run's real cause and has to be reported.
 local MISMATCH_DEFER_SECONDS = 3
 
--- The fork runs the Studio plugin strictly single-VM: the experimental
--- Actor-host (vmHosts) parallel seam was pruned. Every request, including
--- one carrying a `vmParallel` count, runs sequentially through
--- `Runner.runProjects` below.
+-- How long to wait for the actor hosts to bind their message handler. They
+-- bind as the run-mode session starts, so this only absorbs the gap between
+-- plugin scripts starting; a host still un-ready is one that failed to load,
+-- and the run goes ahead without it.
+local HOST_READY_TIMEOUT_SECONDS = 10
 
-local testArgs: any = nil
+-- Set by each host once its `BindToMessage` is live. Mirrors
+-- `plugin/host/vm-host.server.luau`.
+local HOST_READY_ATTRIBUTE = "JestRobloxVmHostReady"
+
+-- Must exceed `NIL_RETURN_PLUGIN_WAIT_MS` in `src/backends/studio-cli.ts`.
+local NIL_RELAY_WAIT_SECONDS = 60
+local ARGS_WAIT_SECONDS = 5
+
+local sideChannel: any = nil
+local rawSideChannel = ReplicatedStorage:GetAttribute(SIDE_CHANNEL_ATTRIBUTE)
+if typeof(rawSideChannel) == "string" then
+	local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, rawSideChannel)
+	if decodeOk and typeof(decoded) == "table" then
+		sideChannel = decoded
+	end
+end
+
+-- Every installed copy shares Studio's WebStreamClient cap, so only the copy
+-- the run asks for may open the socket.
+if
+	sideChannel ~= nil
+	and typeof(sideChannel.payload) == "table"
+	and typeof(sideChannel.payload.pluginKey) == "string"
+	and sideChannel.payload.pluginKey ~= PluginKey
+then
+	sideChannel = nil
+end
+
+local hostSocket: any = nil
+local hasNilRelay = false
+if sideChannel ~= nil then
+	local connectOk, socket = pcall(function()
+		return HttpService:CreateWebStreamClient(
+			Enum.WebStreamClientType.WebSocket,
+			{ Url = sideChannel.url }
+		)
+	end)
+	if connectOk then
+		hostSocket = socket
+		socket.Opened:Once(function()
+			socket:Send(
+				HttpService:JSONEncode({ type = "pluginReady", requestId = sideChannel.requestId })
+			)
+		end)
+		socket.MessageReceived:Connect(function(data: string)
+			local frameOk, frame = pcall(HttpService.JSONDecode, HttpService, data)
+			if
+				frameOk
+				and typeof(frame) == "table"
+				and frame.type == "nilRelay"
+				and frame.requestId == sideChannel.requestId
+			then
+				hasNilRelay = true
+			end
+		end)
+	else
+		warn("[jest-roblox] failed to open the studio-cli socket: " .. tostring(socket))
+	end
+end
+
+local usesSideChannel = false
 
 -- Every result (success or failure) echoes `protocolVersion` so the studio-cli
 -- host can detect a stale plugin: one predating this echo omits the field and
 -- the host rejects it as a version mismatch.
 local function endTest(jestOutput: string, gameOutput: string?): ()
-	if testArgs and typeof(testArgs.resultsUrl) == "string" and testArgs.resultsUrl ~= "" then
-		local postMessage = {
-			type = "results",
-			requestId = testArgs.requestId or "direct",
-			protocolVersion = PROTOCOL_VERSION,
-			pluginVersion = PluginVersion,
-			gameOutput = gameOutput or "[]",
-			jestOutput = jestOutput,
-		}
-		pcall(function()
-			return HttpService:RequestAsync({
-				Url = testArgs.resultsUrl,
-				Method = "POST",
-				Headers = { ["Content-Type"] = "application/json" },
-				Body = HttpService:JSONEncode(postMessage),
-			})
-		end)
-		-- Now call EndTest with minimal empty payload so Studio cleanly exits Run Mode
-		-- without attempting to marshal the large test result table across VM boundaries
-		pcall(function()
-			StudioTestService:EndTest({
-				protocolVersion = PROTOCOL_VERSION,
-				pluginVersion = PluginVersion,
-			})
-		end)
-		return
-	end
-
+	local result = {
+		jestOutput = jestOutput,
+		gameOutput = gameOutput or "[]",
+		protocolVersion = PROTOCOL_VERSION,
+		pluginKey = PluginKey,
+		pluginVersion = PluginVersion,
+	}
 	local ok, endErr = pcall(function()
-		StudioTestService:EndTest({
-			jestOutput = jestOutput,
-			gameOutput = gameOutput or "[]",
-			protocolVersion = PROTOCOL_VERSION,
-			pluginVersion = PluginVersion,
-		})
+		if usesSideChannel then
+			result.type = "results"
+			result.requestId = sideChannel.requestId
+			hostSocket:Send(HttpService:JSONEncode(result))
+		else
+			StudioTestService:EndTest(result)
+		end
 	end)
 	if not ok then
 		warn("[jest-roblox] EndTest failed: " .. tostring(endErr))
@@ -102,18 +187,22 @@ local function endWithError(err: string): ()
 	endTest(HttpService:JSONEncode({ success = false, err = err }), "[]")
 end
 
-testArgs = StudioTestService:GetTestArgs()
-if testArgs == nil then
-	for _ = 1, 50 do
-		task.wait(0.1)
-		testArgs = StudioTestService:GetTestArgs()
-		if testArgs ~= nil then
-			break
-		end
-	end
+local testArgs = StudioTestService:GetTestArgs()
+local argsDeadline = os.clock()
+	+ if hostSocket ~= nil then NIL_RELAY_WAIT_SECONDS else ARGS_WAIT_SECONDS
+while testArgs == nil and not hasNilRelay and os.clock() < argsDeadline do
+	task.wait(0.1)
+	testArgs = StudioTestService:GetTestArgs()
 end
 
-if testArgs == nil then
+-- Remove this fallback once Roblox fixes
+-- https://devforum.roblox.com/t/executerunmodeasync-returns-nil-when-called-from-task-runscript-before-the-place-reaches-placeidle/4921336
+if testArgs == nil and hasNilRelay then
+	testArgs = sideChannel.payload
+	usesSideChannel = true
+end
+
+if typeof(testArgs) ~= "table" or testArgs.test ~= true then
 	return
 end
 
@@ -124,7 +213,25 @@ end
 local clientVersion = if typeof(testArgs.protocolVersion) == "number"
 	then testArgs.protocolVersion
 	else nil
+local requestedKey = if typeof(testArgs.pluginKey) == "string" then testArgs.pluginKey else nil
+local mismatchMessage: string? = nil
 if clientVersion ~= PROTOCOL_VERSION then
+	mismatchMessage = "Studio plugin protocol version mismatch — plugin v"
+		.. tostring(PROTOCOL_VERSION)
+		.. " ("
+		.. PluginVersion
+		.. "), CLI v"
+		.. tostring(clientVersion)
+		.. ". Update the jest-roblox Studio plugin to match the CLI."
+elseif requestedKey ~= nil and requestedKey ~= PluginKey then
+	mismatchMessage = "Studio plugin key mismatch — the CLI asked for plugin "
+		.. requestedKey
+		.. ", but no copy with that key answered (this copy: "
+		.. (PluginKey or ("manually installed " .. PluginVersion))
+		.. "). The CLI's managed plugin did not load."
+end
+
+if mismatchMessage ~= nil then
 	-- Defer to any installed copy that can serve this run before reporting.
 	-- Reporting straight away is what makes a stale copy fatal to a Studio
 	-- that also has a working one: `EndTest` is first-past-the-post, and
@@ -138,21 +245,14 @@ if clientVersion ~= PROTOCOL_VERSION then
 		task.wait(0.05)
 	until os.clock() >= deadline
 
-	endWithError(
-		"Studio plugin protocol version mismatch — plugin v"
-			.. tostring(PROTOCOL_VERSION)
-			.. " ("
-			.. PluginVersion
-			.. "), CLI v"
-			.. tostring(clientVersion)
-			.. ". Update the jest-roblox Studio plugin to match the CLI."
-	)
+	endWithError(mismatchMessage)
 	return
 end
 
 -- Claim the run before doing anything that takes time, so the copies that
 -- cannot serve it stand down rather than answering in our place.
 ReplicatedStorage:SetAttribute(RUN_CLAIM_ATTRIBUTE, PROTOCOL_VERSION)
+ReplicatedStorage:SetAttribute(SIDE_CHANNEL_ATTRIBUTE, nil)
 
 local loadStringEnabled = pcall(function()
 	loadstring("return true")
@@ -161,6 +261,189 @@ end)
 if not loadStringEnabled then
 	endWithError("LoadString must be enabled in ServerScriptService to run tests")
 	return
+end
+
+local VmParallel = require(script.Parent.shared["vm-parallel"])
+
+local function encode(value: any): string
+	return HttpService:JSONEncode(value)
+end
+
+--[[
+	The actor hosts that have bound their message handler, up to `limit`.
+
+	Level-triggered on purpose: a host signals readiness by setting an
+	attribute, not by firing an event, so a host that bound before this runs is
+	still seen. Sorted by name so slice 1 always lands on host1 — the dispatch
+	is deterministic even though the DataModel child order need not be.
+]]
+local function collectReadyHosts(limit: number): { Actor }
+	local folder = script.Parent:FindFirstChild("vmHosts")
+	if folder == nil then
+		return {}
+	end
+
+	local ready: { Actor } = {}
+	local deadline = os.clock() + HOST_READY_TIMEOUT_SECONDS
+	repeat
+		table.clear(ready)
+		local children = folder:GetChildren()
+		table.sort(children, function(left: Instance, right: Instance): boolean
+			return left.Name < right.Name
+		end)
+
+		for _, child in children do
+			local hostScript = child:FindFirstChild("runner")
+			if
+				child:IsA("Actor")
+				and hostScript ~= nil
+				and hostScript:GetAttribute(HOST_READY_ATTRIBUTE) == true
+			then
+				table.insert(ready, child)
+			end
+		end
+
+		if #ready >= limit then
+			break
+		end
+
+		task.wait(0.05)
+	until os.clock() >= deadline
+
+	return ready
+end
+
+--[[
+	One round trip to the VM hosts: each host gets `payloadFor` of its slice,
+	and `readAnswer` turns what a host fires back into the request index it
+	answers and the answer itself — or no index, for an answer this exchange
+	did not ask for.
+]]
+type HostExchange = {
+	expected: number,
+	hosts: { Actor },
+	message: string,
+	payloadFor: (slice: { number }) -> any,
+	readAnswer: (...any) -> (number?, any),
+	slices: { { number } },
+	waitSeconds: number,
+}
+
+--[[
+	Send each host its slice and collect the answers by request index. Returns
+	once every index has answered or `waitSeconds` has passed; an index still
+	missing is a host that died or never answered.
+
+	The main thread does the waiting because `StudioTestService:EndTest` must be
+	called from the run-mode runner's own thread: called from inside the
+	BindableEvent handler it fails with "can only be called from the server
+	DataModel of a running Studio play session".
+]]
+local function exchangeWithHosts(exchange: HostExchange): { [number]: any }
+	local results = script.Parent.vmHosts.results :: BindableEvent
+	local received: { [number]: any } = {}
+	local receivedCount = 0
+	local connection = results.Event:Connect(function(...: any)
+		local index, answer = exchange.readAnswer(...)
+		if index ~= nil and received[index] == nil then
+			received[index] = answer
+			receivedCount += 1
+		end
+	end)
+
+	for hostIndex, slice in exchange.slices do
+		exchange.hosts[hostIndex]:SendMessage(exchange.message, exchange.payloadFor(slice))
+	end
+
+	local deadline = os.clock() + exchange.waitSeconds
+	while receivedCount < exchange.expected and os.clock() < deadline do
+		task.wait(0.05)
+	end
+
+	connection:Disconnect()
+	return received
+end
+
+local function missingError(waitSeconds: number): string
+	return "The VM host running this project stopped answering (timed out after "
+		.. string.format("%.0f", waitSeconds)
+		.. "s)"
+end
+
+--[[
+	The fan-out a workspace run hands the embedded runner: one staged package's
+	entries split across the hosts, returned in the order they were given. An
+	entry no host answered for comes back as an ExecutionError.
+
+	A host that misses the deadline is still running, so it takes no further
+	package, and each package's answers carry its batch number: a late answer
+	from an earlier package must not fill a slot in this one.
+]]
+local function fanOutToHosts(hosts: { Actor }, runBudgetMs: number?)
+	local waitSeconds = VmParallel.resolveHostDeadlineSeconds(runBudgetMs)
+	local live = table.clone(hosts)
+	local batch = 0
+
+	local function failAll(entries: { any }, message: string): { any }
+		local failed = {}
+		for index, entry in entries do
+			failed[index] =
+				VmParallel.workspaceErrorEntry(entry, { encode = encode, message = message })
+		end
+
+		return failed
+	end
+
+	return function(entries: { any }): { any }
+		if #live == 0 then
+			return failAll(
+				entries,
+				"No VM host is left to run this project: every host stopped answering"
+			)
+		end
+
+		batch += 1
+		local current = batch
+		local slices = VmParallel.planSlices({ configCount = #entries, hostCount = #live })
+		local received = exchangeWithHosts({
+			expected = #entries,
+			hosts = live,
+			message = "runStaged",
+			payloadFor = function(slice)
+				local sliceEntries = {}
+				for _, index in slice do
+					table.insert(sliceEntries, entries[index])
+				end
+
+				return { batch = current, entries = sliceEntries, indices = slice }
+			end,
+			readAnswer = function(index: number, result: any, answerBatch: number)
+				return if answerBatch == current then index else nil, result
+			end,
+			slices = slices,
+			waitSeconds = waitSeconds,
+		})
+
+		local ordered = failAll(entries, missingError(waitSeconds))
+		local stuck: { [Actor]: true } = {}
+		for hostIndex, slice in slices do
+			for _, index in slice do
+				if received[index] == nil then
+					stuck[live[hostIndex]] = true
+				else
+					ordered[index] = received[index]
+				end
+			end
+		end
+
+		for index = #live, 1, -1 do
+			if stuck[live[index]] then
+				table.remove(live, index)
+			end
+		end
+
+		return ordered
+	end
 end
 
 -- Dispatch by payload shape. A `workspace` payload drives the staged
@@ -178,13 +461,35 @@ if testArgs.workspace ~= nil then
 		return
 	end
 
-	local runOk, entriesOrErr = pcall(EmbeddedRunner.runEmbedded, script, testArgs.workspace)
+	-- Experimental: each package's projects run across the VM hosts once the
+	-- package is staged. No host ready leaves the run sequential.
+	local fanOut = nil
+	local vmParallel = testArgs.workspace.vmParallel
+	if typeof(vmParallel) == "number" and vmParallel > 1 then
+		local hosts = collectReadyHosts(vmParallel)
+		if #hosts > 0 then
+			fanOut = fanOutToHosts(hosts, testArgs.workspace.runBudgetMs)
+		else
+			warn("[jest-roblox] no parallel VM hosts became ready; running projects sequentially")
+		end
+	end
+
+	local runOk, entriesOrErr, outcome =
+		pcall(EmbeddedRunner.runEmbedded, script, testArgs.workspace, fanOut)
 	if not runOk then
 		endWithError("EmbeddedRunner.runEmbedded threw: " .. tostring(entriesOrErr))
 		return
 	end
 
-	endTest(HttpService:JSONEncode({ entries = entriesOrErr }), "[]")
+	-- `bailed` tells the CLI the missing entries were skipped under --bail.
+	endTest(
+		HttpService:JSONEncode({
+			bailed = outcome.bailed,
+			deferred = outcome.deferred,
+			entries = entriesOrErr,
+		}),
+		"[]"
+	)
 	return
 end
 
@@ -210,6 +515,7 @@ if not stubHooksOk then
 	return
 end
 
+local GameOutputCapture = require(script.Parent.shared["game-output-capture"])
 
 -- Per-config injection target lists, parallel to `configs`. The CLI sends a
 -- pre-filtered list excluding mount paths whose source tree already has a
@@ -217,6 +523,91 @@ end
 -- field) means: skip injection for this config.
 local runtimeStubMounts: { { string } } = testArgs.runtimeStubMounts or table.create(#configs, {})
 
+--[[
+	Run the configs across `requested` Luau VMs and return the entries in
+	request order plus the run's batch-scoped game output.
+
+	Returns nil when no host was available, which leaves the caller on the
+	plain sequential path rather than failing a run the session can still
+	serve.
+]]
+local function runInVmHosts(requested: number): ({ any }?, string?)
+	local hosts = collectReadyHosts(math.min(requested, #configs))
+	if #hosts == 0 then
+		warn("[jest-roblox] no parallel VM hosts became ready; running projects sequentially")
+		return nil, nil
+	end
+
+	-- One capture for the whole batch, owned here. `LogService.MessageOut`
+	-- reports every message to every listener with no source identity, so
+	-- under parallel "which project printed this" is unanswerable; the hosts
+	-- capture nothing and the CLI labels this as batch-scoped.
+	local stopCapture = GameOutputCapture.start()
+
+	local slices = VmParallel.planSlices({
+		configCount = #configs,
+		hostCount = math.min(requested, #hosts),
+		mounts = runtimeStubMounts,
+	})
+
+	-- Bounded by the budget the CLI sent rather than a constant of our own:
+	-- the wait exists to turn a dead host into ExecutionError entries the CLI
+	-- can render, and a wait outlasting the CLI's timeout delivers none of them
+	-- (studio-cli has killed Studio by then).
+	local waitSeconds = VmParallel.resolveHostDeadlineSeconds(testArgs.runBudgetMs)
+	local received = exchangeWithHosts({
+		expected = #configs,
+		hosts = hosts,
+		message = "run",
+		payloadFor = function(slice)
+			local payload = { configs = {}, indices = slice, runtimeStubMounts = {} }
+			for _, configIndex in slice do
+				table.insert(payload.configs, configs[configIndex])
+				table.insert(payload.runtimeStubMounts, runtimeStubMounts[configIndex] or {})
+			end
+
+			return encode(payload)
+		end,
+		readAnswer = function(
+			configIndex: number,
+			jestOutput: string,
+			bannerOutput: string,
+			elapsedMs: number
+		)
+			return configIndex,
+				{ bannerOutput = bannerOutput, elapsedMs = elapsedMs, jestOutput = jestOutput }
+		end,
+		slices = slices,
+		waitSeconds = waitSeconds,
+	})
+
+	return VmParallel.finalizeEntries({
+		configCount = #configs,
+		encode = encode,
+		missingError = missingError(waitSeconds),
+		received = received,
+	}),
+		stopCapture()
+end
+
+-- Experimental in-session parallelism, off unless the CLI asked for it. A
+-- count of one is the sequential path by definition, so only a real split
+-- takes the branch.
+local vmParallel = if typeof(testArgs.vmParallel) == "number" then testArgs.vmParallel else 0
+if vmParallel > 1 and #configs > 1 then
+	local entries, gameOutput = runInVmHosts(vmParallel)
+	if entries ~= nil then
+		-- `gameOutputScope` reports what this run did rather than what it was
+		-- asked to do: the fallback below runs the sequential path, where each
+		-- project owns its capture again, and the CLI groups the output by
+		-- this field rather than by the flag it sent.
+		endTest(
+			HttpService:JSONEncode({ entries = entries, gameOutputScope = "batch" }),
+			gameOutput or "[]"
+		)
+		return
+	end
+end
 
 -- The hooks let `Runner.runProjects` inject each config's `jest.config`
 -- ModuleScripts just-in-time and destroy them before the next config runs, so

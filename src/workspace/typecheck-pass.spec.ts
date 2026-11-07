@@ -3,7 +3,7 @@ import { fromPartial } from "@total-typescript/shoehorn";
 import { describe, expect, it, vi } from "vitest";
 
 import type { TimingCollector } from "../timing/orchestration-collector.ts";
-import type { TypecheckPassOutcome } from "../typecheck/group-by-tsconfig.ts";
+import type { TypecheckPassOutcome } from "../typecheck/typecheck-groups.ts";
 import type { WorkspaceProjectResult } from "./coverage-attach.ts";
 import { attachTypecheck } from "./typecheck-pass.ts";
 
@@ -16,7 +16,11 @@ describe(attachTypecheck, () => {
 		const record = vi.fn<TimingCollector["record"]>();
 
 		expect(
-			attachTypecheck(results, { elapsedMs: 12, result }, fromPartial({ record })),
+			attachTypecheck({
+				pass: { elapsedMs: 12, result },
+				results,
+				timing: fromPartial({ record }),
+			}),
 		).toStrictEqual({ results, typecheckResult: result });
 		expect(record).toHaveBeenCalledExactlyOnceWith("runTypecheck", 12);
 	});
@@ -26,7 +30,13 @@ describe(attachTypecheck, () => {
 
 		const record = vi.fn<TimingCollector["record"]>();
 
-		expect(attachTypecheck([], { elapsedMs: 0 }, fromPartial({ record }))).toStrictEqual({
+		expect(
+			attachTypecheck({
+				pass: { elapsedMs: 0 },
+				results: [],
+				timing: fromPartial({ record }),
+			}),
+		).toStrictEqual({
 			results: [],
 			typecheckResult: undefined,
 		});

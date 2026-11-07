@@ -2,12 +2,14 @@ packages:
   - packages/*
 
 overrides:
-  "@typescript-eslint/eslint-plugin": 8.62.1
-  "@typescript-eslint/parser": 8.62.1
-  "@typescript-eslint/type-utils": 8.62.1
-  "@typescript-eslint/types": 8.62.1
-  "@typescript-eslint/typescript-estree": 8.62.1
-  "@typescript-eslint/utils": 8.62.1
+  "@typescript-eslint/eslint-plugin": 8.72.0
+  "@typescript-eslint/parser": 8.72.0
+  "@typescript-eslint/type-utils": 8.72.0
+  "@typescript-eslint/types": 8.72.0
+  "@typescript-eslint/typescript-estree": 8.72.0
+  "@typescript-eslint/utils": 8.72.0
+  # weld's dts-bundle-generator needs the TypeScript JS API, which 7 lacks.
+  dts-bundle-generator>typescript: 6.0.3
 
 minimumReleaseAgeExclude:
   - "@bedrock-rbx/ocale"
@@ -16,6 +18,3 @@ minimumReleaseAgeExclude:
 publicHoistPattern:
   - "*@rbxts*"
   - "@typescript/*"
-
-patchedDependencies:
-  "@stryker-mutator/vitest-runner@10.0.0": patches/@stryker-mutator__vitest-runner@10.0.0.patch

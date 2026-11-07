@@ -1,89 +1,28 @@
-import { ApiError, NetworkError, PermissionError } from "@bedrock-rbx/ocale";
+import { TaskStallError } from "@isentinel/roblox-runner";
 
+import * as path from "node:path";
 import process from "node:process";
 import { stripVTControlCharacters } from "node:util";
-import type { MockInstance } from "vitest";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { main, parseArgs, runAsync } from "./cli.ts";
+import { expectedDefaultFormatters } from "#test/mocks/config-default-formatters.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
+import type { OutputSpies } from "#test/mocks/spec-results.ts";
+import { makeExecuteResult, makeJestResult, setupOutputSpies } from "#test/mocks/spec-results.ts";
+import packageJson from "../package.json" with { type: "json" };
+import type { CliDependencies } from "./cli.ts";
+import { main, runAsync } from "./cli.ts";
 import { ConfigError } from "./config/errors.ts";
-import { loadConfig } from "./config/loader.ts";
-import { DEFAULT_CONFIG, type ResolvedConfig } from "./config/schema.ts";
-import type { ExecuteResult } from "./executor.ts";
-import { outputMultiResultAsync } from "./output.ts";
-import { LuauScriptError } from "./reporter/parser.ts";
-import { runJestRobloxAsync } from "./run.ts";
-import type { MultiRunResult, ProjectResult, WorkspaceRunResult } from "./run/types.ts";
-import type { JestResult } from "./types/jest-result.ts";
-
-vi.mock(import("./config/loader"));
-vi.mock(import("./run"));
-vi.mock(import("./output"));
-
-const stdEnvironmentMock = vi.hoisted(() => ({ isAgent: false }));
-
-vi.mock(import("std-env"), async (importOriginal) => {
-	const actual = await importOriginal();
-	return {
-		...actual,
-		get isAgent() {
-			return stdEnvironmentMock.isAgent;
-		},
-	};
-});
-
-type MockedWrite = MockInstance<typeof process.stderr.write>;
-
-type MockedConsole = MockInstance<typeof console.log>;
-
-interface OutputSpies {
-	consoleError: MockedConsole;
-	consoleLog: MockedConsole;
-	stderr: MockedWrite;
-	stdout: MockedWrite;
-}
-
-const mocks = {
-	loadConfig: vi.mocked(loadConfig),
-	outputMultiResult: vi.mocked(outputMultiResultAsync),
-	runJestRoblox: vi.mocked(runJestRobloxAsync),
-};
+import type { ResolvedConfig } from "./config/schema.ts";
+import type { MultiRunResult, ProjectResult, WorkspaceRunResult } from "./run/run-types.ts";
 
 function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
 	return {
-		...DEFAULT_CONFIG,
+		...createResolvedConfig(),
 		rootDir: "/test",
 		testMatch: ["**/*.spec.ts"],
 		testPathIgnorePatterns: [],
-		...overrides,
-	};
-}
-
-function makeJestResult(overrides: Partial<JestResult> = {}): JestResult {
-	return {
-		numFailedTests: 0,
-		numPassedTests: 1,
-		numPendingTests: 0,
-		numTotalTests: 1,
-		startTime: 1000,
-		success: true,
-		testResults: [],
-		...overrides,
-	};
-}
-
-function makeExecuteResult(overrides: Partial<ExecuteResult> = {}): ExecuteResult {
-	return {
-		exitCode: 0,
-		output: "",
-		result: makeJestResult(),
-		timing: {
-			executionMs: 100,
-			startTime: Date.now(),
-			testsMs: 50,
-			totalMs: 200,
-			uploadMs: 50,
-		},
 		...overrides,
 	};
 }
@@ -117,13 +56,51 @@ function makeWorkspaceResult(overrides: Partial<WorkspaceRunResult> = {}): Works
 	};
 }
 
-function setupOutputSpies(): OutputSpies {
-	return {
-		consoleError: vi.spyOn(console, "error").mockImplementation(() => {}),
-		consoleLog: vi.spyOn(console, "log").mockImplementation(() => {}),
-		stderr: vi.spyOn(process.stderr, "write").mockReturnValue(true),
-		stdout: vi.spyOn(process.stdout, "write").mockReturnValue(true),
+function setupDefaults(configOverrides: Partial<ResolvedConfig> = {}) {
+	const { fileSystem } = createMemoryFileSystem({ "/test/default.project.json": "{}" });
+	const loadConfig = vi
+		.fn<NonNullable<CliDependencies["loadConfig"]>>()
+		.mockResolvedValue(makeConfig(configOverrides));
+	const outputMultiResult = vi
+		.fn<NonNullable<CliDependencies["outputMultiResult"]>>()
+		.mockResolvedValue(0);
+	const runJestRoblox = vi
+		.fn<NonNullable<CliDependencies["runJestRoblox"]>>()
+		.mockResolvedValue(makeMultiResult());
+	const dependencies: CliDependencies = {
+		fileSystem,
+		loadConfig,
+		outputMultiResult,
+		runJestRoblox,
 	};
+
+	return { dependencies, fileSystem, loadConfig, outputMultiResult, runJestRoblox };
+}
+
+async function captureHelpAsync(): Promise<string> {
+	const spies = setupOutputSpies();
+	setupDefaults();
+
+	await runAsync(["--help"]);
+
+	return String(spies.consoleLog.mock.calls[0]?.[0]);
+}
+
+const HELP_WRAP_REGEX = /\n {20,}/g;
+
+/**
+ * One help entry, unwrapped onto a single line. The help text folds a long
+ * description onto indented continuation lines, so a trailing note reads the
+ * same whichever line it landed on.
+ *
+ * @param help - The full help text.
+ * @param flag - The flag that starts the entry.
+ * @returns The unwrapped entry line.
+ */
+function helpEntry(help: string, flag: string): string {
+	const entries = help.replaceAll(HELP_WRAP_REGEX, " ").split("\n");
+
+	return String(entries.find((line) => line.trimStart().startsWith(`${flag} `)));
 }
 
 function renderedStderr(spies: OutputSpies): string {
@@ -132,1092 +109,66 @@ function renderedStderr(spies: OutputSpies): string {
 	);
 }
 
-function setupDefaults(configOverrides: Partial<ResolvedConfig> = {}) {
-	const config = makeConfig(configOverrides);
-	mocks.loadConfig.mockResolvedValue(config);
-	mocks.runJestRoblox.mockResolvedValue(makeMultiResult());
-	mocks.outputMultiResult.mockResolvedValue(0);
-	return { config };
-}
-
-describe(parseArgs, () => {
-	it("should return help when --help is passed", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--help"]).help).toBeTrue();
-	});
-
-	it("should return version when --version is passed", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--version"]).version).toBeTrue();
-	});
-
-	it("should parse --config option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--config", "./custom.config.ts"]).config).toBe("./custom.config.ts");
-	});
-
-	it("should parse --testPathPattern option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--testPathPattern", "player"]).testPathPattern).toBe("player");
-	});
-
-	it("should parse -t / --testNamePattern option", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["-t", "should spawn"]).testNamePattern).toBe("should spawn");
-		expect(parseArgs(["--testNamePattern", "should spawn"]).testNamePattern).toBe(
-			"should spawn",
-		);
-	});
-
-	it("should parse --formatters json", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--formatters", "json"]).formatters).toStrictEqual(["json"]);
-	});
-
-	it("should parse --outputFile option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--outputFile", "results.json"]).outputFile).toBe("results.json");
-	});
-
-	it("should parse --verbose flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--verbose"]).verbose).toBeTrue();
-	});
-
-	it("should parse --silent flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--silent"]).silent).toBeTrue();
-	});
-
-	it("should parse --bail flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--bail"]).bail).toBeTrue();
-	});
-
-	it("should leave bail undefined without the flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs([]).bail).toBeUndefined();
-	});
-
-	it("should parse positional file arguments", () => {
-		expect.assertions(1);
-
-		const result = parseArgs(["src/test.spec.ts", "src/other.spec.ts"]);
-
-		expect(result.files).toStrictEqual(["src/test.spec.ts", "src/other.spec.ts"]);
-	});
-
-	it("should leave files undefined when no positionals", () => {
-		expect.assertions(1);
-
-		expect(parseArgs([]).files).toBeUndefined();
-	});
-
-	it("should parse combined options and files", () => {
-		expect.assertions(3);
-
-		const result = parseArgs(["--verbose", "-t", "should pass", "src/test.spec.ts"]);
-
-		expect(result.verbose).toBeTrue();
-		expect(result.testNamePattern).toBe("should pass");
-		expect(result.files).toStrictEqual(["src/test.spec.ts"]);
-	});
-
-	it("should parse --formatters agent", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--formatters", "agent"]).formatters).toStrictEqual(["agent"]);
-	});
-
-	it("should reject --no-cache as an unknown option", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--no-cache"])).toThrow(/Unknown option/);
-	});
-
-	it("should reject --cache as an unknown option", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--cache"])).toThrow(/Unknown option/);
-	});
-
-	it("should parse --no-coverage-cache flag", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["--no-coverage-cache"]).coverageCache).toBeFalse();
-		expect(parseArgs(["--coverage-cache"]).coverageCache).toBeTrue();
-	});
-
-	it("should let --no-coverage-cache take precedence over --coverage-cache", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--coverage-cache", "--no-coverage-cache"]).coverageCache).toBeFalse();
-	});
-
-	it("should parse --no-upload-cache flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--no-upload-cache"]).uploadCache).toBeFalse();
-	});
-
-	it("should leave uploadCache unset when the flag is absent", () => {
-		expect.assertions(1);
-
-		expect(parseArgs([]).uploadCache).toBeUndefined();
-	});
-
-	it("should parse color flags and prefer --no-color", () => {
-		expect.assertions(3);
-
-		expect(parseArgs(["--no-color"]).color).toBeFalse();
-		expect(parseArgs(["--color"]).color).toBeTrue();
-		expect(parseArgs(["--color", "--no-color"]).color).toBeFalse();
-	});
-
-	it("should parse --gameOutput option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--gameOutput", "/tmp/game.json"]).gameOutput).toBe("/tmp/game.json");
-	});
-
-	it("should parse Luau display flags and prefer --no-show-luau", () => {
-		expect.assertions(3);
-
-		expect(parseArgs(["--no-show-luau"]).showLuau).toBeFalse();
-		expect(parseArgs(["--showLuau"]).showLuau).toBeTrue();
-		expect(parseArgs(["--showLuau", "--no-show-luau"]).showLuau).toBeFalse();
-	});
-
-	it("should parse -u / --updateSnapshot flag", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["-u"]).updateSnapshot).toBeTrue();
-		expect(parseArgs(["--updateSnapshot"]).updateSnapshot).toBeTrue();
-	});
-
-	it("should parse --typecheck flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--typecheck"]).typecheck).toBeTrue();
-	});
-
-	it("should parse --typecheckOnly flag and imply --typecheck", () => {
-		expect.assertions(2);
-
-		const result = parseArgs(["--typecheckOnly"]);
-
-		expect(result.typecheckOnly).toBeTrue();
-		expect(result.typecheck).toBeTrue();
-	});
-
-	it("should parse --typecheckTsconfig option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--typecheckTsconfig", "tsconfig.test.json"]).typecheckTsconfig).toBe(
-			"tsconfig.test.json",
-		);
-	});
-
-	it("should parse valid --backend values", () => {
-		expect.assertions(4);
-
-		expect(parseArgs(["--backend", "auto"]).backend).toBe("auto");
-		expect(parseArgs(["--backend", "open-cloud"]).backend).toBe("open-cloud");
-		expect(parseArgs(["--backend", "studio"]).backend).toBe("studio");
-		expect(parseArgs(["--backend", "studio-cli"]).backend).toBe("studio-cli");
-	});
-
-	it("should parse --studioPath", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["--studioPath", "C:/Studio/RobloxStudioBeta.exe"]).studioPath).toBe(
-			"C:/Studio/RobloxStudioBeta.exe",
-		);
-		expect(parseArgs([]).studioPath).toBeUndefined();
-	});
-
-	it("should parse --headed", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["--headed"]).headed).toBeTrue();
-		expect(parseArgs([]).headed).toBeUndefined();
-	});
-
-	it("should leave backend undefined when not passed", () => {
-		expect.assertions(1);
-
-		expect(parseArgs([]).backend).toBeUndefined();
-	});
-
-	it("should throw on invalid --backend value", () => {
-		expect.assertions(2);
-
-		expect(() => parseArgs(["--backend", "not-a-backend"])).toThrow(
-			'Invalid backend "not-a-backend"',
-		);
-		expect(() => parseArgs(["--backend", "invalid"])).toThrow(
-			"Must be one of: auto, open-cloud, studio, studio-cli",
-		);
-	});
-
-	it("should parse --coverage flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--coverage"]).collectCoverage).toBeTrue();
-	});
-
-	it("should parse --no-coverage flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--no-coverage"]).collectCoverage).toBeFalse();
-	});
-
-	it("should let --no-coverage take precedence over --coverage when both are passed", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--coverage", "--no-coverage"]).collectCoverage).toBeFalse();
-	});
-
-	it("should parse --coverageDirectory option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--coverageDirectory", "my-coverage"]).coverageDirectory).toBe(
-			"my-coverage",
-		);
-	});
-
-	it("should parse --coverageReporters with multiple values", () => {
-		expect.assertions(1);
-
-		const result = parseArgs([
-			"--coverageReporters",
-			"text",
-			"--coverageReporters",
-			"lcov",
-			"--coverageReporters",
-			"html",
-		]);
-
-		expect(result.coverageReporters).toStrictEqual(["text", "lcov", "html"]);
-	});
-
-	it("should report every invalid --coverageReporters value", () => {
-		expect.assertions(1);
-
-		expect(() => {
-			return parseArgs([
-				"--coverageReporters",
-				"bad-one",
-				"--coverageReporters",
-				"text",
-				"--coverageReporters",
-				"bad-two",
-			]);
-		}).toThrow(
-			'Invalid coverage reporter "bad-one", "bad-two". Must be one of: clover, cobertura, html, html-spa, json, json-summary, lcov, lcovonly, none, teamcity, text, text-lcov, text-summary',
-		);
-	});
-
-	it("should parse --collectCoverageFrom with multiple values", () => {
-		expect.assertions(1);
-
-		const result = parseArgs([
-			"--collectCoverageFrom",
-			"src/**/*.ts",
-			"--collectCoverageFrom",
-			"lib/**/*.ts",
-		]);
-
-		expect(result.collectCoverageFrom).toStrictEqual(["src/**/*.ts", "lib/**/*.ts"]);
-	});
-
-	it("should leave collectCoverageFrom undefined when not passed", () => {
-		expect.assertions(1);
-
-		expect(parseArgs([]).collectCoverageFrom).toBeUndefined();
-	});
-
-	it("should parse --port option", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["--port", "4000"]).port).toBe(4000);
-		expect(parseArgs([]).port).toBeUndefined();
-	});
-
-	it("should parse --timeout option", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["--timeout", "60000"]).timeout).toBe(60000);
-		expect(parseArgs([]).timeout).toBeUndefined();
-	});
-
-	it("should parse single --project flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--project", "client"]).project).toStrictEqual(["client"]);
-	});
-
-	it("should parse multiple --project flags", () => {
-		expect.assertions(1);
-
-		const result = parseArgs(["--project", "client", "--project", "server"]);
-
-		expect(result.project).toStrictEqual(["client", "server"]);
-	});
-
-	it("should parse --passWithNoTests flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--passWithNoTests"]).passWithNoTests).toBeTrue();
-	});
-
-	it("should parse --parallel with integer value", () => {
-		expect.assertions(2);
-
-		expect(parseArgs(["--parallel", "3"]).parallel).toBe(3);
-		expect(parseArgs(["--parallel", "12"]).parallel).toBe(12);
-	});
-
-	it('should parse --parallel with "auto"', () => {
-		expect.assertions(2);
-
-		const result = parseArgs(["--parallel", "auto"]);
-
-		expect(result.parallel).toBe("auto");
-		expect(result.files).toBeUndefined();
-	});
-
-	it('should treat bare --parallel (no value) as "auto"', () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--parallel"]).parallel).toBe("auto");
-	});
-
-	it("should treat --parallel followed by another flag as auto", () => {
-		expect.assertions(2);
-
-		const result = parseArgs(["--parallel", "--verbose"]);
-
-		expect(result.parallel).toBe("auto");
-		expect(result.verbose).toBeTrue();
-	});
-
-	it("should leave a negative positional for the argument parser", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--parallel", "-1"])).toThrow("Unknown option '-1'");
-	});
-
-	it("should leave parallel undefined when flag not present", () => {
-		expect.assertions(1);
-
-		expect(parseArgs([]).parallel).toBeUndefined();
-	});
-
-	it("should throw on --parallel 0", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--parallel", "0"])).toThrow("Invalid --parallel value");
-	});
-
-	it("should accept the minimum --parallel value", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--parallel", "1"]).parallel).toBe(1);
-	});
-
-	it("should throw on --parallel -1", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--parallel=-1"])).toThrow("Invalid --parallel value");
-	});
-
-	it("should throw on --parallel non-numeric", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--parallel=xyz"])).toThrow("Invalid --parallel value");
-	});
-
-	it.for(["3x", "x3"])(
-		"should reject attached partially numeric --parallel value %j",
-		(value) => {
-			expect.assertions(1);
-
-			expect(() => parseArgs([`--parallel=${value}`])).toThrow("Invalid --parallel value");
-		},
-	);
-
-	it("should parse --experimental-vm-parallel with integer value", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--experimental-vm-parallel", "3"]).experimentalVmParallel).toBe(3);
-	});
-
-	it('should treat bare --experimental-vm-parallel as "auto"', () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--experimental-vm-parallel"]).experimentalVmParallel).toBe("auto");
-	});
-
-	it('should consume "auto" as the --experimental-vm-parallel value, not a test path', () => {
-		expect.assertions(2);
-
-		const result = parseArgs(["--experimental-vm-parallel", "auto"]);
-
-		expect(result.experimentalVmParallel).toBe("auto");
-		expect(result.files).toBeUndefined();
-	});
-
-	it("should treat --experimental-vm-parallel followed by another flag as auto", () => {
-		expect.assertions(2);
-
-		const result = parseArgs(["--experimental-vm-parallel", "--verbose"]);
-
-		expect(result.experimentalVmParallel).toBe("auto");
-		expect(result.verbose).toBeTrue();
-	});
-
-	it("should leave experimentalVmParallel undefined when flag not present", () => {
-		expect.assertions(1);
-
-		expect(parseArgs([]).experimentalVmParallel).toBeUndefined();
-	});
-
-	it("should throw on --experimental-vm-parallel 0", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--experimental-vm-parallel", "0"])).toThrow(
-			"Invalid --experimental-vm-parallel value",
-		);
-	});
-
-	it("should throw on --experimental-vm-parallel non-numeric", () => {
-		expect.assertions(1);
-
-		expect(() => parseArgs(["--experimental-vm-parallel=xyz"])).toThrow(
-			"Invalid --experimental-vm-parallel value",
-		);
-	});
-
-	it("should parse --apiKey option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--apiKey", "secret"]).apiKey).toBe("secret");
-	});
-
-	it("should parse --universeId option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--universeId", "123"]).universeId).toBe("123");
-	});
-
-	it("should parse --placeId option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--placeId", "456"]).placeId).toBe("456");
-	});
-
-	it("should parse all three credential flags together", () => {
-		expect.assertions(3);
-
-		const result = parseArgs(["--apiKey", "secret", "--universeId", "123", "--placeId", "456"]);
-
-		expect(result.apiKey).toBe("secret");
-		expect(result.universeId).toBe("123");
-		expect(result.placeId).toBe("456");
-	});
-
-	it("should leave credential fields undefined when flags are absent", () => {
-		expect.assertions(3);
-
-		const result = parseArgs([]);
-
-		expect(result.apiKey).toBeUndefined();
-		expect(result.universeId).toBeUndefined();
-		expect(result.placeId).toBeUndefined();
-	});
-
-	it("should parse --workspace flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--workspace"]).workspace).toBeTrue();
-	});
-
-	it("should parse --packages option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--packages", "foo,bar"]).packages).toBe("foo,bar");
-	});
-
-	it("should parse --affected-since option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--affected-since", "main"]).affectedSince).toBe("main");
-	});
-
-	it("should parse --workspace-root option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--workspace-root", "./pkgs/testing"]).workspaceRoot).toBe(
-			"./pkgs/testing",
-		);
-	});
-
-	it("should parse --setupFiles list", () => {
-		expect.assertions(1);
-
-		const result = parseArgs(["--setupFiles", "a.ts", "--setupFiles", "b.ts"]);
-
-		expect(result.setupFiles).toStrictEqual(["a.ts", "b.ts"]);
-	});
-
-	it("should parse --setupFilesAfterEnv list", () => {
-		expect.assertions(1);
-
-		const result = parseArgs(["--setupFilesAfterEnv", "x.ts", "--setupFilesAfterEnv", "y.ts"]);
-
-		expect(result.setupFilesAfterEnv).toStrictEqual(["x.ts", "y.ts"]);
-	});
-
-	it("should parse --rojoProject option", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--rojoProject", "custom.project.json"]).rojoProject).toBe(
-			"custom.project.json",
-		);
-	});
-
-	it("should parse --sourceMap flag", () => {
-		expect.assertions(1);
-
-		expect(parseArgs(["--sourceMap"]).sourceMap).toBeTrue();
-	});
-});
-
 describe(runAsync, () => {
-	it("should return 2 and print banner for ConfigError with hint", async () => {
-		expect.assertions(4);
+	it("should settle the active progress stage when execution throws", async () => {
+		expect.assertions(2);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(new ConfigError("bad value", "try this instead"));
+		const cli = setupDefaults();
+		cli.runJestRoblox.mockImplementation(({ progress }) => {
+			assert(progress !== undefined);
+			progress.reveal({ color: false });
+			progress.begin("boot", "version 88");
+			throw new Error("boot failed");
+		});
 
-		const code = await runAsync([]);
+		const code = await runAsync([], cli.dependencies);
+
+		expect(code).toBe(2);
+		expect(spies.stdout.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain(
+			" · boot probe   version 88\n",
+		);
+	});
+
+	it("should return 2 and print banner for ConfigError", async () => {
+		expect.assertions(2);
+
+		const spies = setupOutputSpies();
+		const cli = setupDefaults();
+		cli.loadConfig.mockRejectedValue(new ConfigError("bad value", "try this instead"));
+
+		const code = await runAsync([], cli.dependencies);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Config Error"));
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("bad value"));
-		expect(renderedStderr(spies)).toContain("\n  Hint: try this instead\n");
 	});
 
-	it("should return 2 and print banner for ConfigError without hint", async () => {
+	it("should return 3 and report a stalled task as an infrastructure failure", async () => {
 		expect.assertions(3);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(new ConfigError("missing field"));
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("missing field"));
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Hint:"));
-	});
-
-	it("should return 2 and print hint for LuauScriptError matching a known pattern", async () => {
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(
-			new LuauScriptError("Failed to find Jest instance in ReplicatedStorage"),
-		);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Luau Error"));
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Hint:"));
-	});
-
-	it("should omit Hint section for LuauScriptError with no matching pattern", async () => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(new LuauScriptError("Some unrelated runtime error"));
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Hint:"));
-	});
-
-	it("should lead the banner with captured banner output when the message is just an exit code", async () => {
-		// When Jest exits via process.exit(N), the message "Exited
-		// with code: N" is only a transport — the real error message Jest
-		// printed to stdout lives in `bannerOutput` (the InterceptWriteable
-		// capture, distinct from the LogService-sourced `gameOutput` dump).
-		// Lead the banner with that.
-		expect.assertions(5);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-
-		const error = new LuauScriptError("Exited with code: 1");
-		error.bannerOutput = JSON.stringify([
-			{ message: "No tests found, exiting with code 1", messageType: 0, timestamp: 0 },
-			{
-				message: "Run with `--passWithNoTests` to exit with code 0",
-				messageType: 0,
-				timestamp: 0,
-			},
-		]);
-		mocks.loadConfig.mockRejectedValue(error);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Test Run Failed"));
-		expect(renderedStderr(spies)).toContain(
-			"\n  No tests found, exiting with code 1\n  Run with `--passWithNoTests` to exit with code 0\n\n  Exited with code: 1\n",
-		);
-		// Game output is the primary content now, not a sub-section.
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Game output:"));
-		// "Luau Error" title is reserved for actual Luau crashes.
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Luau Error"));
-	});
-
-	it("should recognize a multi-digit exit code only when it is the complete message", async () => {
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-
-		const error = new LuauScriptError("Exited with code: 12");
-		error.bannerOutput = JSON.stringify([
-			{ message: "captured failure", messageType: 0, timestamp: 0 },
-		]);
-		mocks.loadConfig.mockRejectedValue(error);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(renderedStderr(spies)).toContain("captured failure\n\n  Exited with code: 12");
-		expect(renderedStderr(spies)).not.toContain("Game output:");
-	});
-
-	it.for(["prefix Exited with code: 1", "Exited with code: 1 trailing"] as const)(
-		"should keep captured output as context for non-exact exit message %j",
-		async (message) => {
-			expect.assertions(2);
-
-			const spies = setupOutputSpies();
-			setupDefaults();
-
-			const error = new LuauScriptError(message);
-			error.bannerOutput = JSON.stringify([
-				{ message: "captured context", messageType: 0, timestamp: 0 },
-			]);
-			mocks.loadConfig.mockRejectedValue(error);
-
-			const code = await runAsync([]);
-
-			expect(code).toBe(2);
-			expect(renderedStderr(spies)).toContain("Game output:\n  captured context");
-		},
-	);
-
-	it("should print banner output context for LuauScriptError with parseable bannerOutput", async () => {
-		// Non-exit-code LuauScriptError (e.g. config / Jest-resolution failure)
-		// keeps the original layout: message as primary, bannerOutput as hint.
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-
-		const error = new LuauScriptError("Failed to find Jest instance in ReplicatedStorage");
-		error.bannerOutput = JSON.stringify([
-			{ message: "diagnostic output", messageType: 0, timestamp: 0 },
-		]);
-		mocks.loadConfig.mockRejectedValue(error);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Luau Error"));
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Game output:"));
-	});
-
-	it("should omit Game output section when bannerOutput parses to empty array", async () => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-
-		const error = new LuauScriptError("Exited with code: 1");
-		error.bannerOutput = "[]";
-		mocks.loadConfig.mockRejectedValue(error);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Game output:"));
-	});
-
-	it("should omit Game output section when gameOutput is undefined", async () => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(new LuauScriptError("Exited with code: 1"));
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Game output:"));
-	});
-
-	it("should return 2 and print message for generic Error", async () => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(new Error("something broke"));
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.consoleError).toHaveBeenCalledWith("Error: something broke");
-	});
-
-	it("should return 2 for unknown error type", async () => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue("string-error");
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.consoleError).toHaveBeenCalledWith("An unknown error occurred");
-	});
-
-	it("should return 2 and render a Backend Error banner when error.cause is an OpenCloudError", async () => {
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const wrapped = new Error("Failed to upload place: Network request failed", {
-			cause: new NetworkError("Network request failed"),
-		});
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("Backend Error"));
-		expect(spies.stderr).toHaveBeenCalledWith(
-			expect.stringContaining("Failed to upload place: Network request failed"),
-		);
-	});
-
-	it("should include the cause chain entries inside the Backend Error banner", async () => {
-		expect.assertions(5);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const innerWithCode = Object.assign(new TypeError("fetch failed"), {
-			code: "ECONNRESET",
-			errno: -54,
-			syscall: "connect",
-		});
-		const wrapped = new Error("Failed to upload place: Network request failed", {
-			cause: new NetworkError("Network request failed", { cause: innerWithCode }),
-		});
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(
-			expect.stringContaining("NetworkError: Network request failed"),
-		);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("ECONNRESET"));
-		expect(renderedStderr(spies)).toContain(
-			"    [1] TypeError: fetch failed (code=ECONNRESET errno=-54 syscall=connect)",
-		);
-		expect(renderedStderr(spies)).not.toContain(" ()");
-	});
-
-	it("should name the failing request, status, and body head for a parse failure", async () => {
-		expect.assertions(5);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const message = "Failed to parse response body (content-type: application/json)";
-		const wrapped = new Error(message, {
-			cause: new ApiError(message, {
-				cause: new SyntaxError("Unterminated string in JSON at position 1572740"),
-				details: '{"path":"universes/1/places/2/luau-execution-session-tasks/abc","sta',
-				method: "GET",
-				statusCode: 200,
-				url: "https://apis.roblox.com/cloud/v2/universes/1/places/2/luau-execution-session-tasks/abc",
-			}),
-		});
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("status=200"));
-		expect(spies.stderr).toHaveBeenCalledWith(
-			expect.stringContaining(
-				"GET https://apis.roblox.com/cloud/v2/universes/1/places/2/luau-execution-session-tasks/abc",
-			),
-		);
-		expect(renderedStderr(spies)).toContain(
-			"    [0] ApiError: Failed to parse response body (content-type: application/json) (status=200)",
-		);
-		expect(spies.stderr).toHaveBeenCalledWith(
-			expect.stringContaining(
-				'{"path":"universes/1/places/2/luau-execution-session-tasks/abc',
-			),
-		);
-	});
-
-	it("should collapse and truncate the body head to keep the banner readable", async () => {
-		expect.assertions(4);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const wrapped = new Error("Failed to parse response body", {
-			cause: new ApiError("Failed to parse response body", {
-				details: `{"log":"line one\nline two${"x".repeat(400)}"}`,
-				statusCode: 200,
-			}),
-		});
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-
-		const rendered = renderedStderr(spies);
-
-		expect(rendered).toContain("line one line two");
-		expect(rendered).toContain("…");
-		expect(rendered).not.toContain("x".repeat(200));
-	});
-
-	it("should truncate response bodies only after the preview limit", async () => {
-		expect.assertions(4);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const exactLimit = "x".repeat(160);
-		mocks.loadConfig.mockRejectedValue(
-			new Error("Failed to parse response body", {
-				cause: new ApiError("Failed to parse response body", {
-					details: exactLimit,
-					statusCode: 200,
-				}),
+		const cli = setupDefaults();
+		cli.runJestRoblox.mockRejectedValue(
+			new TaskStallError({
+				error: new Error("The task stalled"),
+				evidence: {
+					createTime: "2026-09-23T10:00:00.000Z",
+					kind: "task-stall",
+					observedStates: ["QUEUED"],
+					placeVersion: 42,
+					task: "universes/1/places/2/versions/42/luau-execution-sessions/s/tasks/t",
+					timeoutSeconds: 300,
+					updateTime: "2026-09-23T10:05:00.000Z",
+				},
+				readResultAsync: async () => ({ durationMs: 0, outputs: [] }),
 			}),
 		);
 
-		await expect(runAsync([])).resolves.toBe(2);
-		expect(renderedStderr(spies)).toContain(`Body: ${exactLimit}\n`);
+		const code = await runAsync([], cli.dependencies);
 
-		spies.stderr.mockClear();
-		mocks.loadConfig.mockRejectedValue(
-			new Error("Failed to parse response body", {
-				cause: new ApiError("Failed to parse response body", {
-					details: `${exactLimit}y`,
-					statusCode: 200,
-				}),
-			}),
-		);
-
-		await expect(runAsync([])).resolves.toBe(2);
-		expect(renderedStderr(spies)).toContain(`Body: ${exactLimit}…\n`);
-	});
-
-	it("should collapse a run of mixed whitespace in a response body", async () => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(
-			new Error("Failed to parse response body", {
-				cause: new ApiError("Failed to parse response body", {
-					details: "first\n \tsecond",
-					statusCode: 200,
-				}),
-			}),
-		);
-
-		await expect(runAsync([])).resolves.toBe(2);
-		expect(renderedStderr(spies)).toContain("Body: first second\n");
-	});
-
-	it("should omit the body line when the captured body is blank", async () => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const wrapped = new Error("Failed to parse response body", {
-			cause: new ApiError("Failed to parse response body", {
-				details: "  \n  ",
-				statusCode: 200,
-			}),
-		});
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-
-		const rendered = renderedStderr(spies);
-
-		expect(rendered).not.toContain("Body:");
-	});
-
-	it("should render the url alone when the error names no method", async () => {
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const wrapped = new Error("HTTP 503: Service Unavailable", {
-			cause: new ApiError("HTTP 503: Service Unavailable", {
-				statusCode: 503,
-				url: "https://apis.roblox.com/cloud/v2/universes/1/places/2",
-			}),
-		});
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-
-		const rendered = renderedStderr(spies);
-
-		expect(rendered).toContain("https://apis.roblox.com/cloud/v2/universes/1/places/2");
-		expect(rendered).not.toContain("undefined");
-	});
-
-	it("should name the missing scope in the Backend Error banner for a PermissionError cause", async () => {
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const wrapped = new Error(
-			"Failed to upload place: HTTP 401: API Key has insufficient scopes.",
-			{
-				cause: new PermissionError("HTTP 401: API Key has insufficient scopes.", {
-					operationKey: "places.publishVersion",
-					requiredScopes: ["universe-places:write"],
-					statusCode: 401,
-				}),
-			},
-		);
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("universe-places:write"));
-		expect(spies.stderr).toHaveBeenCalledWith(
-			expect.stringContaining("Add via Creator Dashboard"),
-		);
-	});
-
-	it("should fall through to plain console.error when error.cause is not an OpenCloudError", async () => {
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		const wrapped = new Error("wrapped non-ocale", {
-			cause: new Error("inner non-ocale"),
-		});
-		mocks.loadConfig.mockRejectedValue(wrapped);
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.consoleError).toHaveBeenCalledWith("Error: wrapped non-ocale");
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("Backend Error"));
-	});
-});
-
-describe("lUAU_ERROR_HINTS", () => {
-	it.for<[message: string, hint: string]>([
-		[
-			"Failed to find Jest instance in ReplicatedStorage",
-			'Set "jestPath" in your config to specify the Jest module location, e.g. "ReplicatedStorage/rbxts_include/node_modules/@rbxts/jest/src"',
-		],
-		[
-			"Failed to find Jest instance at path",
-			"The configured jestPath does not resolve to a valid instance. Verify the path matches your Rojo project tree.",
-		],
-		[
-			"Failed to find service ReplicatedStorage.foo",
-			"The first segment of jestPath must be a valid Roblox service name (e.g. ReplicatedStorage, ServerScriptService).",
-		],
-		[
-			"No projects configured",
-			'Set "projects" in jest.config.ts (e.g. ["ReplicatedStorage/client", "ServerScriptService/server"]).',
-		],
-		[
-			"Infinite yield detected",
-			"A :WaitForChild() call is waiting for an instance that doesn't exist. Check your DataModel paths and Rojo project configuration.",
-		],
-		[
-			"loadstring() is not available",
-			'loadstring() must be enabled for Jest to run. Add "LoadStringEnabled": true to ServerScriptService.$properties in your project.json.',
-		],
-		// Verbatim from a v3 plugin, which is the point: the copy that answers
-		// is a stale one whose wording is already fixed on disk.
-		[
-			"Studio plugin protocol version mismatch — plugin v3, CLI v6. Update the jest-roblox Studio plugin to match the CLI.",
-			"If you have more than one JestRobloxRunner installed, this may be a stale copy rather than the one you just updated: Studio runs them all, and on --backend studio-cli the first to answer decides the run. Check your Studio plugins folder and remove the copies you do not want.",
-		],
-	])("should hint for: %s", async ([message, hint]) => {
-		expect.assertions(2);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(new LuauScriptError(message));
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(renderedStderr(spies)).toContain(`Hint: ${hint}`);
-	});
-
-	it("should not reference removed --projects flag in projects hint", async () => {
-		expect.assertions(3);
-
-		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.loadConfig.mockRejectedValue(new LuauScriptError("No projects configured"));
-
-		const code = await runAsync([]);
-
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("projects"));
-		expect(spies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("--projects"));
+		expect(code).toBe(3);
+		expect(renderedStderr(spies)).toContain("Roblox Infrastructure Error");
+		expect(renderedStderr(spies)).toContain("The task stalled");
 	});
 });
 
@@ -1225,7 +176,7 @@ describe(main, () => {
 	it("should pass only user arguments and set process.exitCode from the run result", async () => {
 		expect.assertions(2);
 
-		setupDefaults();
+		const cli = setupDefaults();
 		setupOutputSpies();
 
 		const originalArgv = process.argv;
@@ -1237,68 +188,117 @@ describe(main, () => {
 			process.exitCode = originalExitCode;
 		});
 
-		await main();
+		await main(cli.dependencies);
 
 		expect(process.exitCode).toBe(0);
-		expect(mocks.runJestRoblox).toHaveBeenCalledWith(
-			expect.objectContaining({ files: undefined, parallel: 2 }),
-			expect.any(Object),
-			expect.any(Object),
+		expect(cli.runJestRoblox).toHaveBeenCalledWith(
+			expect.objectContaining<Record<string, unknown>>({
+				cli: expect.objectContaining({ files: undefined, parallel: 2 }),
+				config: expect.any(Object),
+				fileSystem: cli.fileSystem,
+				progress: expect.any(Object),
+			}),
 		);
 	});
 });
 
 describe("runInner orchestration", () => {
+	it("should write the run log through the injected file system", async () => {
+		expect.assertions(1);
+
+		setupOutputSpies();
+		const cli = setupDefaults();
+
+		await runAsync([], cli.dependencies);
+
+		expect(
+			cli.fileSystem.existsSync(path.join("/test", ".jest-roblox", "last-run.log")),
+		).toBeTrue();
+	});
+
 	it("should print HELP_TEXT and return 0 when --help is passed", async () => {
 		expect.assertions(3);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
-		const code = await runAsync(["--help"]);
+		const code = await runAsync(["--help"], cli.dependencies);
 
 		expect(code).toBe(0);
 		expect(spies.consoleLog).toHaveBeenCalledWith(
 			expect.stringContaining("Usage: jest-roblox"),
 		);
-		expect(mocks.loadConfig).not.toHaveBeenCalled();
+		expect(cli.loadConfig).not.toHaveBeenCalled();
+	});
+
+	it.for([
+		"--collectCoverageFrom",
+		"--coverageReporters",
+		"--formatters",
+		"--project",
+		"--setupFiles",
+		"--setupFilesAfterEnv",
+	])("should mark %s as a repeatable flag, not a variadic one", async (flag) => {
+		expect.assertions(1);
+
+		const entry = helpEntry(await captureHelpAsync(), flag);
+
+		expect(entry).toContain("(repeatable)");
+	});
+
+	it("should document no binary-input option", async () => {
+		expect.assertions(1);
+
+		const help = await captureHelpAsync();
+
+		expect(help).not.toContain("binary-input");
+	});
+
+	it("should document no option value as variadic", async () => {
+		expect.assertions(1);
+
+		// parseArgs collects a repeated flag; it never takes several values
+		// after one flag. A `<name...>` entry invited `--project a b`, which
+		// silently turned `b` into a positional file filter.
+		const help = await captureHelpAsync();
+
+		expect(help).not.toMatch(/<[^>]*\.\.\.>/);
 	});
 
 	it("should print VERSION and return 0 when --version is passed", async () => {
 		expect.assertions(3);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
-		const code = await runAsync(["--version"]);
+		const code = await runAsync(["--version"], cli.dependencies);
 
 		expect(code).toBe(0);
-		expect(spies.consoleLog).toHaveBeenCalledOnce();
-		expect(mocks.loadConfig).not.toHaveBeenCalled();
+		expect(spies.consoleLog).toHaveBeenCalledExactlyOnceWith(packageJson.version);
+		expect(cli.loadConfig).not.toHaveBeenCalled();
 	});
 
-	it("should throw a ConfigError when SEA mode is paired with --typecheck", async () => {
-		expect.assertions(2);
+	it("should load config for --typecheck in SEA mode", async () => {
+		expect.assertions(1);
 
-		const spies = setupOutputSpies();
-		setupDefaults();
+		setupOutputSpies();
+		const cli = setupDefaults();
 
 		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const code = await runAsync(["--typecheck"]);
+		await runAsync(["--typecheck", "--formatters", "default"], cli.dependencies);
 
-		expect(code).toBe(2);
-		expect(spies.stderr).toHaveBeenCalledWith(expect.stringContaining("standalone binary"));
+		expect(cli.loadConfig).toHaveBeenCalledOnce();
 	});
 
 	it("should allow typechecking outside SEA mode", async () => {
 		expect.assertions(2);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 		vi.stubEnv("JEST_ROBLOX_SEA", "false");
 
-		const code = await runAsync(["--typecheck"]);
+		const code = await runAsync(["--typecheck", "--formatters", "default"], cli.dependencies);
 
 		expect(code).toBe(0);
 		expect(spies.stderr).not.toHaveBeenCalled();
@@ -1308,10 +308,10 @@ describe("runInner orchestration", () => {
 		expect.assertions(2);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 		vi.stubEnv("JEST_ROBLOX_SEA", "true");
 
-		const code = await runAsync([]);
+		const code = await runAsync(["--formatters", "default"], cli.dependencies);
 
 		expect(code).toBe(0);
 		expect(spies.stderr).not.toHaveBeenCalled();
@@ -1321,47 +321,61 @@ describe("runInner orchestration", () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
-		await runAsync(["--config", "./custom.ts"]);
+		await runAsync(["--config", "./custom.ts"], cli.dependencies);
 
-		expect(mocks.loadConfig).toHaveBeenCalledWith("./custom.ts", undefined);
+		expect(cli.loadConfig).toHaveBeenCalledWith({
+			configPath: "./custom.ts",
+			cwd: undefined,
+			fileSystem: cli.fileSystem,
+		});
 	});
 
 	it("should load the bootstrap config from --workspace-root", async () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
-		await runAsync(["--workspace", "--packages", "foo", "--workspace-root", "/ws"]);
+		await runAsync(
+			["--workspace", "--packages", "foo", "--workspace-root", "/ws"],
+			cli.dependencies,
+		);
 
-		expect(mocks.loadConfig).toHaveBeenCalledWith(undefined, "/ws");
+		expect(cli.loadConfig).toHaveBeenCalledWith({
+			configPath: undefined,
+			cwd: "/ws",
+			fileSystem: cli.fileSystem,
+		});
 	});
 
 	it("should pass cli flags into runJestRoblox", async () => {
-		expect.assertions(2);
+		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
-		await runAsync(["--verbose"]);
+		await runAsync(["--verbose"], cli.dependencies);
 
-		expect(mocks.runJestRoblox).toHaveBeenCalledOnce();
-
-		const [cli] = mocks.runJestRoblox.mock.calls[0]!;
-
-		expect(cli.verbose).toBeTrue();
+		expect(cli.runJestRoblox).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining<Record<string, unknown>>({
+				cli: expect.objectContaining({ verbose: true }),
+				config: expect.anything(),
+				fileSystem: cli.fileSystem,
+				progress: expect.anything(),
+			}),
+		);
 	});
 
 	it("should propagate a non-zero exit code from outputMultiResult", async () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults();
-		mocks.outputMultiResult.mockResolvedValue(1);
+		const cli = setupDefaults();
+		cli.outputMultiResult.mockResolvedValue(1);
 
-		const code = await runAsync([]);
+		const code = await runAsync([], cli.dependencies);
 
 		expect(code).toBe(1);
 	});
@@ -1370,36 +384,46 @@ describe("runInner orchestration", () => {
 		expect.assertions(2);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 		const multi = makeMultiResult();
-		mocks.runJestRoblox.mockResolvedValue(multi);
+		cli.runJestRoblox.mockResolvedValue(multi);
 
-		const code = await runAsync([]);
+		const code = await runAsync([], cli.dependencies);
 
 		expect(code).toBe(0);
-		expect(mocks.outputMultiResult).toHaveBeenCalledWith(expect.any(Object), multi);
+		expect(cli.outputMultiResult).toHaveBeenCalledWith(
+			expect.objectContaining({
+				dependencies: { fileSystem: cli.fileSystem },
+				result: multi,
+			}),
+		);
 	});
 
 	it("should dispatch WorkspaceRunResult to outputMultiResult", async () => {
 		expect.assertions(2);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 		const workspace = makeWorkspaceResult();
-		mocks.runJestRoblox.mockResolvedValue(workspace);
+		cli.runJestRoblox.mockResolvedValue(workspace);
 
-		const code = await runAsync([]);
+		const code = await runAsync([], cli.dependencies);
 
 		expect(code).toBe(0);
-		expect(mocks.outputMultiResult).toHaveBeenCalledWith(expect.any(Object), workspace);
+		expect(cli.outputMultiResult).toHaveBeenCalledWith(
+			expect.objectContaining({
+				dependencies: { fileSystem: cli.fileSystem },
+				result: workspace,
+			}),
+		);
 	});
 
 	it("should write validationMessage to stderr and return validationExitCode", async () => {
 		expect.assertions(3);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.runJestRoblox.mockResolvedValue(
+		const cli = setupDefaults();
+		cli.runJestRoblox.mockResolvedValue(
 			makeWorkspaceResult({
 				projectResults: [],
 				validationExitCode: 2,
@@ -1407,23 +431,23 @@ describe("runInner orchestration", () => {
 			}),
 		);
 
-		const code = await runAsync(["--workspace"]);
+		const code = await runAsync(["--workspace"], cli.dependencies);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).toHaveBeenCalledWith("Error: --packages names no packages.\n");
-		expect(mocks.outputMultiResult).not.toHaveBeenCalled();
+		expect(cli.outputMultiResult).not.toHaveBeenCalled();
 	});
 
 	it("should not write to stderr when validationMessage is undefined", async () => {
 		expect.assertions(2);
 
 		const spies = setupOutputSpies();
-		setupDefaults();
-		mocks.runJestRoblox.mockResolvedValue(
+		const cli = setupDefaults();
+		cli.runJestRoblox.mockResolvedValue(
 			makeMultiResult({ projectResults: [], validationExitCode: 2 }),
 		);
 
-		const code = await runAsync([]);
+		const code = await runAsync(["--formatters", "default"], cli.dependencies);
 
 		expect(code).toBe(2);
 		expect(spies.stderr).not.toHaveBeenCalled();
@@ -1433,99 +457,194 @@ describe("runInner orchestration", () => {
 		expect.assertions(2);
 
 		setupOutputSpies();
-		setupDefaults();
-		mocks.runJestRoblox.mockResolvedValue(makeWorkspaceResult({ projectResults: [] }));
+		const cli = setupDefaults();
+		cli.runJestRoblox.mockResolvedValue(makeWorkspaceResult({ projectResults: [] }));
 
-		const code = await runAsync(["--workspace", "--affected-since", "main"]);
+		const code = await runAsync(["--workspace", "--affected-since", "main"], cli.dependencies);
 
 		expect(code).toBe(0);
-		expect(mocks.outputMultiResult).not.toHaveBeenCalled();
+		expect(cli.outputMultiResult).not.toHaveBeenCalled();
 	});
 
 	it("should return 0 for multi mode with empty projects and no typecheck", async () => {
 		expect.assertions(2);
 
 		setupOutputSpies();
-		setupDefaults();
-		mocks.runJestRoblox.mockResolvedValue(makeMultiResult({ projectResults: [] }));
+		const cli = setupDefaults();
+		cli.runJestRoblox.mockResolvedValue(makeMultiResult({ projectResults: [] }));
 
-		const code = await runAsync([]);
+		const code = await runAsync([], cli.dependencies);
 
 		expect(code).toBe(0);
-		expect(mocks.outputMultiResult).not.toHaveBeenCalled();
+		expect(cli.outputMultiResult).not.toHaveBeenCalled();
 	});
 
 	it("should dispatch multi mode with empty projects but typecheck present", async () => {
 		expect.assertions(2);
 
 		setupOutputSpies();
-		setupDefaults();
-		mocks.runJestRoblox.mockResolvedValue(
-			makeMultiResult({ projectResults: [], typecheckResult: makeJestResult() }),
-		);
+		const cli = setupDefaults();
+		const result = makeMultiResult({ projectResults: [], typecheckResult: makeJestResult() });
+		cli.runJestRoblox.mockResolvedValue(result);
 
-		const code = await runAsync([]);
+		const code = await runAsync([], cli.dependencies);
 
 		expect(code).toBe(0);
-		expect(mocks.outputMultiResult).toHaveBeenCalledOnce();
+		expect(cli.outputMultiResult).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				dependencies: { fileSystem: cli.fileSystem },
+				result,
+			}),
+		);
 	});
 
 	it("should let --no-coverage override config that enables coverage", async () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults({ collectCoverage: true });
+		const cli = setupDefaults({ collectCoverage: true });
 
-		await runAsync(["--no-coverage"]);
+		await runAsync(["--no-coverage"], cli.dependencies);
 
-		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
+		const [{ config }] = cli.runJestRoblox.mock.calls[0]!;
 
 		expect(config.collectCoverage).toBeFalse();
+	});
+
+	it("should give a Luau-only package a project built from its layout", async () => {
+		expect.assertions(1);
+
+		setupOutputSpies();
+		const cli = setupDefaults();
+		cli.fileSystem.rmSync("/test/default.project.json");
+
+		await runAsync([], cli.dependencies);
+
+		const [{ config }] = cli.runJestRoblox.mock.calls[0]!;
+
+		expect(config.rojoProject).toBe(path.join("/test", ".jest-roblox-layout.project.json"));
+	});
+
+	it("should leave a workspace run to each package's own project", async () => {
+		expect.assertions(1);
+
+		setupOutputSpies();
+		const cli = setupDefaults();
+		cli.fileSystem.rmSync("/test/default.project.json");
+
+		await runAsync(["--workspace"], cli.dependencies);
+
+		const [{ config }] = cli.runJestRoblox.mock.calls[0]!;
+
+		expect(config.rojoProject).toBeUndefined();
 	});
 
 	it("should pass explicit --formatters through merge into config", async () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
-		await runAsync(["--formatters", "json"]);
+		await runAsync(["--formatters", "json"], cli.dependencies);
 
-		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
+		const [{ config }] = cli.runJestRoblox.mock.calls[0]!;
 
 		expect(config.formatters).toStrictEqual(["json"]);
 	});
 
-	it("should default formatters to agent when std-env reports agent", async () => {
+	it("should fall back to the default formatters when nothing names one", async () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
-		stdEnvironmentMock.isAgent = true;
-		onTestFinished(() => {
-			stdEnvironmentMock.isAgent = false;
-		});
+		await runAsync([], cli.dependencies);
 
-		await runAsync([]);
+		const [{ config }] = cli.runJestRoblox.mock.calls[0]!;
 
-		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
-
-		expect(config.formatters).toContain("agent");
+		expect(config.formatters).toStrictEqual(expectedDefaultFormatters());
 	});
 
 	it("should default formatters to github-actions when GITHUB_ACTIONS env is true", async () => {
 		expect.assertions(1);
 
 		setupOutputSpies();
-		setupDefaults();
+		const cli = setupDefaults();
 
 		vi.stubEnv("GITHUB_ACTIONS", "true");
 
-		await runAsync([]);
+		await runAsync([], cli.dependencies);
 
-		const [, config] = mocks.runJestRoblox.mock.calls[0]!;
+		const [{ config }] = cli.runJestRoblox.mock.calls[0]!;
 
 		expect(config.formatters).toContain("github-actions");
+	});
+});
+
+describe("setup subcommand", () => {
+	it("should run setup instead of a test run when setup is the first positional", async () => {
+		expect.assertions(4);
+
+		const spies = setupOutputSpies();
+		const { fileSystem, volume } = createMemoryFileSystem();
+		volume.mkdirSync(process.cwd(), { recursive: true });
+		const cli = setupDefaults();
+		const homeDirectory = path.resolve("/home/user");
+
+		const code = await runAsync(["setup"], { ...cli.dependencies, fileSystem, homeDirectory });
+
+		expect(code).toBe(0);
+		expect(
+			volume.existsSync(
+				path.join(
+					homeDirectory,
+					".jest-roblox",
+					"typedefs",
+					packageJson.version,
+					"config.luau",
+				),
+			),
+		).toBeTrue();
+		expect(cli.loadConfig).not.toHaveBeenCalled();
+		expect(spies.stdout).toHaveBeenCalledWith(
+			expect.stringContaining('Created .config.luau with the "jest-roblox" alias'),
+		);
+	});
+
+	it("should show a .luaurc that setup cannot read as a Config Error with the entry to add", async () => {
+		expect.assertions(3);
+
+		const spies = setupOutputSpies();
+		const { fileSystem } = createMemoryFileSystem({
+			[path.join(process.cwd(), ".luaurc")]: '{ "aliases": { "x": 1 } }',
+		});
+		const cli = setupDefaults();
+
+		const code = await runAsync(["setup"], {
+			...cli.dependencies,
+			fileSystem,
+			homeDirectory: path.resolve("/home/user"),
+		});
+
+		expect(code).toBe(2);
+		expect(renderedStderr(spies)).toContain(
+			"Failed to read .luaurc: aliases.x must be a string (was a number)",
+		);
+		expect(renderedStderr(spies)).toContain(
+			`Hint: Fix the file and run setup again, or add this entry to its "aliases" by hand: "jest-roblox": "~/.jest-roblox/typedefs/${packageJson.version}"`,
+		);
+	});
+
+	it("should run tests filtered to setup when the filter is written ./setup", async () => {
+		expect.assertions(1);
+
+		setupOutputSpies();
+		const cli = setupDefaults();
+
+		await runAsync(["./setup"], cli.dependencies);
+
+		const [{ cli: options }] = cli.runJestRoblox.mock.calls[0]!;
+
+		expect(options.files).toStrictEqual(["./setup"]);
 	});
 });

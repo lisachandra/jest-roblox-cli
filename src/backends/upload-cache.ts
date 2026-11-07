@@ -1,8 +1,9 @@
 import { type } from "arktype";
 import { createHash } from "node:crypto";
-import * as fs from "node:fs";
 import * as path from "node:path";
 
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 
 /**
@@ -20,23 +21,27 @@ import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
  * `docs/research/open-cloud-warm-boot/README.md`.
  *
  * The cache cannot be validated against the server — Open Cloud exposes no
- * content hash for a place version, nor a way to ask which version is head. It
- * does not need to be: the caller runs tasks behind the `game.PlaceVersion`
- * guard, so a stale entry can only make the guard fire and the task retry
- * pinned to the recorded version, which holds exactly the bytes this file
- * hashed. The guard names the version it booted, so the caller invalidates an
- * entry it proves is behind head — a cache hit never uploads, so an entry left
- * in place could never become head again on its own.
+ * content hash for a place version. It does not need to be: the caller submits
+ * every task to the recorded version itself, which holds exactly the bytes this
+ * file hashed, and a version keeps existing after head moves on. A version Open
+ * Cloud no longer serves answers with a 404, and the caller drops the entry.
  */
 export interface UploadCacheTarget {
 	/** Absolute path of the place file whose bytes were uploaded. */
 	placeFilePath: string;
+	/** Place the upload targets. */
 	placeId: number | string;
+	/** Universe that owns the place. */
 	universeId: number | string;
 }
 
-interface CacheEntry {
+/**
+ * What a cached upload records: the inputs it was built from, and its version.
+ */
+export interface CacheEntry {
+	/** SHA-256 hash of the uploaded place file. */
 	hash: string;
+	/** Place version that holds the uploaded bytes. */
 	versionNumber: number;
 }
 
@@ -67,10 +72,16 @@ const cacheFileInputSchema = type({
  * Undefined when the place file cannot be read. The caller then uploads, which
  * fails on the same file with the API's own message — a cache miss must never
  * be the thing that reports a missing place.
+ * @param placeFilePath - Path of the place file to hash.
+ * @param fileSystem - File system to read from.
+ * @returns The hex SHA-256 hash, or `undefined` when the file cannot be read.
  */
-export function hashPlaceFile(placeFilePath: string): string | undefined {
+export function hashPlaceFile(
+	placeFilePath: string,
+	fileSystem: FileSystem = nodeFileSystem,
+): string | undefined {
 	try {
-		return createHash("sha256").update(fs.readFileSync(placeFilePath)).digest("hex");
+		return createHash("sha256").update(fileSystem.readFileSync(placeFilePath)).digest("hex");
 	} catch {
 		return undefined;
 	}
@@ -79,27 +90,60 @@ export function hashPlaceFile(placeFilePath: string): string | undefined {
 /**
  * The version already holding `hash` for this target, or undefined when these
  * bytes have never been uploaded from this machine.
+ * @param root0 - Lookup input.
+ * @param root0.fileSystem - File system to read from.
+ * @param root0.hash - Hash of the place file.
+ * @param root0.rootDirectory - Project root that holds the cache file.
+ * @param root0.target - Upload target.
+ * @returns The cached version number, or `undefined` on a miss.
  */
-export function readCachedVersion(
-	rootDirectory: string,
-	target: UploadCacheTarget,
-	hash: string,
-): number | undefined {
-	const entry = readCacheFile(rootDirectory).entries[entryKey(target)];
+export function readCachedVersion({
+	fileSystem = nodeFileSystem,
+	hash,
+	rootDirectory,
+	target,
+}: {
+	/** File system to read from. */
+	readonly fileSystem?: FileSystem;
+	/** Hash of the place file. */
+	readonly hash: string;
+	/** Project root that holds the cache file. */
+	readonly rootDirectory: string;
+	/** Upload target. */
+	readonly target: UploadCacheTarget;
+}): number | undefined {
+	const entry = readCacheFile(fileSystem, rootDirectory).entries[entryKey(target)];
 	return entry?.hash === hash ? entry.versionNumber : undefined;
 }
 
-export function writeCachedVersion(
-	rootDirectory: string,
-	target: UploadCacheTarget,
-	hash: string,
-	versionNumber: number,
-): void {
-	const cache = readCacheFile(rootDirectory);
+/**
+ * Records an uploaded version for a target; a failed write is ignored.
+ * @param root0 - Write input.
+ * @param root0.entry - Hash and version to record.
+ * @param root0.fileSystem - File system to write to.
+ * @param root0.rootDirectory - Project root that holds the cache file.
+ * @param root0.target - Upload target.
+ */
+export function writeCachedVersion({
+	entry: { hash, versionNumber },
+	fileSystem = nodeFileSystem,
+	rootDirectory,
+	target,
+}: {
+	/** Hash and version to record. */
+	readonly entry: CacheEntry;
+	/** File system to write to. */
+	readonly fileSystem?: FileSystem;
+	/** Project root that holds the cache file. */
+	readonly rootDirectory: string;
+	/** Upload target. */
+	readonly target: UploadCacheTarget;
+}): void {
+	const cache = readCacheFile(fileSystem, rootDirectory);
 	cache.entries[entryKey(target)] = { hash, versionNumber };
 	try {
-		fs.mkdirSync(path.dirname(cachePath(rootDirectory)), { recursive: true });
-		fs.writeFileSync(cachePath(rootDirectory), JSON.stringify(cache, undefined, "\t"));
+		fileSystem.mkdirSync(path.dirname(cachePath(rootDirectory)), { recursive: true });
+		fileSystem.writeFileSync(cachePath(rootDirectory), JSON.stringify(cache, undefined, "\t"));
 	} catch {
 		// A cache that cannot be written costs speed, never correctness.
 	}
@@ -108,9 +152,22 @@ export function writeCachedVersion(
 /**
  * True once the entry is gone. A cache file that cannot be written keeps
  * serving the entry it already holds, so the caller hears no.
+ * @param root0 - Invalidate input.
+ * @param root0.fileSystem - File system to write to.
+ * @param root0.rootDirectory - Project root that holds the cache file.
+ * @param root0.target - Upload target.
+ * @returns Whether the entry is gone.
  */
-export function invalidateCachedVersion(rootDirectory: string, target: UploadCacheTarget): boolean {
-	const cache = readCacheFile(rootDirectory);
+export function invalidateCachedVersion({
+	fileSystem = nodeFileSystem,
+	rootDirectory,
+	target,
+}: {
+	readonly fileSystem?: FileSystem;
+	readonly rootDirectory: string;
+	readonly target: UploadCacheTarget;
+}): boolean {
+	const cache = readCacheFile(fileSystem, rootDirectory);
 	const key = entryKey(target);
 	// `deleteProperty` reports success for an absent key too, so ask first —
 	// otherwise a no-op invalidate rewrites the file for nothing.
@@ -120,7 +177,7 @@ export function invalidateCachedVersion(rootDirectory: string, target: UploadCac
 
 	Reflect.deleteProperty(cache.entries, key);
 	try {
-		fs.writeFileSync(cachePath(rootDirectory), JSON.stringify(cache, undefined, "\t"));
+		fileSystem.writeFileSync(cachePath(rootDirectory), JSON.stringify(cache, undefined, "\t"));
 	} catch {
 		// As above — best effort, and the caller says only what it can stand
 		// behind: an entry that survives the write is still the one in use.
@@ -131,40 +188,14 @@ export function invalidateCachedVersion(rootDirectory: string, target: UploadCac
 }
 
 /**
- * Whether a task booting `bootedVersion` proves `reusedVersion` is behind
- * head.
- */
-export function isBehindHead({
-	bootedVersion,
-	reusedVersion,
-}: {
-	bootedVersion: number;
-	reusedVersion: number;
-}): boolean {
-	return bootedVersion > reusedVersion;
-}
-
-/**
- * Drop the entry when a task proves it is behind head, and report whether it
- * went. This is the only evidence there is — Open Cloud will not say which
- * version is head, so a task that booted past the reused one is what stands in
- * for asking. Dropping it keeps the slow path from becoming permanent: a cache
- * hit never uploads, so an entry left in place can never become head again on
- * its own, and every later run pays a pinned cold boot. Dropping one that was
- * in fact fine costs a single upload on the next run.
- */
-export function invalidateIfBehindHead(
-	rootDirectory: string,
-	target: UploadCacheTarget,
-	versions: { bootedVersion: number; reusedVersion: number },
-): boolean {
-	return isBehindHead(versions) && invalidateCachedVersion(rootDirectory, target);
-}
-
-/**
  * One entry per (universe, place, place file) rather than per content hash, so
  * the file stays bounded — re-uploading a changed build overwrites its entry
  * instead of appending another.
+ * @param root0 - Upload target.
+ * @param root0.placeFilePath - Place file the upload came from.
+ * @param root0.placeId - Place the upload targets.
+ * @param root0.universeId - Universe that owns the place.
+ * @returns The cache entry key.
  */
 function entryKey({ placeFilePath, placeId, universeId }: UploadCacheTarget): string {
 	return `${String(universeId)}/${String(placeId)}/${normalizeWindowsPath(placeFilePath)}`;
@@ -174,6 +205,8 @@ function entryKey({ placeFilePath, placeId, universeId }: UploadCacheTarget): st
  * Deliberately not under `.jest-roblox/coverage/` — a non-incremental coverage
  * rebuild wipes that directory, which would drop the cache on exactly the runs
  * that rebuilt an identical place.
+ * @param rootDirectory - Project root.
+ * @returns The path of the cache file.
  */
 function cachePath(rootDirectory: string): string {
 	return path.join(rootDirectory, ".jest-roblox", "upload-cache.json");
@@ -184,12 +217,15 @@ function cachePath(rootDirectory: string): string {
  * unknown `version`, a junk entry — collapses to "no cache". That is how the
  * format migrates without a migration, and why a corrupt file costs a re-upload
  * rather than a run.
+ * @param fileSystem - File system to read from.
+ * @param rootDirectory - Project root that holds the cache file.
+ * @returns The cache contents, or an empty cache on any failure.
  */
-function readCacheFile(rootDirectory: string): CacheFile {
+function readCacheFile(fileSystem: FileSystem, rootDirectory: string): CacheFile {
 	const entries: Record<string, CacheEntry> = {};
 	try {
 		const parsed = cacheFileInputSchema.assert(
-			JSON.parse(fs.readFileSync(cachePath(rootDirectory), "utf8")),
+			JSON.parse(fileSystem.readFileSync(cachePath(rootDirectory), "utf8")),
 		);
 
 		for (const [key, value] of Object.entries(parsed.entries)) {

@@ -9,22 +9,21 @@ import type {
 
 import { parseSync, Visitor } from "oxc-parser";
 
-import type { TestDefinition } from "./types.ts";
+import { buildAncestorChain } from "./ancestor-chain.ts";
+import type { RawTestDefinition, TestDefinition } from "./typecheck-types.ts";
 
 const TEST_FUNCTIONS = new Set(["it", "test"]);
 const SUITE_FUNCTIONS = new Set(["describe", "suite"]);
 const ALL_FUNCTIONS = new Set([...SUITE_FUNCTIONS, ...TEST_FUNCTIONS]);
 
-interface RawDefinition {
-	name: string;
-	end: number;
-	start: number;
-	type: "suite" | "test";
-}
-
+/**
+ * Find every `describe`, `suite`, `it` and `test` call in a TypeScript source.
+ * @param source - The TypeScript type-test source.
+ * @returns The definitions, in source order, with their ancestor names.
+ */
 export function collectTestDefinitions(source: string): Array<TestDefinition> {
 	const result = parseSync("test.ts", source);
-	const raw: Array<RawDefinition> = [];
+	const raw: Array<RawTestDefinition> = [];
 
 	const visitor = new Visitor({
 		CallExpression(node) {
@@ -36,34 +35,9 @@ export function collectTestDefinitions(source: string): Array<TestDefinition> {
 	});
 
 	visitor.visit(result.program);
-	raw.sort((a, b) => a.start - b.start);
 
+	// The visitor enters calls in source order, before their nested calls.
 	return buildAncestorChain(raw);
-}
-
-function buildAncestorChain(sorted: Array<RawDefinition>): Array<TestDefinition> {
-	const result: Array<TestDefinition> = [];
-	const suiteStack: Array<{ end: number; name: string }> = [];
-
-	for (const definition of sorted) {
-		while (
-			suiteStack.length > 0 &&
-			suiteStack.at(-1)!.end <= definition.start // eslint-disable-line ts/no-non-null-assertion -- stack length > 0
-		) {
-			suiteStack.pop();
-		}
-
-		result.push({
-			...definition,
-			ancestorNames: suiteStack.map((suite) => suite.name),
-		});
-
-		if (definition.type === "suite") {
-			suiteStack.push({ name: definition.name, end: definition.end });
-		}
-	}
-
-	return result;
 }
 
 function isStringLiteral(node: Expression): node is StringLiteral {
@@ -74,8 +48,8 @@ function isTemplateLiteral(node: Expression): node is TemplateLiteral {
 	return node.type === "TemplateLiteral";
 }
 
-// cspell:ignore quasis
 function extractStringArgument(node: Expression, source: string): string {
+	// cspell:ignore quasis
 	if (isStringLiteral(node)) {
 		return node.value;
 	}
@@ -96,7 +70,7 @@ function isIdentifier(node: Expression): node is IdentifierReference {
 }
 
 function isStaticMemberExpression(node: Expression): node is StaticMemberExpression {
-	return node.type === "MemberExpression" && "computed" in node && !node.computed;
+	return node.type === "MemberExpression" && !node.computed;
 }
 
 function getCalleeName(callee: Expression): string | undefined {
@@ -115,7 +89,7 @@ function getCalleeName(callee: Expression): string | undefined {
 	return undefined;
 }
 
-function extractDefinition(node: CallExpression, source: string): RawDefinition | undefined {
+function extractDefinition(node: CallExpression, source: string): RawTestDefinition | undefined {
 	const name = getCalleeName(node.callee);
 	if (name === undefined || !ALL_FUNCTIONS.has(name)) {
 		return undefined;

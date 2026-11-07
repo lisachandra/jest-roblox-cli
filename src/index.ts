@@ -7,7 +7,7 @@ export type { CoveragePlaceBundle } from "./artifacts/build-coverage-place.ts";
 // Place + Coverage-Instrumented Place in one pass (the sole producer of a Clean
 // Place — no CLI flag).
 export { prepareArtifactsAsync } from "./artifacts/prepare-artifacts.ts";
-export type { ArtifactBundle } from "./artifacts/prepare-artifacts.ts";
+export type { ArtifactBundle, PrepareArtifactsOptions } from "./artifacts/prepare-artifacts.ts";
 export type { Backend, BackendOptions, ParallelOption } from "./backends/interface.ts";
 export { OpenCloudBackend, createOpenCloudBackend } from "./backends/open-cloud.ts";
 
@@ -15,11 +15,19 @@ export { StudioCliBackend, createStudioCliBackend } from "./backends/studio-cli.
 
 export { StudioBackend, createStudioBackend } from "./backends/studio.ts";
 
+export {
+	GLOBAL_TEST_KEYS,
+	JEST_ARGV_EXCLUDED_KEYS,
+	ROOT_CLI_KEYS,
+	SHARED_TEST_KEYS,
+} from "./config/config-keys.ts";
+export type { ConfigInput } from "./config/define-config.ts";
+export { defineConfig, defineProject } from "./config/define-config.ts";
+export { resolveLayoutProject } from "./config/layout-project.ts";
 export { loadConfig, resolveConfig } from "./config/loader.ts";
 export type { ResolvedProjectConfig } from "./config/projects.ts";
 export type {
 	Config,
-	ConfigInput,
 	FormatterEntry,
 	GlobalTestConfig,
 	ResolvedConfig,
@@ -31,26 +39,19 @@ export type {
 	SharedTestConfig,
 	WorkspaceConfig,
 } from "./config/schema.ts";
-export {
-	DEFAULT_CONFIG,
-	defineConfig,
-	defineProject,
-	GLOBAL_TEST_KEYS,
-	JEST_ARGV_EXCLUDED_KEYS,
-	ROOT_CLI_KEYS,
-	SHARED_TEST_KEYS,
-} from "./config/schema.ts";
+export { DEFAULT_CONFIG } from "./config/schema.ts";
 // Artifact contract (BuildManifest + CoverageManifest schemas, validating
 // readers, file-hash helper). Re-exported from a clean barrel shared with the
 // `source`-condition entry.
 export * from "./coverage-pipeline/artifacts.ts";
+export type { RawCoverageData, RawFileCoverage } from "./coverage-pipeline/coverage-types.ts";
+export type { InstrumentUniverse } from "./coverage-pipeline/instrument-universe.ts";
 export { mergeRawCoverage } from "./coverage-pipeline/merge-raw-coverage.ts";
 // Companion harvest seam: turn the raw hit counters a run emits (the
 // `_G.__jest_roblox_cov` global, or a run envelope's `runner.coverage` field)
 // into typed coverage keyed by the same fileKey the static maps use. For a run
 // this CLI did not launch.
 export { normalizeRawCoverage, parseCoverageEnvelope } from "./coverage-pipeline/raw-coverage.ts";
-export type { RawCoverageData, RawFileCoverage } from "./coverage-pipeline/types.ts";
 
 export { formatExecuteOutput, runProjectsAsync } from "./executor.ts";
 export type {
@@ -65,7 +66,8 @@ export { formatResult, formatTestSummary, formatFailure } from "./formatters/for
 export { formatAnnotations, formatJobSummary } from "./formatters/github-actions.ts";
 export type { GitHubActionsFormatterOptions } from "./formatters/github-actions.ts";
 export { formatJson, writeJsonFileAsync } from "./formatters/json.ts";
-export { parseJestOutput, extractJsonFromOutput } from "./reporter/parser.ts";
+export { extractJsonFromOutput } from "./reporter/json-extraction.ts";
+export { parseJestOutput } from "./reporter/parser.ts";
 export { runJestRobloxAsync } from "./run.ts";
 
 export type {
@@ -77,21 +79,21 @@ export type {
 	RunResult,
 	SingleRunResult,
 	WorkspaceRunResult,
-} from "./run/types.ts";
+} from "./run/run-types.ts";
 export { buildJestArgv, generateTestScript } from "./test-script.ts";
 
 export type { JestArgv } from "./test-script.ts";
 
 export { runTypecheckAsync } from "./typecheck/runner.ts";
 export type { TypecheckOptions } from "./typecheck/runner.ts";
-export type { TestDefinition, TscErrorInfo } from "./typecheck/types.ts";
-export type { GameOutputEntry } from "./types/game-output.ts";
+export type { TestDefinition, TypeTestDiagnostic } from "./typecheck/typecheck-types.ts";
+export type { GameOutputEntry } from "./types/game-output-types.ts";
 export type {
 	JestResult,
 	TestFileResult,
 	TestCaseResult,
 	TestStatus,
-} from "./types/jest-result.ts";
+} from "./types/jest-result-types.ts";
 export { formatGameOutputNotice, parseGameOutput, writeGameOutput } from "./utils/game-output.ts";
 
 // Luau AST infrastructure

@@ -1,20 +1,25 @@
 import { isRojoTreeNode } from "@isentinel/rojo-utils";
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { RojoTreeNode } from "../types/rojo.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { hashString } from "../utils/hash.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import { findStage } from "./stage.ts";
 
+/** Inputs to {@link poolSharedMounts}. */
 export interface PoolSharedMountsOptions {
+	/** Where the mounts are probed. Defaults to the real filesystem. */
+	fileSystem?: FileSystem;
 	/**
 	 * The directory the synthesized project file is written to. The frame the
 	 * pool key is derived in, so the same relative mount keys the same on every
 	 * machine.
 	 */
 	projectDirectory: string;
+	/** The synthesized project, serialized. */
 	projectJson: string;
 }
 
@@ -87,8 +92,11 @@ const MARKER_SAFE_KEYS = new Set(["$className", "$path"]);
  * A change to what this emits from unchanged sources needs
  * {@link SHARED_POOL_PASS_VERSION} bumped with it; the place-reuse key reads
  * this pass through that number and through nothing else.
+ * @param options - Project text, its directory and where mounts are probed.
+ * @returns The rewritten project text, or the input unchanged when nothing pools.
  */
 export function poolSharedMounts({
+	fileSystem = nodeFileSystem,
 	projectDirectory,
 	projectJson,
 }: PoolSharedMountsOptions): string {
@@ -113,7 +121,7 @@ export function poolSharedMounts({
 	for (const [mountPath, nodes] of mounts) {
 		// A coverage shadow is per package by construction, so it is referenced
 		// once and never reaches the filesystem check.
-		if (nodes.length < 2 || !buildsAnInstance(mountPath)) {
+		if (nodes.length < 2 || !buildsAnInstance(fileSystem, mountPath)) {
 			continue;
 		}
 
@@ -142,6 +150,8 @@ export function poolSharedMounts({
  * key — `$properties`, `$attributes`, `$ignoreUnknownInstances` — describes
  * the instance rojo builds from the mount, and the clone that replaces it at
  * materialize time carries the pooled entry's own metadata instead.
+ * @param node - Tree node to test.
+ * @returns True when only `$path`, a Folder `$className` and children are declared.
  */
 function isPoolCandidate(node: RojoTreeNode): boolean {
 	if (node.$className !== undefined && node.$className !== "Folder") {
@@ -151,7 +161,11 @@ function isPoolCandidate(node: RojoTreeNode): boolean {
 	return Object.keys(node).every((key) => !key.startsWith("$") || MARKER_SAFE_KEYS.has(key));
 }
 
-/** Every staged node the pass could pool, grouped by the path it mounts. */
+/**
+ * Every staged node the pass could pool, grouped by the path it mounts.
+ * @param node - Node to walk.
+ * @param mounts - Receives candidates by normalized path; mutated.
+ */
 function collectPoolCandidates(node: RojoTreeNode, mounts: Map<string, Array<RojoTreeNode>>): void {
 	const mountPath = node.$path;
 	if (typeof mountPath === "string" && isPoolCandidate(node)) {
@@ -181,9 +195,12 @@ function collectPoolCandidates(node: RojoTreeNode, mounts: Map<string, Array<Roj
  * failed materialize, where the mount it replaced would merely have been
  * absent. A directory always builds one; a file builds one only if rojo reads
  * its extension.
+ * @param fileSystem - Probes the path.
+ * @param mountPath - Path a node mounts.
+ * @returns True for a directory or a file with a pooled extension.
  */
-function buildsAnInstance(mountPath: string): boolean {
-	const stats = fs.statSync(mountPath, { throwIfNoEntry: false });
+function buildsAnInstance(fileSystem: FileSystem, mountPath: string): boolean {
+	const stats = fileSystem.statSync(mountPath, { throwIfNoEntry: false });
 	if (stats === undefined) {
 		return false;
 	}
@@ -195,6 +212,9 @@ function buildsAnInstance(mountPath: string): boolean {
  * Keyed on the path relative to the project directory, so a checkout at a
  * different root — another machine, another clone — keys the same mount the
  * same way and the place-reuse and upload caches keep hitting.
+ * @param mountPath - Path the nodes mount.
+ * @param projectDirectory - Directory the key is relative to.
+ * @returns The first `DIGEST_LENGTH` hex digits of the relative path's hash.
  */
 function pathDigest(mountPath: string, projectDirectory: string): string {
 	const relative = normalizeWindowsPath(path.relative(projectDirectory, mountPath));
@@ -209,6 +229,9 @@ function pathDigest(mountPath: string, projectDirectory: string): string {
  * the pair unless that is a Folder, so an entry that dropped it would quietly
  * build the ModuleScript an `init.luau` directory makes, under a name the
  * project was rejected for calling a Folder.
+ * @param mountPath - Path every node mounted.
+ * @param nodes - The nodes being pooled.
+ * @returns The pooled entry.
  */
 function poolEntry(mountPath: string, nodes: Array<RojoTreeNode>): RojoTreeNode {
 	if (nodes.some((node) => node.$className !== undefined)) {
@@ -218,7 +241,11 @@ function poolEntry(mountPath: string, nodes: Array<RojoTreeNode>): RojoTreeNode 
 	return { $path: mountPath };
 }
 
-/** Strip the mount off a node and leave the marker the materializer reads. */
+/**
+ * Strip the mount off a node and leave the marker the materializer reads.
+ * @param node - Node to rewrite in place.
+ * @param key - Pool key the marker names.
+ */
 function markPooled(node: RojoTreeNode, key: string): void {
 	delete node.$path;
 	node.$className = "Folder";

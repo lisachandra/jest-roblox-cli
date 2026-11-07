@@ -1,15 +1,8 @@
-import { fromAny } from "@total-typescript/shoehorn";
-
-import { vol } from "memfs";
 import { Buffer } from "node:buffer";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import { hashBuffer, hashFile } from "./hash.ts";
-
-vi.mock(import("node:fs"), async () => {
-	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, default: memfs.fs });
-});
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { hashBuffer, hashFile, hashString } from "./hash.ts";
 
 describe(hashBuffer, () => {
 	it("should return consistent SHA256 hash for same input", () => {
@@ -41,17 +34,20 @@ describe(hashBuffer, () => {
 	});
 });
 
+describe(hashString, () => {
+	it("should hash the text's UTF-8 bytes identically to hashBuffer", () => {
+		expect.assertions(1);
+
+		expect(hashString("-- é")).toBe(hashBuffer(Buffer.from("-- é", "utf8")));
+	});
+});
+
 describe(hashFile, () => {
 	it("should hash the file's bytes identically to hashBuffer", () => {
 		expect.assertions(1);
 
-		onTestFinished(() => {
-			vol.reset();
-		});
+		const { fileSystem } = createMemoryFileSystem({ "/dir/file.luau": "local x = 1" });
 
-		vol.mkdirSync("/dir", { recursive: true });
-		vol.writeFileSync("/dir/file.luau", "local x = 1");
-
-		expect(hashFile("/dir/file.luau")).toBe(hashBuffer(Buffer.from("local x = 1")));
+		expect(hashFile("/dir/file.luau", fileSystem)).toBe(hashBuffer(Buffer.from("local x = 1")));
 	});
 });

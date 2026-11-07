@@ -1,17 +1,42 @@
 import type { OpenCloudError } from "@bedrock-rbx/ocale";
-import { PollTimeoutError } from "@bedrock-rbx/ocale";
-import type { LuauExecutionTaskRef } from "@bedrock-rbx/ocale/luau-execution";
+import { ApiError, NetworkError, PollTimeoutError } from "@bedrock-rbx/ocale";
+import type { FailedTask, LuauExecutionTaskRef } from "@bedrock-rbx/ocale/luau-execution";
 
 /**
  * What a poll was given, and where that came from. The default budget is the
  * task deadline plus a boot-lag allowance, and saying so is what stops a
  * timeout reading as "your script was too slow"; an explicit
- * {@link ExecuteScriptOptions.pollBudget} has no such story to tell.
+ * `pollBudget` has no such story to tell.
  */
 export interface PollContext {
+	/**
+	 * A different task booted this version; it does not prove this task
+	 * started.
+	 */
 	readonly bootProven: boolean;
+	/**
+	 * The host added boot allowance rather than using an explicit poll budget.
+	 */
 	readonly hasDefaultBudget: boolean;
+	/**
+	 * Pinned place version; absent when submitting against head.
+	 */
+	readonly placeVersion: number | undefined;
+	/** The whole poll's wall clock, whatever part of it the submit spent. */
+	readonly pollBudgetMs: number;
+	/**
+	 * Fresh observation allowance used when rereading the same task.
+	 */
+	readonly recoveryPollBudgetMs: number;
+	/**
+	 * Original task reference; recovery never submits another task.
+	 */
 	readonly ref: LuauExecutionTaskRef;
+	/** The state the submit answered with. */
+	readonly submittedState: string;
+	/**
+	 * Server execution deadline in seconds, independent of place boot time.
+	 */
 	readonly timeoutSeconds: number;
 }
 
@@ -33,7 +58,44 @@ export interface PollContext {
  * moment it turns terminal, so the grace costs nothing on any run that gets
  * an answer — only a task Roblox never resolves spends it.
  */
-export const TASK_DEADLINE_GRACE_MS = 45_000;
+/**
+ * Task log messages carried on a failure, counted from the end. The tail is
+ * what explains the failure; a full Jest run's output is megabytes and the
+ * error banner is not where anyone reads it.
+ */
+export const FAILURE_LOG_TAIL = 20;
+
+/** Per-message cap on the failure log tail, in characters. */
+const FAILURE_LOG_MESSAGE_LIMIT = 400;
+
+const TASK_DEADLINE_GRACE_MS = 45_000;
+
+const MAX_TASK_TIMEOUT_SECONDS = 300;
+
+/**
+ * The default poll budget outlasts the task deadline and place startup.
+ * @param timeout - Execution timeout in milliseconds.
+ * @param pollBudget - Explicit host poll allowance, when supplied.
+ * @returns Server timeout and independent host polling and recovery budgets.
+ */
+export function resolveBudgets(
+	timeout: number,
+	pollBudget: number | undefined,
+): {
+	hasDefaultBudget: boolean;
+	pollBudgetMs: number;
+	recoveryPollBudgetMs: number;
+	timeoutSeconds: number;
+} {
+	const timeoutSeconds = Math.min(Math.floor(timeout / 1000), MAX_TASK_TIMEOUT_SECONDS);
+	const recoveryPollBudgetMs = Math.max(timeout, timeoutSeconds * 1000 + TASK_DEADLINE_GRACE_MS);
+	return {
+		hasDefaultBudget: pollBudget === undefined,
+		pollBudgetMs: pollBudget ?? recoveryPollBudgetMs,
+		recoveryPollBudgetMs,
+		timeoutSeconds,
+	};
+}
 
 /**
  * The task's resource path, which is what the Open Cloud API and the Creator
@@ -56,6 +118,16 @@ export function describeTaskRef(ref: LuauExecutionTaskRef): string {
 }
 
 /**
+ * A field of a task ocale typed `unknown`, or `undefined` when it is absent.
+ * @param task - Original task identity and server result.
+ * @param key - Field to read from the observed task.
+ * @returns The requested task field, or undefined when absent.
+ */
+export function readTaskField(task: unknown, key: string): unknown {
+	return Reflect.get(Object(task), key);
+}
+
+/**
  * Expands a poll that never settled into something actionable. Reaching here
  * is itself the diagnosis, and {@link describeSuspects} says what it means.
  *
@@ -72,7 +144,7 @@ export function toPollError(err: OpenCloudError, context: PollContext): Error {
 
 	const lines = [
 		"Execution timed out: Roblox never reported a terminal state for the task " +
-			`within ${String(Math.round(err.timeoutMs / 1000))}s${describeBudgetOrigin(context)}.`,
+			`within ${String(Math.round(context.pollBudgetMs / 1000))}s${describeBudgetOrigin(context)}.`,
 		`  task: ${describeTaskRef(context.ref)}`,
 		`  last observed state: ${readObservedState(err.lastObservedTask)}`,
 		...describeSuspects(context),
@@ -80,7 +152,100 @@ export function toPollError(err: OpenCloudError, context: PollContext): Error {
 	return new Error(lines.join("\n"), { cause: err });
 }
 
-/** How the poll budget was arrived at, or nothing when the caller named it. */
+/**
+ * The HTTP status a refusal carried, as a parenthetical, or nothing when the
+ * call never reached a response.
+ *
+ * The status is what separates the causes a caller can act on: a 429 is the
+ * per-key create quota and worth a retry, a 401 is the key itself, and a
+ * transport failure has no status at all. Written like the PUT's own message
+ * so the two halves of one upload read the same way.
+ * @param err - Failure returned by the transport.
+ * @returns HTTP status suffix for API failures, otherwise an empty string.
+ */
+export function describeStatus(err: OpenCloudError): string {
+	return err instanceof ApiError ? ` (HTTP ${String(err.statusCode)})` : "";
+}
+
+/**
+ * Expands an upload failure into one diagnostic line. An `ApiError` carries
+ * the failing call and how long it was in flight, and a bare `err.message`
+ * throws all of that away: `HTTP 502: Request Context Failure` alone says
+ * nothing about which request died, or whether it died on the wire or after
+ * 30 seconds of upload.
+ *
+ * @param err - The Open Cloud error the upload returned.
+ * @returns The error message, followed by the request context ocale captured.
+ */
+export function describeUploadFailure(err: OpenCloudError): string {
+	if (!(err instanceof ApiError) && !(err instanceof NetworkError)) {
+		return err.message;
+	}
+
+	const target = err.url === undefined ? "" : ` on ${err.method} ${err.url}`;
+	const elapsed =
+		err instanceof ApiError && err.elapsedMs !== undefined
+			? ` after ${(err.elapsedMs / 1000).toFixed(1)}s`
+			: "";
+	return `${err.message}${target}${elapsed}`;
+}
+
+/**
+ * One log line, prefixed by the severity Roblox assigned it so an `ERROR`
+ * stands out from the `print` above it, and truncated so one runaway line
+ * cannot push the rest of the tail off the banner.
+ *
+ * @param message - A structured log message from the task's log page.
+ * @returns The formatted, length-capped line.
+ */
+export function formatLogMessage({
+	message,
+	messageType,
+}: {
+	message: string;
+	messageType: string;
+}): string {
+	const body =
+		message.length > FAILURE_LOG_MESSAGE_LIMIT
+			? `${message.slice(0, FAILURE_LOG_MESSAGE_LIMIT)}…`
+			: message;
+	return `[${messageType}] ${body}`;
+}
+
+/**
+ * Names a terminal Roblox failure in full: the category code, Roblox's own
+ * message, the task the run can be looked up by, and what the script printed
+ * before it died.
+ *
+ * The code is not decoration. `DEADLINE_EXCEEDED` means the script outran its
+ * budget and the log tail is where it was stuck; `SCRIPT_ERROR` means it threw
+ * and the tail holds the traceback. Reporting `error.message` alone loses that
+ * split, and loses the task id entirely.
+ *
+ * @param task - The `FAILED` task Roblox returned.
+ * @param logTail - Formatted log lines, newest last; may be empty.
+ * @returns The multi-line failure description.
+ */
+export function describeTaskFailure(task: FailedTask, logTail: ReadonlyArray<string>): string {
+	const lines = [
+		`Roblox task failed (${task.error.code}): ${task.error.message}`,
+		`  task: ${describeTaskRef(task.ref)}`,
+	];
+	if (logTail.length > 0) {
+		lines.push("  Roblox output before the failure:");
+		for (const line of logTail) {
+			lines.push(`    ${line}`);
+		}
+	}
+
+	return lines.join("\n");
+}
+
+/**
+ * How the poll budget was arrived at, or nothing when the caller named it.
+ * @param context - Original task identity and observation budgets.
+ * @returns Explanation of the explicit or default observation budget.
+ */
 function describeBudgetOrigin(context: PollContext): string {
 	if (!context.hasDefaultBudget) {
 		return "";
@@ -93,40 +258,18 @@ function describeBudgetOrigin(context: PollContext): string {
 }
 
 /**
- * What is left to suspect once the poll has run out.
- *
- * Roblox fails a task that merely outran its deadline — `DEADLINE_EXCEEDED`
- * lands a boot lag after the deadline elapsed, which is what
- * {@link TASK_DEADLINE_GRACE_MS} waits for. A task still running past both has
- * not overrun; it was never scheduled, and the usual reason is a place version
- * Roblox cannot load. Measured against one, the task sat `PROCESSING` for ten
- * minutes on a 30s deadline and Roblox reported no state, no error, and no
- * logs, ever.
- *
- * A caller that proved the boot has ruled that out already, and repeating the
- * guess would send the reader to Studio to inspect a place that loads.
- *
- * @param context - The task polled and what the caller knows about its place.
- * @returns Lines naming the suspects, indented to sit under the first.
+ * A poll timeout establishes neither script startup nor place-load failure.
+ * @param context - Original task identity and observation budgets.
+ * @returns Possible infrastructure causes qualified by available boot evidence.
  */
 function describeSuspects(context: PollContext): Array<string> {
-	if (context.bootProven) {
-		return [
-			"  This place version is known to boot — a script ran against it just " +
-				"before this task was submitted — so a place Roblox cannot load " +
-				"is ruled out.",
-			"  What is left is a task Open Cloud never scheduled: retry, and if " +
-				"it repeats, the fault is outside this run.",
-		];
-	}
-
+	const evidence = context.bootProven
+		? "  This place version is known to boot; another task ran against it."
+		: "  Place loading, execution, or result delivery may have stalled.";
 	return [
-		"  A script that merely outran its deadline is failed by Roblox, so this " +
-			"is most likely a place version Roblox could not start — such a task " +
-			"is never scheduled and never reports anything. Open the place file " +
-			"in Studio to see why it will not load.",
-		"  The other reading is an unusually slow cold boot, which the next run " +
-			"avoids by reusing the now-warm server.",
+		evidence,
+		"  PROCESSING does not establish whether the script started or finished. " +
+			"A timeout alone cannot authorize running it again; recovery requires an execution claim.",
 	];
 }
 
@@ -142,6 +285,6 @@ function describeSuspects(context: PollContext): Array<string> {
  * @returns The task's state, or `"unknown"` when there is none to read.
  */
 function readObservedState(task: unknown): string {
-	const state: unknown = Reflect.get(Object(task), "state");
+	const state = readTaskField(task, "state");
 	return typeof state === "string" ? state : "unknown";
 }

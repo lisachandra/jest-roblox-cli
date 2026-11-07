@@ -1,66 +1,66 @@
-/* cspell:words jridgewell */
-import type { originalPositionFor } from "@jridgewell/trace-mapping";
 import { fromAny, fromPartial } from "@total-typescript/shoehorn";
 
-import { assert, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import type { CoverageMap } from "./coverage-map.ts";
+import { createCoverageMap, span } from "#test/mocks/coverage-spec-mapper.ts";
+import type { CoverageMapFile, FileLocation } from "#test/mocks/coverage-spec-mapper.ts";
+import { MANIFEST_VERSION } from "#test/mocks/coverage-versions.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { buildSourceMap } from "#test/mocks/source-map.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import type { RawCoverageData } from "./coverage-types.ts";
 import type { CoverageManifest } from "./manifest.ts";
-import { MANIFEST_VERSION } from "./manifest.ts";
-import type { MappedFileCoverage } from "./mapper.ts";
-import { CoverageMapMalformedError, mapCoverageToTypeScript } from "./mapper.ts";
-import type { RawCoverageData } from "./types.ts";
+import type { PositionResolver } from "./mapper-types.ts";
+import { mapCoverageToTypeScript } from "./mapper.ts";
 
-const { mockOriginalPositionFor, mockReadFileSync, MockTraceMap } = vi.hoisted(() => {
-	class MockTraceMapClass {}
+type GeneratedPosition = Parameters<PositionResolver>[0];
+type OriginalPosition = ReturnType<PositionResolver>;
 
-	return {
-		mockOriginalPositionFor: vi.fn<typeof originalPositionFor>(),
-		mockReadFileSync: vi.fn<(path: string, encoding: string) => string>(),
-		MockTraceMap: MockTraceMapClass,
-	};
-});
+const resolvePosition = vi.fn<PositionResolver>();
 
-vi.mock(import("node:fs"), async (importOriginal) => {
-	return fromPartial({
-		...(await importOriginal()),
-		readFileSync: mockReadFileSync,
-	});
-});
-
-vi.mock(import("@jridgewell/trace-mapping"), async (importOriginal) => {
-	return fromAny({
-		...(await importOriginal()),
-		originalPositionFor: mockOriginalPositionFor,
-		TraceMap: MockTraceMap,
-	});
-});
+function traceMapFactory(): PositionResolver {
+	return resolvePosition;
+}
 
 /**
- * `originalPositionFor` stub: the span start (column 0) resolves to a.ts, its
- * end to b.ts. Hoisted to module scope — the split would otherwise be a
- * conditional inside a test body.
+ * Position resolver: the span start (column 0) resolves to a.ts, its end to
+ * b.ts. Hoisted to module scope — the split would otherwise be a conditional
+ * inside a test body.
+ * @param position - Generated position to resolve.
+ * @returns Original position in a.ts or b.ts.
  */
-function positionSplitByColumn(
-	_map: Parameters<typeof originalPositionFor>[0],
-	position: Parameters<typeof originalPositionFor>[1],
-): ReturnType<typeof originalPositionFor> {
+function positionSplitByColumn(position: GeneratedPosition): OriginalPosition {
 	return position.column === 0
-		? { name: null, column: 0, line: 3, source: "src/a.ts" }
-		: { name: null, column: 25, line: 3, source: "src/b.ts" };
+		? { column: 0, line: 3, source: "src/a.ts" }
+		: { column: 25, line: 3, source: "src/b.ts" };
 }
 
 /**
  * As {@linkcode positionSplitByColumn}, but the first branch arm resolves to
  * a.ts.
+ * @param position - Generated position to resolve.
+ * @returns Original position in a.ts or b.ts.
  */
-function positionSplitByLine(
-	_map: Parameters<typeof originalPositionFor>[0],
-	position: Parameters<typeof originalPositionFor>[1],
-): ReturnType<typeof originalPositionFor> {
+function positionSplitByLine(position: GeneratedPosition): OriginalPosition {
 	return position.line === 3
-		? { name: null, column: 0, line: 2, source: "src/a.ts" }
-		: { name: null, column: 0, line: 4, source: "src/b.ts" };
+		? { column: 0, line: 2, source: "src/a.ts" }
+		: { column: 0, line: 4, source: "src/b.ts" };
+}
+
+/**
+ * Resolve one endpoint and leave the other source-less.
+ * @param unmappedEndpoint - Endpoint that resolves to no source.
+ * @returns Resolver for the span endpoints.
+ */
+function resolverWithoutEndpoint(unmappedEndpoint: "end" | "start"): PositionResolver {
+	return (position) => {
+		const isStart = position.column === 0;
+		if ((unmappedEndpoint === "start") === isStart) {
+			return { column: null, line: null, source: null };
+		}
+
+		return playerTs(3, 5);
+	};
 }
 
 function createManifest(files: CoverageManifest["files"] = {}): CoverageManifest {
@@ -76,48 +76,27 @@ function createManifest(files: CoverageManifest["files"] = {}): CoverageManifest
 	};
 }
 
-function createCoverageMap(
-	statementMap: CoverageMap["statementMap"] = {},
-	functionMap?: CoverageMap["functionMap"],
-	branchMap?: CoverageMap["branchMap"],
-): CoverageMap {
-	let coverageMap: CoverageMap = { statementMap };
-	if (functionMap !== undefined) {
-		coverageMap = { ...coverageMap, functionMap };
-	}
-
-	if (branchMap !== undefined) {
-		coverageMap = { ...coverageMap, branchMap };
-	}
-
-	return coverageMap;
-}
-
-function setupFs(fileContents: Record<string, string>): void {
-	mockReadFileSync.mockImplementation((filePath: string) => {
-		const contents = fileContents[filePath];
-		if (contents === undefined) {
-			const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file: ${filePath}`);
-			err.code = "ENOENT";
-			throw err;
-		}
-
-		return contents;
-	});
+/**
+ * A volume holding the shadow outputs the mapper reads back.
+ *
+ * @param fileContents - The cov-maps and source maps, by path.
+ * @returns File system over the volume.
+ */
+function setupFs(fileContents: Record<string, string>): FileSystem {
+	return createMemoryFileSystem(fileContents).fileSystem;
 }
 
 function setupSourceMapMappings(
 	mappings: Record<string, { column: number; line: number; source: string }>,
 ): void {
-	mockOriginalPositionFor.mockImplementation((_map, position) => {
+	resolvePosition.mockImplementation((position) => {
 		const key = `${String(position.line)}:${String(position.column)}`;
 		const mapping = mappings[key];
 		if (mapping === undefined) {
-			return { name: null, column: null, line: null, source: null };
+			return { column: null, line: null, source: null };
 		}
 
 		return {
-			name: null,
 			column: mapping.column,
 			line: mapping.line,
 			source: mapping.source,
@@ -125,7 +104,7 @@ function setupSourceMapMappings(
 	});
 }
 
-function createManifestFiles() {
+function createManifestFiles(statementCount: number) {
 	return {
 		"shared/player.luau": {
 			key: "shared/player.luau",
@@ -134,9 +113,53 @@ function createManifestFiles() {
 			originalLuauPath: "out/shared/player.luau",
 			sourceHash: "abc123",
 			sourceMapPath: "out/shared/player.luau.map",
-			statementCount: 1,
+			statementCount,
 		},
 	};
+}
+
+const PLAYER_LINE_5 = {
+	"5:0": playerTs(3, 0),
+	"5:19": playerTs(3, 25),
+};
+
+function playerTs(line: number, column: number): { column: number; line: number; source: string } {
+	return { column, line, source: "src/shared/player.ts" };
+}
+
+function malformedSidecar(): ReturnType<typeof expect.objectContaining> {
+	return expect.objectContaining<Record<string, unknown>>({
+		coverageMapPath: expect.any(String),
+		message: expect.stringContaining("is malformed or invalid"),
+	});
+}
+
+function functionLocation(): FileLocation {
+	return { end: { column: 4, line: 8 }, start: { column: 1, line: 5 } };
+}
+
+function playerFs(coverageMap: CoverageMapFile): FileSystem {
+	return setupFs({
+		"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
+		"out/shared/player.luau.map": '{"version":3}',
+	});
+}
+
+function mapPlayer({
+	coverageData,
+	fileSystem,
+	statementCount = 1,
+}: {
+	coverageData: RawCoverageData;
+	fileSystem: FileSystem;
+	statementCount?: number;
+}): ReturnType<typeof mapCoverageToTypeScript> {
+	return mapCoverageToTypeScript({
+		coverageData,
+		fileSystem,
+		manifest: createManifest(createManifestFiles(statementCount)),
+		traceMapFactory,
+	});
 }
 
 describe(mapCoverageToTypeScript, () => {
@@ -145,41 +168,82 @@ describe(mapCoverageToTypeScript, () => {
 			expect.assertions(4);
 
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"0": span(5, 1, 20),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"5:19": { column: 25, line: 3, source: "src/shared/player.ts" },
+				...PLAYER_LINE_5,
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { s: { "0": 3 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files["src/shared/player.ts"]).toBeDefined();
 
 			const file = result.files["src/shared/player.ts"];
 
 			expect(file!.path).toBe("src/shared/player.ts");
-			expect(file!.statementMap["0"]).toStrictEqual({
-				end: { column: 25, line: 3 },
-				start: { column: 0, line: 3 },
-			});
+			expect(file!.statementMap["0"]).toStrictEqual(span(3, 0, 25));
 			expect(file!.s["0"]).toBe(3);
+		});
+	});
+
+	describe("with no injected trace-map factory", () => {
+		it("should resolve positions through the real source map on disk", () => {
+			expect.assertions(2);
+
+			const coverageMap = createCoverageMap({
+				"0": span(5, 1, 20),
+			});
+
+			const fileSystem = setupFs({
+				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
+				"out/shared/player.luau.map": buildSourceMap({
+					file: "player.luau",
+					segments: [
+						{ generatedColumn: 0, generatedLine: 5, sourceColumn: 0, sourceLine: 3 },
+						{ generatedColumn: 19, generatedLine: 5, sourceColumn: 25, sourceLine: 3 },
+					],
+					source: "src/shared/player.ts",
+				}),
+			});
+
+			const result = mapCoverageToTypeScript({
+				coverageData: { "shared/player.luau": { s: { "0": 3 } } },
+				fileSystem,
+				manifest: createManifest(createManifestFiles(1)),
+			});
+
+			const file = result.files["src/shared/player.ts"];
+
+			expect(file!.statementMap["0"]).toStrictEqual(span(3, 0, 25));
+			expect(file!.s["0"]).toBe(3);
+		});
+
+		it("should fall back to passthrough when the source map does not parse", () => {
+			expect.assertions(1);
+
+			const coverageMap = createCoverageMap({
+				"0": span(5, 1, 20),
+			});
+
+			const fileSystem = setupFs({
+				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
+				"out/shared/player.luau.map": "not a source map",
+			});
+
+			const result = mapCoverageToTypeScript({
+				coverageData: { "shared/player.luau": { s: { "0": 3 } } },
+				fileSystem,
+				manifest: createManifest(createManifestFiles(1)),
+			});
+
+			expect(Object.keys(result.files)).toStrictEqual(["shared/player.luau"]);
 		});
 	});
 
@@ -193,13 +257,10 @@ describe(mapCoverageToTypeScript, () => {
 			// cwd-relative paths so that collectCoverageFrom glob patterns can
 			// match them.
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"0": span(5, 1, 20),
 			});
 
-			setupFs({
+			const fileSystem = setupFs({
 				"out/packages/src/player.luau.cov-map.json": JSON.stringify(coverageMap),
 				"out/packages/src/player.luau.map": '{"version":3}',
 			});
@@ -225,7 +286,12 @@ describe(mapCoverageToTypeScript, () => {
 				"out/packages/src/player.luau": { s: { "0": 3 } },
 			};
 
-			const result = mapCoverageToTypeScript(coverageData, manifest);
+			const result = mapCoverageToTypeScript({
+				coverageData,
+				fileSystem,
+				manifest,
+				traceMapFactory,
+			});
 
 			// Should resolve to cwd-relative path, not raw source map relative
 			// path
@@ -239,13 +305,10 @@ describe(mapCoverageToTypeScript, () => {
 			// roblox-ts on Windows produces source maps with backslash paths
 			// like ..\\src\\player.ts instead of ../src/player.ts
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"0": span(5, 1, 20),
 			});
 
-			setupFs({
+			const fileSystem = setupFs({
 				"out/player.luau.cov-map.json": JSON.stringify(coverageMap),
 				"out/player.luau.map": '{"version":3}',
 			});
@@ -271,7 +334,12 @@ describe(mapCoverageToTypeScript, () => {
 				"out/player.luau": { s: { "0": 3 } },
 			};
 
-			const result = mapCoverageToTypeScript(coverageData, manifest);
+			const result = mapCoverageToTypeScript({
+				coverageData,
+				fileSystem,
+				manifest,
+				traceMapFactory,
+			});
 
 			expect(result.files["src/player.ts"]).toBeDefined();
 			expect(result.files["..\\src\\player.ts"]).toBeUndefined();
@@ -283,40 +351,21 @@ describe(mapCoverageToTypeScript, () => {
 			expect.assertions(2);
 
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 10, line: 1 },
-					start: { column: 1, line: 1 },
-				},
-				"1": {
-					end: { column: 20, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"0": span(1, 1, 10),
+				"1": span(5, 1, 20),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"5:19": { column: 25, line: 3, source: "src/shared/player.ts" },
+				...PLAYER_LINE_5,
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { s: { "0": 1, "1": 5 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest({
-					...createManifestFiles(),
-					"shared/player.luau": {
-						...createManifestFiles()["shared/player.luau"],
-						statementCount: 2,
-					},
-				}),
-			);
+			const result = mapPlayer({ coverageData, fileSystem, statementCount: 2 });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -330,51 +379,30 @@ describe(mapCoverageToTypeScript, () => {
 			expect.assertions(3);
 
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 15, line: 3 },
-					start: { column: 1, line: 3 },
-				},
-				"1": {
-					end: { column: 20, line: 7 },
-					start: { column: 1, line: 7 },
-				},
+				"0": span(3, 1, 15),
+				"1": span(7, 1, 20),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:14": { column: 20, line: 2, source: "src/shared/player.ts" },
-				"7:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"7:19": { column: 25, line: 2, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"3:14": playerTs(2, 20),
+				"7:0": playerTs(2, 0),
+				"7:19": playerTs(2, 25),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { s: { "0": 3, "1": 7 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest({
-					...createManifestFiles(),
-					"shared/player.luau": {
-						...createManifestFiles()["shared/player.luau"],
-						statementCount: 2,
-					},
-				}),
-			);
+			const result = mapPlayer({ coverageData, fileSystem, statementCount: 2 });
 
 			const file = result.files["src/shared/player.ts"];
 
 			expect(Object.keys(file!.statementMap)).toHaveLength(1);
 			expect(file!.s["0"]).toBe(10);
-			expect(file!.statementMap["0"]).toStrictEqual({
-				end: { column: 25, line: 2 },
-				start: { column: 0, line: 2 },
-			});
+			expect(file!.statementMap["0"]).toStrictEqual(span(2, 0, 25));
 		});
 
 		it("should keep existing end when it has higher column on the same line", () => {
@@ -383,42 +411,24 @@ describe(mapCoverageToTypeScript, () => {
 			// Two Luau stmts map to same TS start, same end line
 			// First has HIGHER end column than second → existing end is kept
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 3 },
-					start: { column: 1, line: 3 },
-				},
-				"1": {
-					end: { column: 10, line: 7 },
-					start: { column: 1, line: 7 },
-				},
+				"0": span(3, 1, 20),
+				"1": span(7, 1, 10),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:19": { column: 25, line: 2, source: "src/shared/player.ts" },
-				"7:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"7:9": { column: 5, line: 2, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"3:19": playerTs(2, 25),
+				"7:0": playerTs(2, 0),
+				"7:9": playerTs(2, 5),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { s: { "0": 1, "1": 1 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest({
-					...createManifestFiles(),
-					"shared/player.luau": {
-						...createManifestFiles()["shared/player.luau"],
-						statementCount: 2,
-					},
-				}),
-			);
+			const result = mapPlayer({ coverageData, fileSystem, statementCount: 2 });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -428,141 +438,18 @@ describe(mapCoverageToTypeScript, () => {
 		});
 	});
 
-	describe("with one source statement lowered to several Luau statements", () => {
-		// `const [first, second] = buildPair(\n\tinput,\n);` on TS line 10.
-		// roblox-ts lowers it to a `local _binding = ...` mapped across the
-		// call's three source lines, plus one single-line fragment per bound
-		// name, each mapped to its own column of line 10.
-		const bindingSpan = { end: { column: 33, line: 20 }, start: { column: 1, line: 20 } };
-		const firstSpan = { end: { column: 26, line: 21 }, start: { column: 1, line: 21 } };
-		const secondSpan = { end: { column: 27, line: 22 }, start: { column: 1, line: 22 } };
-
-		function setupLuauFile(statementMap: CoverageMap["statementMap"]): void {
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(
-					createCoverageMap(statementMap),
-				),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
-		}
-
-		function setupDestructuringMappings(): void {
-			setupSourceMapMappings({
-				// `local _binding = buildPair(input)`
-				"20:0": { column: 0, line: 10, source: "src/shared/player.ts" },
-				"20:32": { column: 1, line: 12, source: "src/shared/player.ts" },
-				// `local first = _binding[1]`
-				"21:0": { column: 7, line: 10, source: "src/shared/player.ts" },
-				"21:25": { column: 12, line: 10, source: "src/shared/player.ts" },
-				// `local second = _binding[2]`
-				"22:0": { column: 14, line: 10, source: "src/shared/player.ts" },
-				"22:26": { column: 20, line: 10, source: "src/shared/player.ts" },
-			});
-		}
-
-		function runFile(hitCounts: Record<string, number>): MappedFileCoverage {
-			const result = mapCoverageToTypeScript(
-				{ "shared/player.luau": { s: hitCounts } },
-				createManifest({
-					"shared/player.luau": {
-						...createManifestFiles()["shared/player.luau"],
-						statementCount: Object.keys(hitCounts).length,
-					},
-				}),
-			);
-
-			const file = result.files["src/shared/player.ts"];
-			assert(file !== undefined, "fixture statements map to src/shared/player.ts");
-			return file;
-		}
-
-		it("should record one entry per source statement", () => {
-			expect.assertions(2);
-
-			setupLuauFile({ "0": bindingSpan, "1": firstSpan, "2": secondSpan });
-			setupDestructuringMappings();
-
-			const file = runFile({ "0": 3, "1": 3, "2": 3 });
-
-			expect(Object.keys(file.statementMap)).toHaveLength(1);
-			expect(file.statementMap["0"]).toStrictEqual({
-				end: { column: 1, line: 12 },
-				start: { column: 0, line: 10 },
-			});
-		});
-
-		it("should sum the fragment hit counts rather than splitting them", () => {
-			expect.assertions(1);
-
-			setupLuauFile({ "0": bindingSpan, "1": firstSpan, "2": secondSpan });
-			setupDestructuringMappings();
-
-			const file = runFile({ "0": 3, "1": 3, "2": 3 });
-
-			expect(file.s["0"]).toBe(9);
-		});
-
-		it("should widen the entry start when a fragment is recorded first", () => {
-			expect.assertions(2);
-
-			// A fragment lands before the statement start does. The entry takes
-			// the leftmost column, so it still covers the whole source
-			// statement.
-			setupLuauFile({ "0": firstSpan, "1": bindingSpan });
-			setupDestructuringMappings();
-
-			const file = runFile({ "0": 4, "1": 4 });
-
-			expect(Object.keys(file.statementMap)).toHaveLength(1);
-			expect(file.statementMap["0"]).toStrictEqual({
-				end: { column: 1, line: 12 },
-				start: { column: 0, line: 10 },
-			});
-		});
-
-		it("should keep single-line statements that merely share a line apart", () => {
-			expect.assertions(1);
-
-			// `first(); second();` — two source statements, neither spanning
-			// lines. Nothing marks them as fragments of one statement, so they
-			// stay separate.
-			setupLuauFile({
-				"0": { end: { column: 10, line: 20 }, start: { column: 1, line: 20 } },
-				"1": { end: { column: 11, line: 21 }, start: { column: 1, line: 21 } },
-			});
-
-			setupSourceMapMappings({
-				"20:0": { column: 0, line: 10, source: "src/shared/player.ts" },
-				"20:9": { column: 8, line: 10, source: "src/shared/player.ts" },
-				"21:0": { column: 10, line: 10, source: "src/shared/player.ts" },
-				"21:10": { column: 19, line: 10, source: "src/shared/player.ts" },
-			});
-
-			const file = runFile({ "0": 1, "1": 1 });
-
-			expect(Object.keys(file.statementMap)).toHaveLength(2);
-		});
-	});
-
 	describe("with missing statement hit count", () => {
 		it("should default hit count to zero when statement ID is absent from raw data", () => {
 			expect.assertions(1);
 
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"0": span(5, 1, 20),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"5:19": { column: 25, line: 3, source: "src/shared/player.ts" },
+				...PLAYER_LINE_5,
 			});
 
 			// Statement "0" is not in the s record
@@ -570,10 +457,7 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/player.luau": { s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -585,7 +469,14 @@ describe(mapCoverageToTypeScript, () => {
 		it("should return empty result for no coverage entries", () => {
 			expect.assertions(1);
 
-			const result = mapCoverageToTypeScript({}, createManifest());
+			const { fileSystem } = createMemoryFileSystem();
+
+			const result = mapCoverageToTypeScript({
+				coverageData: {},
+				fileSystem,
+				manifest: createManifest(),
+				traceMapFactory,
+			});
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -596,25 +487,18 @@ describe(mapCoverageToTypeScript, () => {
 			expect.assertions(2);
 
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"0": span(5, 1, 20),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"5:19": { column: 25, line: 3, source: "src/shared/player.ts" },
+				...PLAYER_LINE_5,
 			});
 
 			// Instrumented (in the manifest) but never required by a test, so it
 			// is absent from the runtime hit map.
-			const result = mapCoverageToTypeScript({}, createManifest(createManifestFiles()));
+			const result = mapPlayer({ coverageData: {}, fileSystem });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -627,38 +511,38 @@ describe(mapCoverageToTypeScript, () => {
 		it("should skip files when coverage map is missing on disk", () => {
 			expect.assertions(1);
 
-			mockReadFileSync.mockImplementation(() => {
-				const err: NodeJS.ErrnoException = new Error("ENOENT");
-				err.code = "ENOENT";
-				throw err;
-			});
+			const { fileSystem } = createMemoryFileSystem();
 
-			const result = mapCoverageToTypeScript(
-				{ "shared/player.luau": { s: { "0": 1 } } },
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({
+				coverageData: { "shared/player.luau": { s: { "0": 1 } } },
+				fileSystem,
+			});
 
 			expect(result.files).toBeEmptyObject();
 		});
 
 		it("should throw CoverageMapMalformedError when coverage map file exists but is malformed", () => {
-			expect.assertions(2);
+			expect.assertions(3);
 
-			setupFs({
+			const fileSystem = setupFs({
 				"out/shared/player.luau.cov-map.json": "not valid json",
 			});
 
 			let thrown: unknown;
 			try {
-				mapCoverageToTypeScript(
-					{ "shared/player.luau": { s: { "0": 1 } } },
-					createManifest(createManifestFiles()),
-				);
+				mapPlayer({
+					coverageData: { "shared/player.luau": { s: { "0": 1 } } },
+					fileSystem,
+				});
 			} catch (err) {
 				thrown = err;
 			}
 
-			expect(thrown).toBeInstanceOf(CoverageMapMalformedError);
+			expect(thrown).toHaveProperty("coverageMapPath", expect.any(String));
+			expect(thrown).toHaveProperty(
+				"message",
+				expect.stringContaining("re-run `jest-roblox instrument`"),
+			);
 			expect(thrown).toMatchObject({
 				coverageMapPath: "out/shared/player.luau.cov-map.json",
 			});
@@ -670,26 +554,40 @@ describe(mapCoverageToTypeScript, () => {
 			expect.assertions(1);
 
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"0": span(5, 1, 20),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
+			const fileSystem = playerFs(coverageMap);
+
+			resolvePosition.mockImplementation(positionSplitByColumn);
+
+			const result = mapPlayer({
+				coverageData: { "shared/player.luau": { s: { "0": 1 } } },
+				fileSystem,
 			});
-
-			mockOriginalPositionFor.mockImplementation(positionSplitByColumn);
-
-			const result = mapCoverageToTypeScript(
-				{ "shared/player.luau": { s: { "0": 1 } } },
-				createManifest(createManifestFiles()),
-			);
 
 			expect(result.files).toBeEmptyObject();
 		});
+
+		it.for(["start", "end"] as const)(
+			"should drop a statement when its %s endpoint has no source",
+			(unmappedEndpoint) => {
+				expect.assertions(1);
+
+				const coverageMap = createCoverageMap({
+					"0": span(5, 1, 20),
+				});
+				const fileSystem = playerFs(coverageMap);
+				resolvePosition.mockImplementation(resolverWithoutEndpoint(unmappedEndpoint));
+
+				const result = mapPlayer({
+					coverageData: { "shared/player.luau": { s: { "0": 1 } } },
+					fileSystem,
+				});
+
+				expect(result.files).toBeEmptyObject();
+			},
+		);
 	});
 
 	describe("with missing manifest record", () => {
@@ -700,7 +598,14 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/unknown.luau": { s: { "0": 1 } },
 			};
 
-			const result = mapCoverageToTypeScript(coverageData, createManifest());
+			const { fileSystem } = createMemoryFileSystem();
+
+			const result = mapCoverageToTypeScript({
+				coverageData,
+				fileSystem,
+				manifest: createManifest(),
+				traceMapFactory,
+			});
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -710,37 +615,28 @@ describe(mapCoverageToTypeScript, () => {
 		it("should map Luau function to TypeScript location", () => {
 			expect.assertions(4);
 
-			const coverageMap: CoverageMap = {
+			const coverageMap: CoverageMapFile = {
 				functionMap: {
 					"1": {
 						name: "greet",
-						location: {
-							end: { column: 4, line: 8 },
-							start: { column: 1, line: 5 },
-						},
+						location: functionLocation(),
 					},
 				},
 				statementMap: {},
 			};
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"8:3": { column: 10, line: 6, source: "src/shared/player.ts" },
+				"5:0": playerTs(3, 0),
+				"8:3": playerTs(6, 10),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { f: { "1": 7 }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
@@ -759,37 +655,28 @@ describe(mapCoverageToTypeScript, () => {
 		it("should default function hit count to zero when not in raw data", () => {
 			expect.assertions(1);
 
-			const coverageMap: CoverageMap = {
+			const coverageMap: CoverageMapFile = {
 				functionMap: {
 					"1": {
 						name: "foo",
-						location: {
-							end: { column: 4, line: 8 },
-							start: { column: 1, line: 5 },
-						},
+						location: functionLocation(),
 					},
 				},
 				statementMap: {},
 			};
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"8:3": { column: 10, line: 6, source: "src/shared/player.ts" },
+				"5:0": playerTs(3, 0),
+				"8:3": playerTs(6, 10),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
@@ -799,14 +686,11 @@ describe(mapCoverageToTypeScript, () => {
 		it("should map multiple functions to the same TypeScript file", () => {
 			expect.assertions(2);
 
-			const coverageMap: CoverageMap = {
+			const coverageMap: CoverageMapFile = {
 				functionMap: {
 					"1": {
 						name: "greet",
-						location: {
-							end: { column: 4, line: 8 },
-							start: { column: 1, line: 5 },
-						},
+						location: functionLocation(),
 					},
 					"2": {
 						name: "farewell",
@@ -819,26 +703,20 @@ describe(mapCoverageToTypeScript, () => {
 				statementMap: {},
 			};
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"8:3": { column: 10, line: 6, source: "src/shared/player.ts" },
-				"12:0": { column: 0, line: 10, source: "src/shared/player.ts" },
-				"15:3": { column: 10, line: 13, source: "src/shared/player.ts" },
+				"5:0": playerTs(3, 0),
+				"8:3": playerTs(6, 10),
+				"12:0": playerTs(10, 0),
+				"15:3": playerTs(13, 10),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { f: { "1": 2, "2": 5 }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
@@ -853,62 +731,52 @@ describe(mapCoverageToTypeScript, () => {
 			const coverageMap = createCoverageMap(
 				{},
 				{
-					"1": fromPartial({
-						location: { end: { column: 4, line: 8 }, start: { column: 1, line: 5 } },
-					}),
+					functionMap: {
+						"1": fromPartial({
+							location: functionLocation(),
+						}),
+					},
 				},
 			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { f: { "1": 5 }, s: {} },
 			};
 
 			expect(() => {
-				mapCoverageToTypeScript(coverageData, createManifest(createManifestFiles()));
-			}).toThrow(CoverageMapMalformedError);
+				mapPlayer({ coverageData, fileSystem });
+			}).toThrow(malformedSidecar());
 		});
 
 		it("should drop unmapped function when no statements provide a fallback path", () => {
 			expect.assertions(1);
 
-			const coverageMap: CoverageMap = {
+			const coverageMap: CoverageMapFile = {
 				functionMap: {
 					"1": {
 						name: "add",
-						location: {
-							end: { column: 4, line: 8 },
-							start: { column: 1, line: 5 },
-						},
+						location: functionLocation(),
 					},
 				},
 				statementMap: {},
 			};
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// Only start has a mapping; end (line 8) returns null source
 			// — function can't be mapped, and no statements resolved a
 			// TS path to fall back to
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
+				"5:0": playerTs(3, 0),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { f: { "1": 4 }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -918,51 +786,37 @@ describe(mapCoverageToTypeScript, () => {
 
 			const coverageMap = createCoverageMap(
 				{
-					"0": {
-						end: { column: 20, line: 5 },
-						start: { column: 1, line: 5 },
-					},
+					"0": span(5, 1, 20),
 				},
 				{
-					"1": {
-						name: "unmappable",
-						location: {
-							end: { column: 4, line: 99 },
-							start: { column: 1, line: 99 },
+					functionMap: {
+						"1": {
+							name: "unmappable",
+							location: span(99, 1, 4),
 						},
 					},
 				},
 			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// Statement maps, but function location (line 99) does not
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"5:19": { column: 25, line: 3, source: "src/shared/player.ts" },
+				...PLAYER_LINE_5,
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { f: { "1": 0 }, s: { "0": 1 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
 			expect(file).toBeDefined();
 			expect(file.f["0"]).toBe(0);
 			expect(file.fnMap["0"]!.name).toBe("unmappable");
-			expect(file.fnMap["0"]!.loc).toStrictEqual({
-				end: { column: 0, line: 1 },
-				start: { column: 0, line: 1 },
-			});
+			expect(file.fnMap["0"]!.loc).toStrictEqual(span(1, 0, 0));
 		});
 
 		it("should append unmapped function alongside mapped function in same file", () => {
@@ -970,48 +824,34 @@ describe(mapCoverageToTypeScript, () => {
 
 			const coverageMap = createCoverageMap(
 				{
-					"0": {
-						end: { column: 20, line: 5 },
-						start: { column: 1, line: 5 },
-					},
+					"0": span(5, 1, 20),
 				},
 				{
-					"1": {
-						name: "mapped",
-						location: {
-							end: { column: 4, line: 8 },
-							start: { column: 1, line: 5 },
+					functionMap: {
+						"1": {
+							name: "mapped",
+							location: functionLocation(),
 						},
-					},
-					"2": {
-						name: "unmapped",
-						location: {
-							end: { column: 4, line: 99 },
-							start: { column: 1, line: 99 },
+						"2": {
+							name: "unmapped",
+							location: span(99, 1, 4),
 						},
 					},
 				},
 			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"5:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"5:19": { column: 25, line: 3, source: "src/shared/player.ts" },
-				"8:3": { column: 10, line: 6, source: "src/shared/player.ts" },
+				...PLAYER_LINE_5,
+				"8:3": playerTs(6, 10),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { f: { "1": 5, "2": 0 }, s: { "0": 1 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
@@ -1025,30 +865,20 @@ describe(mapCoverageToTypeScript, () => {
 
 			const coverageMap = createCoverageMap(
 				{
-					"0": {
-						end: { column: 20, line: 5 },
-						start: { column: 1, line: 5 },
-					},
-					"1": {
-						end: { column: 20, line: 10 },
-						start: { column: 1, line: 10 },
-					},
+					"0": span(5, 1, 20),
+					"1": span(10, 1, 20),
 				},
 				{
-					"1": {
-						name: "unmappable",
-						location: {
-							end: { column: 4, line: 99 },
-							start: { column: 1, line: 99 },
+					functionMap: {
+						"1": {
+							name: "unmappable",
+							location: span(99, 1, 4),
 						},
 					},
 				},
 			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// Statements map to two different TS files
 			setupSourceMapMappings({
@@ -1062,10 +892,7 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/player.luau": { f: { "1": 0 }, s: { "0": 1, "1": 1 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			// Function lands in one of the two TS files (first resolved)
 			const aFile = result.files["src/shared/a.ts"];
@@ -1082,20 +909,16 @@ describe(mapCoverageToTypeScript, () => {
 			const coverageMap = createCoverageMap(
 				{},
 				{
-					"1": {
-						name: "unmappable",
-						location: {
-							end: { column: 4, line: 99 },
-							start: { column: 1, line: 99 },
+					functionMap: {
+						"1": {
+							name: "unmappable",
+							location: span(99, 1, 4),
 						},
 					},
 				},
 			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// No mappings at all — no TS path can be inferred
 			setupSourceMapMappings({});
@@ -1104,10 +927,7 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/player.luau": { f: { "1": 3 }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -1118,7 +938,7 @@ describe(mapCoverageToTypeScript, () => {
 			expect.assertions(1);
 
 			// Missing required "statementMap" field
-			setupFs({
+			const fileSystem = setupFs({
 				"out/shared/player.luau.cov-map.json": JSON.stringify({ invalid: true }),
 				"out/shared/player.luau.map": '{"version":3}',
 			});
@@ -1128,8 +948,8 @@ describe(mapCoverageToTypeScript, () => {
 			};
 
 			expect(() => {
-				mapCoverageToTypeScript(coverageData, createManifest(createManifestFiles()));
-			}).toThrow(CoverageMapMalformedError);
+				mapPlayer({ coverageData, fileSystem });
+			}).toThrow(malformedSidecar());
 		});
 	});
 
@@ -1140,43 +960,25 @@ describe(mapCoverageToTypeScript, () => {
 			// Two Luau statements map to the same TS start but different end
 			// lines
 			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 15, line: 3 },
-					start: { column: 1, line: 3 },
-				},
-				"1": {
-					end: { column: 10, line: 7 },
-					start: { column: 1, line: 7 },
-				},
+				"0": span(3, 1, 15),
+				"1": span(7, 1, 10),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// Both map to the same TS start (line 2, col 0) but different ends
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:14": { column: 10, line: 3, source: "src/shared/player.ts" },
-				"7:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"7:9": { column: 5, line: 5, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"3:14": playerTs(3, 10),
+				"7:0": playerTs(2, 0),
+				"7:9": playerTs(5, 5),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { s: { "0": 2, "1": 4 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest({
-					...createManifestFiles(),
-					"shared/player.luau": {
-						...createManifestFiles()["shared/player.luau"],
-						statementCount: 2,
-					},
-				}),
-			);
+			const result = mapPlayer({ coverageData, fileSystem, statementCount: 2 });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -1194,39 +996,24 @@ describe(mapCoverageToTypeScript, () => {
 					end: { column: 15, line: 7 },
 					start: { column: 1, line: 3 },
 				},
-				"1": {
-					end: { column: 10, line: 5 },
-					start: { column: 1, line: 5 },
-				},
+				"1": span(5, 1, 10),
 			});
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// Both map to the same TS start but first ends on a later line
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"5:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"5:9": { column: 5, line: 3, source: "src/shared/player.ts" },
-				"7:14": { column: 10, line: 6, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"5:0": playerTs(2, 0),
+				"5:9": playerTs(3, 5),
+				"7:14": playerTs(6, 10),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { s: { "0": 1, "1": 1 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest({
-					...createManifestFiles(),
-					"shared/player.luau": {
-						...createManifestFiles()["shared/player.luau"],
-						statementCount: 2,
-					},
-				}),
-			);
+			const result = mapPlayer({ coverageData, fileSystem, statementCount: 2 });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -1240,49 +1027,44 @@ describe(mapCoverageToTypeScript, () => {
 		it("should map branch arms to TypeScript locations", () => {
 			expect.assertions(5);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-						{ end: { column: 10, line: 5 }, start: { column: 1, line: 5 } },
-					],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 4, 10), span(5, 1, 10), span(7, 1, 10)],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:9": { column: 15, line: 2, source: "src/shared/player.ts" },
-				"5:0": { column: 0, line: 4, source: "src/shared/player.ts" },
-				"5:9": { column: 15, line: 4, source: "src/shared/player.ts" },
+				"3:3": playerTs(2, 2),
+				"3:9": playerTs(2, 15),
+				"5:0": playerTs(4, 0),
+				"5:9": playerTs(4, 15),
+				"7:0": playerTs(6, 0),
+				"7:9": playerTs(6, 15),
 			});
 
 			const coverageData: RawCoverageData = {
-				"shared/player.luau": { b: { "1": [3, 0] }, s: {} },
+				"shared/player.luau": { b: { "1": [3, 0, 2] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
 			expect(file).toBeDefined();
 			expect(file.branchMap["0"]).toStrictEqual({
-				loc: { end: { column: 15, line: 4 }, start: { column: 0, line: 2 } },
-				locations: [
-					{ end: { column: 15, line: 2 }, start: { column: 0, line: 2 } },
-					{ end: { column: 15, line: 4 }, start: { column: 0, line: 4 } },
-				],
+				loc: { end: { column: 15, line: 6 }, start: { column: 2, line: 2 } },
+				locations: [span(2, 2, 15), span(4, 0, 15), span(6, 0, 15)],
 				type: "if",
 			});
-			expect(file.b["0"]).toStrictEqual([3, 0]);
+			expect(file.b["0"]).toStrictEqual([3, 0, 2]);
 			expect(Object.keys(file.branchMap)).toHaveLength(1);
 			expect(Object.keys(file.b)).toHaveLength(1);
 		});
@@ -1290,47 +1072,40 @@ describe(mapCoverageToTypeScript, () => {
 		it("should map multiple branches to the same TypeScript file", () => {
 			expect.assertions(2);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-						{ end: { column: 10, line: 5 }, start: { column: 1, line: 5 } },
-					],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 1, 10), span(5, 1, 10)],
+							type: "if",
+						},
+						"2": {
+							locations: [span(10, 1, 10), span(12, 1, 10)],
+							type: "if",
+						},
+					},
 				},
-				"2": {
-					locations: [
-						{ end: { column: 10, line: 10 }, start: { column: 1, line: 10 } },
-						{ end: { column: 10, line: 12 }, start: { column: 1, line: 12 } },
-					],
-					type: "if",
-				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:9": { column: 15, line: 2, source: "src/shared/player.ts" },
-				"5:0": { column: 0, line: 4, source: "src/shared/player.ts" },
-				"5:9": { column: 15, line: 4, source: "src/shared/player.ts" },
-				"10:0": { column: 0, line: 8, source: "src/shared/player.ts" },
-				"10:9": { column: 15, line: 8, source: "src/shared/player.ts" },
-				"12:0": { column: 0, line: 10, source: "src/shared/player.ts" },
-				"12:9": { column: 15, line: 10, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"3:9": playerTs(2, 15),
+				"5:0": playerTs(4, 0),
+				"5:9": playerTs(4, 15),
+				"10:0": playerTs(8, 0),
+				"10:9": playerTs(8, 15),
+				"12:0": playerTs(10, 0),
+				"12:9": playerTs(10, 15),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [1, 0], "2": [0, 2] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
@@ -1341,26 +1116,25 @@ describe(mapCoverageToTypeScript, () => {
 		it("should default branch arm hit counts to zero when not in raw data", () => {
 			expect.assertions(1);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-						{ end: { column: 10, line: 5 }, start: { column: 1, line: 5 } },
-					],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 1, 10), span(5, 1, 10)],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:9": { column: 15, line: 2, source: "src/shared/player.ts" },
-				"5:0": { column: 0, line: 4, source: "src/shared/player.ts" },
-				"5:9": { column: 15, line: 4, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"3:9": playerTs(2, 15),
+				"5:0": playerTs(4, 0),
+				"5:9": playerTs(4, 15),
 			});
 
 			// No "b" field in raw coverage
@@ -1368,10 +1142,7 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/player.luau": { s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files["src/shared/player.ts"]!.b["0"]).toStrictEqual([0, 0]);
 		});
@@ -1379,59 +1150,60 @@ describe(mapCoverageToTypeScript, () => {
 		it("should throw when a branch arm span fails schema validation", () => {
 			expect.assertions(1);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [fromAny({ notASpan: true })],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [fromAny({ notASpan: true })],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [1] }, s: {} },
 			};
 
 			expect(() => {
-				mapCoverageToTypeScript(coverageData, createManifest(createManifestFiles()));
-			}).toThrow(CoverageMapMalformedError);
+				mapPlayer({ coverageData, fileSystem });
+			}).toThrow(malformedSidecar());
 		});
 
 		it("should skip branch when end position has no source mapping", () => {
 			expect.assertions(1);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 4, line: 9 }, start: { column: 1, line: 7 } },
-						{ end: { column: 4, line: 9 }, start: { column: 1, line: 8 } },
-					],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [
+								{ end: { column: 4, line: 9 }, start: { column: 1, line: 7 } },
+								{ end: { column: 4, line: 9 }, start: { column: 1, line: 8 } },
+							],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// Only start positions have mappings; end (line 9) returns null
 			setupSourceMapMappings({
-				"7:0": { column: 0, line: 6, source: "src/shared/player.ts" },
-				"8:0": { column: 0, line: 6, source: "src/shared/player.ts" },
+				"7:0": playerTs(6, 0),
+				"8:0": playerTs(6, 0),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [3, 0] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -1439,17 +1211,19 @@ describe(mapCoverageToTypeScript, () => {
 		it("should skip branch entries when source map cannot resolve an arm location", () => {
 			expect.assertions(1);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [{ end: { column: 10, line: 99 }, start: { column: 1, line: 99 } }],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(99, 1, 10)],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// No mappings — originalPositionFor returns null source
 			setupSourceMapMappings({});
@@ -1458,10 +1232,7 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/player.luau": { b: { "1": [1] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -1469,31 +1240,27 @@ describe(mapCoverageToTypeScript, () => {
 		it("should skip branch entries when arms map to different source files", () => {
 			expect.assertions(1);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-						{ end: { column: 10, line: 5 }, start: { column: 1, line: 5 } },
-					],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 1, 10), span(5, 1, 10)],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
-			mockOriginalPositionFor.mockImplementation(positionSplitByLine);
+			resolvePosition.mockImplementation(positionSplitByLine);
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [1, 0] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -1501,17 +1268,19 @@ describe(mapCoverageToTypeScript, () => {
 		it("should skip branch entries with empty locations array", () => {
 			expect.assertions(1);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({});
 
@@ -1519,10 +1288,7 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/player.luau": { b: { "1": [] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -1530,22 +1296,23 @@ describe(mapCoverageToTypeScript, () => {
 		it("should skip branch when all arm locations map to null source", () => {
 			expect.assertions(1);
 
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } }],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 1, 10)],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// All positions return null source — mapBranchArmLocations returns
 			// undefined
-			mockOriginalPositionFor.mockReturnValue({
-				name: null,
+			resolvePosition.mockReturnValue({
 				column: null,
 				line: null,
 				source: null,
@@ -1555,10 +1322,7 @@ describe(mapCoverageToTypeScript, () => {
 				"shared/player.luau": { b: { "1": [1] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -1571,27 +1335,22 @@ describe(mapCoverageToTypeScript, () => {
 			const rawCoverageMap = {
 				branchMap: {
 					"1": {
-						locations: [
-							{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-						],
+						locations: [span(3, 1, 10)],
 						// "type" field intentionally omitted
 					},
 				},
 				statementMap: {},
 			};
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(rawCoverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(fromAny(rawCoverageMap));
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [1] }, s: {} },
 			};
 
 			expect(() => {
-				mapCoverageToTypeScript(coverageData, createManifest(createManifestFiles()));
-			}).toThrow(CoverageMapMalformedError);
+				mapPlayer({ coverageData, fileSystem });
+			}).toThrow(malformedSidecar());
 		});
 
 		it("should map branch with implicit else arm using zero-width location", () => {
@@ -1599,36 +1358,32 @@ describe(mapCoverageToTypeScript, () => {
 
 			// Simulates an if-without-else where the instrumenter adds an
 			// implicit else arm with a zero-width span at the if-keyword position
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-						{ end: { column: 1, line: 5 }, start: { column: 1, line: 5 } },
-					],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 1, 10), span(5, 1, 1)],
+							type: "if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// Both arms map to the same TS source file
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:9": { column: 15, line: 2, source: "src/shared/player.ts" },
-				"5:0": { column: 0, line: 4, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"3:9": playerTs(2, 15),
+				"5:0": playerTs(4, 0),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [3, 0] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"]!;
 
@@ -1637,45 +1392,192 @@ describe(mapCoverageToTypeScript, () => {
 			expect(file.branchMap["0"]!.locations).toHaveLength(2);
 		});
 
-		it("should drop phantom branch whose arm collapses onto another arm's start", () => {
+		it("should keep arms that share a start when neither arm is zero-width", () => {
 			expect.assertions(1);
 
-			// A roblox-ts Array polyfill (.filter/.includes/.some) emits a
-			// synthetic dispatch conditional with no source map entry. With
-			// trace-mapping's greatest-lower-bound bias, the source-less
-			// implicit-else position snaps to the nearest preceding segment —
-			// the then-arm's own start — producing a zero-width phantom else
-			// arm that can never be covered (counts [N, 0]).
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-						{ end: { column: 1, line: 5 }, start: { column: 1, line: 5 } },
-					],
-					type: "if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [
+								{ end: { column: 1, line: 4 }, start: { column: 1, line: 3 } },
+								span(5, 1, 10),
+							],
+							type: "if",
+						},
+					},
 				},
-			});
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
-
-			// Else-arm (Luau line 5) snaps to the then-arm's start (TS L2c0).
+			);
+			const fileSystem = playerFs(coverageMap);
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:9": { column: 15, line: 2, source: "src/shared/player.ts" },
-				"5:0": { column: 0, line: 2, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"4:0": playerTs(3, 0),
+				"5:0": playerTs(2, 0),
+				"5:9": playerTs(2, 10),
+			});
+
+			const result = mapPlayer({
+				coverageData: { "shared/player.luau": { b: { "1": [2, 3] }, s: {} } },
+				fileSystem,
+			});
+
+			expect(result.files["src/shared/player.ts"]!.b["0"]).toStrictEqual([2, 3]);
+		});
+
+		it("should keep a zero-width arm beside an arm at another column", () => {
+			expect.assertions(1);
+
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 1, 10), span(5, 1, 1)],
+							type: "if",
+						},
+					},
+				},
+			);
+			const fileSystem = playerFs(coverageMap);
+			setupSourceMapMappings({
+				"3:0": playerTs(2, 5),
+				"3:9": playerTs(2, 10),
+				"5:0": playerTs(2, 0),
+			});
+
+			const result = mapPlayer({
+				coverageData: { "shared/player.luau": { b: { "1": [2, 0] }, s: {} } },
+				fileSystem,
+			});
+
+			expect(result.files["src/shared/player.ts"]!.b["0"]).toStrictEqual([2, 0]);
+		});
+
+		it("should keep a single-line else-less statement if", () => {
+			expect.assertions(1);
+
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [
+								{ end: { column: 2, line: 5 }, start: { column: 11, line: 3 } },
+								span(3, 2, 2),
+							],
+							type: "if",
+						},
+					},
+				},
+			);
+			const fileSystem = playerFs(coverageMap);
+			setupSourceMapMappings({
+				"3:1": playerTs(2, 1),
+				"3:10": playerTs(2, 1),
+				"5:1": playerTs(2, 16),
+			});
+
+			const result = mapPlayer({
+				coverageData: { "shared/player.luau": { b: { "1": [1, 2] }, s: {} } },
+				fileSystem,
+			});
+
+			expect(result.files["src/shared/player.ts"]!.b["0"]).toStrictEqual([1, 2]);
+		});
+
+		it("should keep a multi-line else-less statement if", () => {
+			expect.assertions(1);
+
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [
+								{ end: { column: 2, line: 10 }, start: { column: 11, line: 8 } },
+								span(8, 2, 2),
+							],
+							type: "if",
+						},
+					},
+				},
+			);
+			const fileSystem = playerFs(coverageMap);
+			setupSourceMapMappings({
+				"8:1": playerTs(7, 1),
+				"8:10": playerTs(7, 1),
+				"10:1": playerTs(9, 1),
+			});
+
+			const result = mapPlayer({
+				coverageData: { "shared/player.luau": { b: { "1": [1, 2] }, s: {} } },
+				fileSystem,
+			});
+
+			expect(result.files["src/shared/player.ts"]!.b["0"]).toStrictEqual([1, 2]);
+		});
+
+		it("should keep a branch whose later arm starts elsewhere but ends at the first arm's start", () => {
+			expect.assertions(1);
+
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 2, 2), span(5, 1, 2)],
+							type: "if",
+						},
+					},
+				},
+			);
+			const fileSystem = playerFs(coverageMap);
+			setupSourceMapMappings({
+				"3:1": playerTs(2, 1),
+				"5:0": playerTs(2, 0),
+				"5:1": playerTs(2, 1),
+			});
+
+			const result = mapPlayer({
+				coverageData: { "shared/player.luau": { b: { "1": [1, 2] }, s: {} } },
+				fileSystem,
+			});
+
+			expect(result.files["src/shared/player.ts"]!.b["0"]).toStrictEqual([1, 2]);
+		});
+
+		it("should drop phantom branch whose arms all collapse to one point", () => {
+			expect.assertions(1);
+
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [
+								{ end: { column: 4, line: 13 }, start: { column: 40, line: 10 } },
+								span(10, 2, 2),
+							],
+							type: "if",
+						},
+					},
+				},
+			);
+
+			const fileSystem = playerFs(coverageMap);
+
+			setupSourceMapMappings({
+				"10:1": playerTs(2, 1),
+				"10:39": playerTs(2, 1),
+				"13:3": playerTs(2, 1),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [10, 0] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			expect(result.files).toBeEmptyObject();
 		});
@@ -1687,41 +1589,36 @@ describe(mapCoverageToTypeScript, () => {
 			// other coverage for the same file.
 			const coverageMap = createCoverageMap(
 				{
-					"0": { end: { column: 10, line: 7 }, start: { column: 1, line: 7 } },
+					"0": span(7, 1, 10),
 				},
-				undefined,
 				{
-					"1": {
-						locations: [
-							{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-							{ end: { column: 1, line: 5 }, start: { column: 1, line: 5 } },
-						],
-						type: "if",
+					branchMap: {
+						"1": {
+							locations: [
+								{ end: { column: 4, line: 13 }, start: { column: 40, line: 10 } },
+								span(10, 2, 2),
+							],
+							type: "if",
+						},
 					},
 				},
 			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:9": { column: 15, line: 2, source: "src/shared/player.ts" },
-				"5:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"7:0": { column: 0, line: 3, source: "src/shared/player.ts" },
-				"7:9": { column: 25, line: 3, source: "src/shared/player.ts" },
+				"7:0": playerTs(3, 0),
+				"7:9": playerTs(3, 25),
+				"10:1": playerTs(2, 1),
+				"10:39": playerTs(2, 1),
+				"13:3": playerTs(2, 1),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [10, 0] }, s: { "0": 5 } },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -1741,37 +1638,33 @@ describe(mapCoverageToTypeScript, () => {
 			// dropped; the
 			// phantom signature only applies to compiler-synthesized statement
 			// `if`s (type "if").
-			const coverageMap = createCoverageMap({}, undefined, {
-				"1": {
-					locations: [
-						{ end: { column: 5, line: 3 }, start: { column: 1, line: 3 } },
-						{ end: { column: 13, line: 3 }, start: { column: 9, line: 3 } },
-					],
-					type: "expr-if",
+			const coverageMap = createCoverageMap(
+				{},
+				{
+					branchMap: {
+						"1": {
+							locations: [span(3, 1, 5), span(3, 9, 13)],
+							type: "expr-if",
+						},
+					},
 				},
-			});
+			);
 
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-				"out/shared/player.luau.map": '{"version":3}',
-			});
+			const fileSystem = playerFs(coverageMap);
 
 			// One segment on line 3 → every column snaps to the same TS position.
 			setupSourceMapMappings({
-				"3:0": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:4": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:8": { column: 0, line: 2, source: "src/shared/player.ts" },
-				"3:12": { column: 0, line: 2, source: "src/shared/player.ts" },
+				"3:0": playerTs(2, 0),
+				"3:4": playerTs(2, 0),
+				"3:8": playerTs(2, 0),
+				"3:12": playerTs(2, 0),
 			});
 
 			const coverageData: RawCoverageData = {
 				"shared/player.luau": { b: { "1": [4, 6] }, s: {} },
 			};
 
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
+			const result = mapPlayer({ coverageData, fileSystem });
 
 			const file = result.files["src/shared/player.ts"];
 
@@ -1781,316 +1674,6 @@ describe(mapCoverageToTypeScript, () => {
 	});
 
 	describe("with native Luau files (no source map)", () => {
-		it("should report statement coverage against the original Luau path", () => {
-			expect.assertions(3);
-
-			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 3 },
-					start: { column: 1, line: 1 },
-				},
-			});
-
-			// Only cov-map exists — no .luau.map source map
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { s: { "0": 5 } },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"];
-
-			expect(file).toBeDefined();
-			expect(file!.s["0"]).toBe(5);
-			expect(file!.statementMap["0"]).toStrictEqual({
-				end: { column: 19, line: 3 },
-				start: { column: 0, line: 1 },
-			});
-		});
-
-		it("should passthrough function coverage for native Luau files", () => {
-			expect.assertions(3);
-
-			const coverageMap = createCoverageMap(
-				{
-					"0": {
-						end: { column: 10, line: 1 },
-						start: { column: 1, line: 1 },
-					},
-				},
-				{
-					"0": {
-						name: "greet",
-						location: {
-							end: { column: 4, line: 5 },
-							start: { column: 1, line: 3 },
-						},
-					},
-				},
-			);
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { f: { "0": 3 }, s: { "0": 1 } },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"]!;
-
-			expect(file.fnMap["0"]!.name).toBe("greet");
-			expect(file.f["0"]).toBe(3);
-			expect(file.fnMap["0"]!.loc).toStrictEqual({
-				end: { column: 3, line: 5 },
-				start: { column: 0, line: 3 },
-			});
-		});
-
-		it("should passthrough branch coverage for native Luau files", () => {
-			expect.assertions(3);
-
-			const coverageMap = createCoverageMap(
-				{
-					"0": {
-						end: { column: 10, line: 1 },
-						start: { column: 1, line: 1 },
-					},
-				},
-				undefined,
-				{
-					"0": {
-						locations: [
-							{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-							{ end: { column: 10, line: 5 }, start: { column: 1, line: 5 } },
-						],
-						type: "if",
-					},
-				},
-			);
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { b: { "0": [2, 1] }, s: { "0": 1 } },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"]!;
-
-			expect(file.b["0"]).toStrictEqual([2, 1]);
-			expect(file.branchMap["0"]!.type).toBe("if");
-			expect(file.branchMap["0"]!.locations).toStrictEqual([
-				{ end: { column: 9, line: 3 }, start: { column: 0, line: 3 } },
-				{ end: { column: 9, line: 5 }, start: { column: 0, line: 5 } },
-			]);
-		});
-
-		it("should skip function passthrough when functionMap is undefined", () => {
-			expect.assertions(1);
-
-			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 10, line: 1 },
-					start: { column: 1, line: 1 },
-				},
-			});
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { s: { "0": 1 } },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"]!;
-
-			expect(file.fnMap).toBeEmptyObject();
-		});
-
-		it("should skip branch passthrough when branchMap is undefined", () => {
-			expect.assertions(1);
-
-			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 10, line: 1 },
-					start: { column: 1, line: 1 },
-				},
-			});
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { s: { "0": 1 } },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"]!;
-
-			expect(file.branchMap).toBeEmptyObject();
-		});
-
-		it("should skip branch passthrough entries with empty locations array", () => {
-			expect.assertions(1);
-
-			const coverageMap = createCoverageMap({}, undefined, {
-				"0": { locations: [], type: "if" },
-			});
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { b: { "0": [] }, s: {} },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			expect(result.files["shared/player.luau"]!.branchMap).toBeEmptyObject();
-		});
-
-		it("should default function hit count to zero when not in raw data", () => {
-			expect.assertions(1);
-
-			const coverageMap = createCoverageMap(
-				{
-					"0": {
-						end: { column: 10, line: 1 },
-						start: { column: 1, line: 1 },
-					},
-				},
-				{
-					"0": {
-						name: "foo",
-						location: {
-							end: { column: 4, line: 5 },
-							start: { column: 1, line: 3 },
-						},
-					},
-				},
-			);
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { s: { "0": 1 } },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"]!;
-
-			expect(file.f["0"]).toBe(0);
-		});
-
-		it("should default branch arm hit counts to zero when not in raw data", () => {
-			expect.assertions(1);
-
-			const coverageMap = createCoverageMap(
-				{
-					"0": {
-						end: { column: 10, line: 1 },
-						start: { column: 1, line: 1 },
-					},
-				},
-				undefined,
-				{
-					"0": {
-						locations: [
-							{ end: { column: 10, line: 3 }, start: { column: 1, line: 3 } },
-							{ end: { column: 10, line: 5 }, start: { column: 1, line: 5 } },
-						],
-						type: "if",
-					},
-				},
-			);
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { s: { "0": 1 } },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"]!;
-
-			expect(file.b["0"]).toStrictEqual([0, 0]);
-		});
-
-		it("should default statement hit count to zero when ID is absent from raw data", () => {
-			expect.assertions(1);
-
-			const coverageMap = createCoverageMap({
-				"0": {
-					end: { column: 20, line: 3 },
-					start: { column: 1, line: 1 },
-				},
-			});
-
-			setupFs({
-				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
-			});
-
-			// Statement "0" is not in the s record
-			const coverageData: RawCoverageData = {
-				"shared/player.luau": { s: {} },
-			};
-
-			const result = mapCoverageToTypeScript(
-				coverageData,
-				createManifest(createManifestFiles()),
-			);
-
-			const file = result.files["shared/player.luau"]!;
-
-			expect(file.s["0"]).toBe(0);
-		});
-
 		it("should report an untested native Luau file with zero hits", () => {
 			expect.assertions(2);
 
@@ -2102,12 +1685,12 @@ describe(mapCoverageToTypeScript, () => {
 			});
 
 			// Only cov-map exists — no .luau.map source map (native Luau).
-			setupFs({
+			const fileSystem = setupFs({
 				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
 			});
 
 			// Instrumented but never required by a test → absent from hit map.
-			const result = mapCoverageToTypeScript({}, createManifest(createManifestFiles()));
+			const result = mapPlayer({ coverageData: {}, fileSystem });
 
 			const file = result.files["shared/player.luau"];
 
@@ -2120,37 +1703,33 @@ describe(mapCoverageToTypeScript, () => {
 
 			const coverageMap = createCoverageMap(
 				{
-					"0": {
-						end: { column: 10, line: 1 },
-						start: { column: 1, line: 1 },
-					},
+					"0": span(1, 1, 10),
 				},
 				{
-					"0": {
-						name: "greet",
-						location: {
-							end: { column: 4, line: 5 },
-							start: { column: 1, line: 3 },
+					branchMap: {
+						"0": {
+							locations: [span(7, 1, 10), span(9, 1, 10)],
+							type: "if",
 						},
 					},
-				},
-				{
-					"0": {
-						locations: [
-							{ end: { column: 10, line: 7 }, start: { column: 1, line: 7 } },
-							{ end: { column: 10, line: 9 }, start: { column: 1, line: 9 } },
-						],
-						type: "if",
+					functionMap: {
+						"0": {
+							name: "greet",
+							location: {
+								end: { column: 4, line: 5 },
+								start: { column: 1, line: 3 },
+							},
+						},
 					},
 				},
 			);
 
-			setupFs({
+			const fileSystem = setupFs({
 				"out/shared/player.luau.cov-map.json": JSON.stringify(coverageMap),
 			});
 
 			// Create manifest with two different keys pointing to the same file
-			const baseFile = createManifestFiles()["shared/player.luau"];
+			const baseFile = createManifestFiles(1)["shared/player.luau"];
 			const manifest = createManifest({
 				"shared/player-alias.luau": {
 					...baseFile,
@@ -2173,7 +1752,12 @@ describe(mapCoverageToTypeScript, () => {
 				},
 			};
 
-			const result = mapCoverageToTypeScript(combinedCoverage, manifest);
+			const result = mapCoverageToTypeScript({
+				coverageData: combinedCoverage,
+				fileSystem,
+				manifest,
+				traceMapFactory,
+			});
 
 			const file = result.files["shared/player.luau"]!;
 

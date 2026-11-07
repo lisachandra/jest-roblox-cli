@@ -1,35 +1,76 @@
 import { type } from "arktype";
 import assert from "node:assert";
-import * as cp from "node:child_process";
-import * as fs from "node:fs";
+import type * as cp from "node:child_process";
 import * as path from "node:path";
 import process from "node:process";
 
+import type { ChildProcessRunner } from "../utils/child-process.ts";
+import { nodeChildProcessRunner } from "../utils/child-process.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { NX_MARKER, TURBO_MARKER } from "./discovery.ts";
-import { type PackageInfo, readPackageJsonName } from "./package-resolver.ts";
+import type { PackageInfo } from "./package-resolver.ts";
+import { readPackageJsonName } from "./pnpm-packages.ts";
 
 const JEST_CONFIG_MARKER = /^jest\.config\.[^.]+$/;
 
-function resolvePosixShim(binDirectory: string, command: string): string {
-	const candidate = path.join(binDirectory, command);
-	return fs.existsSync(candidate) ? candidate : command;
+/** What the affected walk reads, and what it launches. */
+export interface AffectedContext {
+	/** What runs `turbo` / `nx`. Defaults to the real launcher. */
+	childProcess?: ChildProcessRunner;
+	/**
+	 * Where the workspace markers are read. Defaults to the real filesystem.
+	 */
+	fileSystem?: FileSystem;
 }
 
-// Build cmd.exe args for `cmd.exe /d /s /c "<command> <args>"`. Each argument
-// is wrapped in double quotes — cmd metacharacters (^, &, |, <, >) are literal
-// inside quotes, and `ref` is already restricted by validRefPattern so no `"`
-// can appear. The outer pair of quotes around the whole command is stripped
-// by /s, leaving cmd.exe to parse the inner `cmd "tok" "tok" ...` normally.
-//
-// The command itself MUST stay unquoted: npm-cli batch shims (turbo.cmd,
-// nx.cmd) compute `%~dp0` from %0, and when cmd.exe runs a *quoted* command
-// resolved via PATHEXT it sets %0 to the bare name — so `%~dp0` falls back
-// to the cwd. The shim then does `node "%~dp0\..\turbo\bin\turbo"`, which
-// resolves to `<cwd>\..\turbo\bin\turbo` (one directory above the workspace),
-// and node errors with MODULE_NOT_FOUND. Leaving the command unquoted lets
-// cmd resolve it through PATH normally and %~dp0 points at the shim's own
-// directory. `command` here is a hard-coded "turbo" or "nx", so no quoting
-// is required for safety.
+/** The same, with both seams settled. */
+type ResolvedAffectedContext = Required<AffectedContext>;
+
+interface AffectedTarget {
+	readonly ref: string;
+	readonly workspaceRoot: string;
+}
+
+interface ToolInvocation {
+	readonly args: Array<string>;
+	readonly command: string;
+	readonly cwd: string;
+}
+
+function resolvePosixShim({
+	binDirectory,
+	command,
+	fileSystem,
+}: {
+	readonly binDirectory: string;
+	readonly command: string;
+	readonly fileSystem: FileSystem;
+}): string {
+	const candidate = path.join(binDirectory, command);
+	return fileSystem.existsSync(candidate) ? candidate : command;
+}
+
+/**
+ * Build cmd.exe args for `cmd.exe /d /s /c "<command> <args>"`. Each argument
+ * is wrapped in double quotes — cmd metacharacters (^, &, |, <, >) are literal
+ * inside quotes, and `ref` is already restricted by validRefPattern so no `"`
+ * can appear. The outer pair of quotes around the whole command is stripped
+ * by /s, leaving cmd.exe to parse the inner `cmd "tok" "tok" ...` normally.
+ *
+ * The command itself MUST stay unquoted: npm-cli batch shims (turbo.cmd,
+ * nx.cmd) compute `%~dp0` from %0, and when cmd.exe runs a *quoted* command
+ * resolved via PATHEXT it sets %0 to the bare name — so `%~dp0` falls back
+ * to the cwd. The shim then does `node "%~dp0\..\turbo\bin\turbo"`, which
+ * resolves to `<cwd>\..\turbo\bin\turbo` (one directory above the workspace),
+ * and node errors with MODULE_NOT_FOUND. Leaving the command unquoted lets
+ * cmd resolve it through PATH normally and %~dp0 points at the shim's own
+ * directory. `command` here is a hard-coded "turbo" or "nx", so no quoting
+ * is required for safety.
+ * @param command - Bare tool name, `turbo` or `nx`.
+ * @param args - Tool arguments, each quoted.
+ * @returns The cmd.exe argument list.
+ */
 function buildCommandExeArgs(command: string, args: Array<string>): Array<string> {
 	const quotedArgs = args.map((argument) => `"${argument}"`).join(" ");
 	return ["/d", "/s", "/c", `"${command} ${quotedArgs}"`];
@@ -67,13 +108,28 @@ interface TurboPackage {
 	relativePath: string;
 }
 
-// turbo.json takes precedence when both markers are present (hybrid monorepo).
-//
-// Returns full `PackageInfo` (name + absolute directory), not bare names: the
-// name must match `package.json#name` so downstream resolution doesn't fail,
-// and turbo/nx already hand us the directory, so resolving it here skips a
-// redundant `resolvePackage` round-trip in the caller.
-export function getAffectedPackages(workspaceRoot: string, ref: string): Array<PackageInfo> {
+/**
+ * The `turbo.json` marker takes precedence when both markers are present
+ * (hybrid monorepo).
+ *
+ * Returns full `PackageInfo` (name + absolute directory), not bare names: the
+ * name must match `package.json#name` so downstream resolution doesn't fail,
+ * and turbo/nx already hand us the directory, so resolving it here skips a
+ * redundant `resolvePackage` round-trip in the caller.
+ * @param options - Workspace root, ref and process seams.
+ * @param options.childProcess - Runner that spawns turbo or nx.
+ * @param options.fileSystem - File system that finds the workspace marker.
+ * @param options.ref - Git ref to compare against.
+ * @param options.workspaceRoot - Workspace root directory.
+ * @returns Each affected package with its absolute directory.
+ * @throws {Error} When the ref is invalid or turbo or nx fails.
+ */
+export function getAffectedPackages({
+	childProcess = nodeChildProcessRunner,
+	fileSystem = nodeFileSystem,
+	ref,
+	workspaceRoot,
+}: AffectedContext & AffectedTarget): Array<PackageInfo> {
 	if (!validRefPattern.test(ref) || ref.startsWith("-")) {
 		throw new Error(
 			`Invalid --affected-since ref ${JSON.stringify(ref)}. ` +
@@ -81,12 +137,14 @@ export function getAffectedPackages(workspaceRoot: string, ref: string): Array<P
 		);
 	}
 
-	if (fs.existsSync(path.join(workspaceRoot, TURBO_MARKER))) {
-		return resolveTurboAffected(workspaceRoot, ref);
+	const resolved = { childProcess, fileSystem } satisfies ResolvedAffectedContext;
+
+	if (resolved.fileSystem.existsSync(path.join(workspaceRoot, TURBO_MARKER))) {
+		return resolveTurboAffected({ ...resolved, ref, workspaceRoot });
 	}
 
-	if (fs.existsSync(path.join(workspaceRoot, NX_MARKER))) {
-		return resolveNxAffected(workspaceRoot, ref);
+	if (resolved.fileSystem.existsSync(path.join(workspaceRoot, NX_MARKER))) {
+		return resolveNxAffected({ ...resolved, ref, workspaceRoot });
 	}
 
 	throw new Error(
@@ -95,16 +153,16 @@ export function getAffectedPackages(workspaceRoot: string, ref: string): Array<P
 	);
 }
 
-function hasJestConfig(packageDirectory: string): boolean {
+function hasJestConfig(fileSystem: FileSystem, packageDirectory: string): boolean {
 	// Guard against a missing directory: turbo's package list can lag the
 	// filesystem (stale cache, package deleted between turbo's read and ours),
 	// and readdirSync would otherwise throw ENOENT and break the silent-drop
 	// guarantee.
-	if (!fs.existsSync(packageDirectory)) {
+	if (!fileSystem.existsSync(packageDirectory)) {
 		return false;
 	}
 
-	return fs.readdirSync(packageDirectory).some((entry) => JEST_CONFIG_MARKER.test(entry));
+	return fileSystem.readdirSync(packageDirectory).some((entry) => JEST_CONFIG_MARKER.test(entry));
 }
 
 // runTool passes `encoding: "utf8"` so child_process surfaces these as strings
@@ -118,9 +176,14 @@ function readStream(failure: ToolFailure, key: "stderr" | "stdout"): string | un
 	return stream !== undefined && stream.length > 0 ? stream : undefined;
 }
 
-// Reshape a failed tool invocation into a readable error. nx writes its branded
-// diagnostic to stdout, not stderr, when --base references an unknown ref —
-// fall back to stdout so users see it.
+/**
+ * Reshape a failed tool invocation into a readable error. The nx CLI writes its branded
+ * diagnostic to stdout, not stderr, when --base references an unknown ref —
+ * fall back to stdout so users see it.
+ * @param command - Tool name, for the message.
+ * @param err - Value the failed invocation threw.
+ * @returns The error to surface, with `err` as its cause.
+ */
 function toToolError(command: string, err: unknown): Error {
 	if (err instanceof Error && "code" in err && err.code === "ENOENT") {
 		return new Error(`${command} was not found on PATH`);
@@ -134,24 +197,35 @@ function toToolError(command: string, err: unknown): Error {
 }
 
 // cspell:words PATHEXT
-// pnpm only prepends `node_modules/.bin` to PATH for `pnpm exec` / `pnpm run`,
-// so a direct `node bin/jest-roblox.js` invocation can't see local tools.
-// Resolution differs per platform:
-//   - Windows: prepend the local bin to PATH and invoke cmd.exe with /d /s /c
-//     so it resolves the `.cmd` shim via PATHEXT. Args are pre-quoted and
-//     passed verbatim — `shell: true` with an args array trips Node 25's
-//     DEP0190, and spawning the `.cmd` shim directly trips Node's
-//     CVE-2024-27980 guard (EINVAL on Node 21+).
-//   - POSIX: pin the absolute path of the locally installed shim. Scripts
-//     in `.bin` are directly executable (`#!/usr/bin/env node`), so no
-//     shell is needed and the bare-PATH lookup isn't required.
-function runTool(command: string, args: Array<string>, cwd: string): string {
+/**
+ * The pnpm CLI only prepends `node_modules/.bin` to PATH for `pnpm exec` /
+ * `pnpm run`, so a direct `node bin/jest-roblox.js` invocation can't see
+ * local tools.
+ * Resolution differs per platform:
+ *   - Windows: prepend the local bin to PATH and invoke cmd.exe with /d /s /c
+ *     so it resolves the `.cmd` shim via PATHEXT. Args are pre-quoted and
+ *     passed verbatim — `shell: true` with an args array trips Node 25's
+ *     DEP0190, and spawning the `.cmd` shim directly trips Node's
+ *     CVE-2024-27980 guard (EINVAL on Node 21+).
+ *   - POSIX: pin the absolute path of the locally installed shim. Scripts
+ *     in `.bin` are directly executable (`#!/usr/bin/env node`), so no
+ *     shell is needed and the bare-PATH lookup isn't required.
+ * @param invocation - Tool, arguments, working directory and process seams.
+ * @returns The tool's stdout.
+ */
+function runTool({
+	args,
+	childProcess,
+	command,
+	cwd,
+	fileSystem,
+}: ResolvedAffectedContext & ToolInvocation): string {
 	const binDirectory = path.join(cwd, "node_modules", ".bin");
 	const isWindows = process.platform === "win32";
 	const childEnvironment = isWindows
 		? { ...process.env, PATH: `${binDirectory}${path.delimiter}${process.env["PATH"]}` }
 		: process.env;
-	const file = isWindows ? "cmd.exe" : resolvePosixShim(binDirectory, command);
+	const file = isWindows ? "cmd.exe" : resolvePosixShim({ binDirectory, command, fileSystem });
 	const spawnArgs = isWindows ? buildCommandExeArgs(command, args) : args;
 	const options = {
 		cwd,
@@ -163,11 +237,11 @@ function runTool(command: string, args: Array<string>, cwd: string): string {
 	const windowsOptions = { ...options, windowsVerbatimArguments: true } satisfies cp.SpawnOptions;
 	try {
 		return isWindows
-			? cp.execFileSync(file, spawnArgs, {
+			? childProcess.execFileSync(file, spawnArgs, {
 					...windowsOptions,
 					windowsHide: true,
 				})
-			: cp.execFileSync(file, spawnArgs, {
+			: childProcess.execFileSync(file, spawnArgs, {
 					...options,
 					windowsHide: true,
 				});
@@ -195,7 +269,11 @@ function parseTurboOutput(stdout: string): Array<TurboPackage> {
 	return validated.packages.items.map((item) => ({ name: item.name, relativePath: item.path }));
 }
 
-function resolveTurboAffected(workspaceRoot: string, ref: string): Array<PackageInfo> {
+function resolveTurboAffected({
+	ref,
+	workspaceRoot,
+	...context
+}: AffectedTarget & ResolvedAffectedContext): Array<PackageInfo> {
 	// `--filter=...[<ref>]` = packages changed since <ref> plus their
 	// dependents. That's exactly the set the user asked for.
 	//
@@ -206,12 +284,19 @@ function resolveTurboAffected(workspaceRoot: string, ref: string): Array<Package
 	// intersection silently narrows the result. Some turbo versions
 	// (e.g. 2.8.x) also reject the combination outright. The filter alone
 	// is the precise expression of intent and works on every 2.x.
-	const stdout = runTool("turbo", ["ls", `--filter=...[${ref}]`, "--output=json"], workspaceRoot);
+	const stdout = runTool({
+		...context,
+		args: ["ls", `--filter=...[${ref}]`, "--output=json"],
+		command: "turbo",
+		cwd: workspaceRoot,
+	});
 	// turbo names projects by `package.json#name` by convention, so the
 	// name needs no further resolution — just anchor the directory. Filter
 	// before mapping so dropped packages don't pay for an extra alloc.
 	return parseTurboOutput(stdout)
-		.filter((item) => hasJestConfig(path.join(workspaceRoot, item.relativePath)))
+		.filter((item) => {
+			return hasJestConfig(context.fileSystem, path.join(workspaceRoot, item.relativePath));
+		})
 		.map((item) => {
 			return {
 				name: item.name,
@@ -229,15 +314,34 @@ function parseNxOutput(stdout: string): Array<string> {
 	return validated;
 }
 
-// Ask nx itself where a project lives. Errors surface with the project name
-// in the message regardless of failure mode (exec failure, non-JSON output,
-// schema mismatch) — nx reporting an affected project it can't subsequently
-// locate is a real inconsistency the user needs to see, not silently drop.
-function nxProjectRoot(workspaceRoot: string, name: string): string {
+/**
+ * Ask nx itself where a project lives. Errors surface with the project name
+ * in the message regardless of failure mode (exec failure, non-JSON output,
+ * schema mismatch) — nx reporting an affected project it can't subsequently
+ * locate is a real inconsistency the user needs to see, not silently drop.
+ * @param options - Project name, workspace root and process seams.
+ * @param options.name - Project name as nx knows it.
+ * @param options.workspaceRoot - Workspace root directory.
+ * @returns The project root that nx reports.
+ * @throws {Error} When nx fails or its output does not parse.
+ */
+function nxProjectRoot({
+	name,
+	workspaceRoot,
+	...context
+}: ResolvedAffectedContext & {
+	readonly name: string;
+	readonly workspaceRoot: string;
+}): string {
 	const errorContext = `nx show project ${JSON.stringify(name)}`;
 	let parsed: JSONValue;
 	try {
-		const stdout = runTool("nx", ["show", "project", name, "--json"], workspaceRoot);
+		const stdout = runTool({
+			...context,
+			args: ["show", "project", name, "--json"],
+			command: "nx",
+			cwd: workspaceRoot,
+		});
 		parsed = parseJson(stdout, "nx");
 	} catch (err) {
 		// Both runTool and parseJson surface failures as Error instances —
@@ -254,7 +358,11 @@ function nxProjectRoot(workspaceRoot: string, name: string): string {
 	return validated.root;
 }
 
-function resolveNxAffected(workspaceRoot: string, ref: string): Array<PackageInfo> {
+function resolveNxAffected({
+	ref,
+	workspaceRoot,
+	...context
+}: AffectedTarget & ResolvedAffectedContext): Array<PackageInfo> {
 	// nx project names live in a separate namespace from `package.json.name`,
 	// so we can't map them via pnpm-workspace.yaml without false-green-ing
 	// affected projects whose two names diverge. Ask nx itself for each
@@ -263,18 +371,28 @@ function resolveNxAffected(workspaceRoot: string, ref: string): Array<PackageInf
 	// package.json exists). Mirrors the turbo path, which gets `path` and the
 	// package name for free from `turbo ls`.
 	const affected = parseNxOutput(
-		runTool("nx", ["show", "projects", "--affected", `--base=${ref}`, "--json"], workspaceRoot),
+		runTool({
+			...context,
+			args: ["show", "projects", "--affected", `--base=${ref}`, "--json"],
+			command: "nx",
+			cwd: workspaceRoot,
+		}),
 	);
 	return affected.flatMap((nxName) => {
-		const packageDirectory = path.join(workspaceRoot, nxProjectRoot(workspaceRoot, nxName));
-		if (!hasJestConfig(packageDirectory)) {
+		const packageDirectory = path.join(
+			workspaceRoot,
+			nxProjectRoot({ ...context, name: nxName, workspaceRoot }),
+		);
+		if (!hasJestConfig(context.fileSystem, packageDirectory)) {
 			return [];
 		}
 
 		// Fall back to the nx name (not the directory basename, as
 		// `inferPackageName` does): a Luau-only nx project may have no
 		// package.json, and the nx name is its only stable identifier.
-		const name = readPackageJsonName(path.join(packageDirectory, "package.json")) ?? nxName;
+		const name =
+			readPackageJsonName(path.join(packageDirectory, "package.json"), context.fileSystem) ??
+			nxName;
 		return [{ name, packageDirectory }];
 	});
 }

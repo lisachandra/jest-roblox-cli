@@ -13,6 +13,10 @@
 	"author": "Christopher Buss <christopher.buss@pm.me> (https://github.com/christopher-buss)",
 	"sideEffects": false,
 	"type": "module",
+	"imports": {
+		"#src/*": "./src/*",
+		"#test/*": "./test/*.ts"
+	},
 	"exports": {
 		".": {
 			"source": "./src/index.ts",
@@ -27,28 +31,47 @@
 		"src"
 	],
 	"scripts": {
-		"build": "tsdown"
+		"boundaries": "cd ../.. && dependency-cruiser --config packages/rojo-utils/dependency-cruiser.config.ts --output-type err -- packages/rojo-utils/src packages/rojo-utils/test",
+		"build": "tsdown",
+		"cpd": "pnpm cpd-production && pnpm cpd-spec",
+		"cpd-production": "jscpd --config .jscpd.json --no-tips",
+		"cpd-spec": "jscpd --config .jscpd.spec.json --no-tips",
+		"integration": "vitest run --project integration --coverage.enabled=false",
+		"knip": "pnpm knip-production && cd ../.. && knip --config packages/rojo-utils/knip.json --workspace packages/rojo-utils",
+		"knip-production": "cd ../.. && knip --production --config packages/rojo-utils/knip.json --workspace packages/rojo-utils",
+		"lint": "oxlint && eslint --cache",
+		"mutation": "stryker run stryker.config.ts",
+		"test": "vitest run --project unit --project type --coverage",
+		"test-type": "vitest run --project type",
+		"test-unit": "vitest run --project unit --coverage.enabled=false",
+		"typecheck": "tsc -b"
 	},
 	"dependencies": {
 		"arktype": "2.2.3"
 	},
 	"devDependencies": {
-		"@isentinel/eslint-config": "6.0.0-beta.42",
+		"@isentinel/eslint-config": "6.2.0",
 		"@isentinel/tsconfig": "2.0.0",
+		"@stryker-mutator/core": "10.1.1",
+		"@stryker-mutator/typescript-checker": "10.1.1",
+		"@stryker-mutator/vitest-runner": "10.1.1",
+		"@total-typescript/shoehorn": "0.1.2",
 		"@types/node": "24.12.3",
-		"@typescript/native-preview": "7.0.0-dev.20260607.1",
-		"@vitest/coverage-v8": "5.0.0-rc.4",
-		"@vitest/eslint-plugin": "1.6.19",
+		"@typescript/native": "npm:typescript@7.0.2",
+		"@vitest/coverage-v8": "5.0.5",
+		"@vitest/eslint-plugin": "1.6.27",
 		"eslint": "10.9.0",
 		"eslint-plugin-jest-extended": "3.0.1",
 		"eslint-plugin-n": "18.3.0",
 		"eslint-plugin-pnpm": "1.8.0",
 		"jest-extended": "7.0.0",
-		"tsdown": "0.22.14",
+		"knip": "6.29.0",
+		"memfs": "4.68.1",
+		"tsdown": "0.23.0",
 		"typescript": "6.0.3",
-		"vitest": "5.0.0-rc.4"
+		"vitest": "5.0.5"
 	},
-	"packageManager": "pnpm@11.24.0+sha512.bd27e345e976dcb0be0b7a1228217b049a817e21b1f355c90dbe7dc46671895a8bc1e6d06c24554505ea93ea0b45f489a27ec1bfbc8de6a9659fca0f16fa0000",
+	"packageManager": "pnpm@12.16.0+sha512.e9ccc91a0b8d52da297c16841f9ee05f3ddd631bd757ef26a211687d4a38de653c614453649294438c58be74c2ba62d53e633a4e153708c012296d0f3ee27b36",
 	"engines": {
 		"node": ">=24.12.0"
 	}

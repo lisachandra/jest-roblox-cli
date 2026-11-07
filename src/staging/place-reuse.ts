@@ -1,11 +1,12 @@
 import { type } from "arktype";
 import { createHash } from "node:crypto";
-import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { CoverageManifest } from "../coverage-pipeline/manifest.ts";
 import { tryComputeRojoInputsHashAsync } from "../coverage-pipeline/rojo-inputs.ts";
 import { atomicWrite } from "../utils/atomic-write.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 
 /**
@@ -15,15 +16,20 @@ import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
  * file an interrupted build left behind.
  */
 export interface PlaceReuseRecord {
+	/** Key the build's inputs hashed to. */
 	inputsKey: string;
+	/** Hash of the place the build wrote. */
 	placeHash: string;
 }
 
 const placeReuseSchema = type({ inputsKey: "string", placeHash: "string" });
 
+/** Inputs to {@link computePlaceInputsKeyAsync}. */
 export interface PlaceInputsKeyOptions {
 	/** Forwarded to `openInputDigestCache`, which says what it claims. */
 	digestCacheFile: string;
+	/** Where the inputs are read. Defaults to the real filesystem. */
+	fileSystem?: FileSystem;
 	/**
 	 * Content hashes for the instrumented trees, folded in instead of walking
 	 * them. Instrumentation already recorded a hash per source file, so
@@ -75,12 +81,15 @@ export interface PlaceInputsKeyOptions {
  * Reports `undefined` when the inputs cannot be fingerprinted (a malformed
  * project). The caller then rebuilds, which is what would have happened
  * without a cache at all.
+ * @param options - Project text and file, manifests, shadow roots and pass versions.
+ * @returns A hex SHA-256 key, or `undefined` when the inputs cannot be hashed.
  */
 export async function computePlaceInputsKeyAsync(
 	options: PlaceInputsKeyOptions,
 ): Promise<string | undefined> {
 	const rojoHash = await tryComputeRojoInputsHashAsync({
 		digestCacheFile: options.digestCacheFile,
+		fileSystem: options.fileSystem,
 		luauRoots: options.shadowRoots,
 		projectJson: options.projectJson,
 		rojoProjectPath: options.projectFile,
@@ -103,10 +112,19 @@ export async function computePlaceInputsKeyAsync(
 	return digest.digest("hex");
 }
 
-export function readPlaceReuseRecord(cacheFile: string): PlaceReuseRecord | undefined {
+/**
+ * The record a previous build left.
+ * @param cacheFile - Path of the record.
+ * @param fileSystem - Reads the record.
+ * @returns The record, or `undefined` when it is missing or malformed.
+ */
+export function readPlaceReuseRecord(
+	cacheFile: string,
+	fileSystem: FileSystem = nodeFileSystem,
+): PlaceReuseRecord | undefined {
 	let raw: string;
 	try {
-		raw = fs.readFileSync(cacheFile, "utf-8");
+		raw = fileSystem.readFileSync(cacheFile, "utf-8");
 	} catch {
 		// No previous build, or it was cleaned away. Not a fault.
 		return undefined;
@@ -121,33 +139,49 @@ export function readPlaceReuseRecord(cacheFile: string): PlaceReuseRecord | unde
 	}
 }
 
-export function writePlaceReuseRecord(cacheFile: string, record: PlaceReuseRecord): void {
+/**
+ * Write the record atomically, replacing any previous one.
+ * @param options - The record and where it goes.
+ * @param options.cacheFile - Path of the record.
+ * @param options.fileSystem - Writes the record.
+ * @param options.record - Key and place hash to record.
+ */
+export function writePlaceReuseRecord({
+	cacheFile,
+	fileSystem = nodeFileSystem,
+	record,
+}: {
+	cacheFile: string;
+	fileSystem?: FileSystem;
+	record: PlaceReuseRecord;
+}): void {
 	// Atomic, like the manifests it sits beside: a torn record read back as a
 	// key match would hand out a place that was never built.
-	atomicWrite({ contents: JSON.stringify(record), targetPath: cacheFile });
+	atomicWrite({ contents: JSON.stringify(record), fileSystem, targetPath: cacheFile });
 }
 
 /**
  * One sorted line per instrumented and non-instrumented file, plus the
  * instrumenter version — a bump changes the shadow output while every
  * `sourceHash` stays put, so without it a stale place would look current.
+ * @param manifests - Coverage manifests to fold.
+ * @returns Sorted key lines.
  */
 function manifestLines(manifests: Array<CoverageManifest>): Array<string> {
-	const lines: Array<string> = [];
-	for (const manifest of manifests) {
-		// Canonicalized: `shadowDir` arrives as a native absolute path, and a
-		// drive-letter or separator difference would read as a changed input.
-		const shadowDirectory = normalizeWindowsPath(manifest.shadowDir);
-		lines.push(`v\0${String(manifest.instrumenterVersion)}\0${shadowDirectory}`);
-		for (const [key, record] of Object.entries(manifest.files)) {
-			lines.push(`f\0${key}\0${record.sourceHash}`);
-		}
-
-		for (const [key, record] of Object.entries(manifest.nonInstrumentedFiles)) {
-			lines.push(`n\0${key}\0${record.sourceHash}`);
-		}
-	}
-
-	lines.sort();
-	return lines;
+	return manifests
+		.flatMap((manifest) => {
+			// Canonicalized: `shadowDir` arrives as a native absolute path, and a
+			// drive-letter or separator difference would read as a changed input.
+			const shadowDirectory = normalizeWindowsPath(manifest.shadowDir);
+			return [
+				`v\0${String(manifest.instrumenterVersion)}\0${shadowDirectory}`,
+				...Object.entries(manifest.files).map(([key, record]) => {
+					return `f\0${key}\0${record.sourceHash}`;
+				}),
+				...Object.entries(manifest.nonInstrumentedFiles).map(([key, record]) => {
+					return `n\0${key}\0${record.sourceHash}`;
+				}),
+			];
+		})
+		.sort();
 }

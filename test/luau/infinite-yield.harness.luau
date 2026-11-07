@@ -106,6 +106,9 @@ local InfiniteYield = __MODULE__
 
 local YIELD_WARNING = "Infinite yield possible on 'ReplicatedStorage.shared:WaitForChild(\"x\")'"
 local ABORT_PREFIX = "Infinite yield detected, aborting tests: "
+-- The whole of a 60s budget abort, spelled out rather than formatted so the
+-- harness disagrees with the module when the wording drifts.
+local TIMED_OUT_60S = "Timed out after 60s, aborting tests. Raise test.projectTimeout"
 
 -- Calls the watchdog from a thread the harness owns, so a run that parks its
 -- caller can be resumed here the way the engine's warning resumes it in
@@ -326,7 +329,7 @@ local function testElapsedBudgetAbortsTheRun()
 
 	check(outcome.done, "T13: the elapsed budget wakes the parked caller")
 	check(outcome.ok == false, "T13: an elapsed budget is a failure")
-	check(outcome.value == "Timed out after 60s, aborting tests", "T13: the abort names the budget")
+	check(outcome.value == TIMED_OUT_60S, "T13: the abort names the budget and the knob")
 	check(outcome.timedOut == true, "T13: the abort says it was the budget, not a yield")
 	check(cancelled, "T13: an elapsed budget runs the cleanup")
 	check(coroutine.status(parkedThread) == "dead", "T13: the abandoned thunk is closed")
@@ -393,9 +396,62 @@ local function testBudgetCoversWorkBeforeTheFirstYield()
 	check(outcome.done, "T17: a budget spent before the first yield never parks the caller")
 	check(outcome.ok == false, "T17: it is still a failure")
 	check(outcome.timedOut == true, "T17: it is reported as the budget, not a yield")
-	check(outcome.value == "Timed out after 60s, aborting tests", "T17: the abort names the budget")
+	check(outcome.value == TIMED_OUT_60S, "T17: the abort names the budget and the knob")
 	check(cancelled, "T17: it runs the cleanup like any other abandon")
 	check(not isWatching(), "T17: the watch is disconnected")
+end
+
+-- T18: an abandoned run appends what the caller has to say about it, on both
+-- paths, so a report that names a budget or a yield also names the test the run
+-- was in. A run that ends on its own is never asked.
+local function testAbandonNoteIsAppended()
+	local asked = 0
+	local function note()
+		asked += 1
+		return 'Last test seen: "spins" in ReplicatedStorage/wedge.spec (running for 52.3s)'
+	end
+
+	local warned = guardInThread(parkForever, { abandonNote = note })
+	emit(YIELD_WARNING, WARNING)
+	check(
+		warned.value == ABORT_PREFIX .. YIELD_WARNING .. ". " .. note(),
+		"T18: a warned run appends the note, got " .. tostring(warned.value)
+	)
+
+	local expired = guardInThread(parkForever, { abandonNote = note, timeoutMs = 60_000 })
+	elapse()
+	check(
+		expired.value == TIMED_OUT_60S .. ". " .. note(),
+		"T18: an elapsed budget appends it too, got " .. tostring(expired.value)
+	)
+
+	asked = 0
+	local finished = guardInThread(function()
+		return "value"
+	end, { abandonNote = note })
+	check(finished.value == "value", "T18: a run that ended keeps its own value")
+	check(asked == 0, "T18: and is never asked for a note")
+end
+
+-- T19: the note is a description, not a verdict — one that throws or says
+-- nothing leaves the abort exactly as it was.
+local function testUselessNoteLeavesTheAbortAlone()
+	local threw = guardInThread(parkForever, {
+		abandonNote = function()
+			error("the record exploded", 0)
+		end,
+	})
+	emit(YIELD_WARNING, WARNING)
+	check(threw.value == ABORT_PREFIX .. YIELD_WARNING, "T19: a throwing note is dropped")
+
+	local empty = guardInThread(parkForever, {
+		abandonNote = function()
+			return ""
+		end,
+		timeoutMs = 60_000,
+	})
+	elapse()
+	check(empty.value == TIMED_OUT_60S, "T19: an empty note adds no punctuation of its own")
 end
 
 testReturnedValueIsPassedThrough()
@@ -415,5 +471,7 @@ testWarningDisarmsTheBudget()
 testNoBudgetArmsNoDeadline()
 testRunWithinBudgetKeepsItsResult()
 testBudgetCoversWorkBeforeTheFirstYield()
+testAbandonNoteIsAppended()
+testUselessNoteLeavesTheAbortAlone()
 
 print("ALL OK")

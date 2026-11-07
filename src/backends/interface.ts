@@ -1,12 +1,13 @@
 import type { ResolvedConfig } from "../config/schema.ts";
-import type { PerTestCoverageEntry, RawCoverageData } from "../coverage-pipeline/types.ts";
+import type { PerTestCoverageEntry, RawCoverageData } from "../coverage-pipeline/coverage-types.ts";
 import type {
 	StreamingResultEntry,
 	StreamingResultReader,
 } from "../memory-store/sorted-map-client.ts";
 import type { RunProgress } from "../progress/reporter.ts";
 import type { SnapshotWrites } from "../reporter/parser.ts";
-import type { JestResult } from "../types/jest-result.ts";
+import type { CodeBundleArtifact } from "../staging/code-bundle.ts";
+import type { JestResult } from "../types/jest-result-types.ts";
 
 /**
  * A shard request: an explicit session count, `"auto"` (the backend picks the
@@ -14,19 +15,31 @@ import type { JestResult } from "../types/jest-result.ts";
  */
 export type ParallelOption = "auto" | number | undefined;
 
+/** One package or project entry from a task's return envelope. */
 export interface EnvelopeEntry {
+	/** Banner text Jest printed before its results. */
 	bannerOutput?: string | undefined;
+	/** Wall time the entry took inside the task, in milliseconds. */
 	elapsedMs?: number | undefined;
+	/** Game output captured while the entry ran. */
 	gameOutput?: string | undefined;
+	/** Raw Jest JSON output for the entry. */
 	jestOutput: string;
+	/** Workspace package that owns the entry. */
 	pkg?: string | undefined;
+	/** Project display name that owns the entry. */
 	project?: string | undefined;
+	/** Snapshot files the entry wrote. */
 	snapshotWrites?: SnapshotWrites | undefined;
 }
 
+/** One project the backend must run. */
 export interface ProjectJob {
+	/** Resolved config of the project. */
 	config: ResolvedConfig;
+	/** Color for the project label in the reporter. */
 	displayColor?: string | undefined;
+	/** Name that labels the project's results. */
 	displayName: string;
 	/**
 	 * Workspace-mode only: the npm package name (e.g. `@halcyon/foo`) that
@@ -50,9 +63,11 @@ export interface ProjectJob {
 	 * field; it bakes stubs into the place file via the synthesizer.
 	 */
 	runtimeInjectionPaths?: Array<string> | undefined;
+	/** Test files to run for the project. */
 	testFiles: Array<string>;
 }
 
+/** Callbacks that receive work-stealing results while the run continues. */
 export interface StreamingHooks {
 	/**
 	 * Called once per newly-observed SortedMap entry, in the order the
@@ -66,17 +81,32 @@ export interface StreamingHooks {
 	 * enough to feel live without saturating the Open Cloud rate limit.
 	 */
 	pollMs?: number | undefined;
+	/** Reader that polls the SortedMap of streamed results. */
 	reader: StreamingResultReader;
 }
 
+/** Inputs for one backend run. */
 export interface BackendOptions {
+	/**
+	 * Studio workspace runs only: stop on the first failing package
+	 * (`--bail`). Open Cloud bakes it into `scriptFactory`/`scriptOverride`.
+	 */
+	bail?: boolean | undefined;
+	/**
+	 * Open-Cloud-only: the Code Bundle this run's place was split from, which
+	 * the backend uploads once as a binary input and every task rebuilds from.
+	 *
+	 * No production caller sets it: a Shared Place run builds the whole place,
+	 * and only a future Exclusive Place grant may hand the backend a Harness
+	 * Place with the code taken out of it. A run without it needs no rebuild.
+	 */
+	codeBundle?: CodeBundleArtifact | undefined;
+	/** Projects to run. */
 	jobs: Array<ProjectJob>;
 	/**
 	 * Open-Cloud-only: number of concurrent Open Cloud Luau execution sessions
 	 * to fire. Unset or 1 means one session carrying all jobs. `"auto"`
-	 * resolves to min(jobs.length, 3). studio-cli takes unset, 1, or `"auto"`
-	 * and rejects an explicit count above 1; the attached `studio` backend
-	 * ignores the field entirely.
+	 * resolves to min(jobs.length, 3). Both Studio backends ignore it.
 	 */
 	parallel?: ParallelOption;
 	/**
@@ -119,17 +149,6 @@ export interface BackendOptions {
 	 */
 	streaming?: StreamingHooks | undefined;
 	/**
-	 * Per-run SortedMap the Roblox runtime heartbeats the test it is on into.
-	 * Read only after a dispatch failure, to name the test a wedged task never
-	 * came back from; a run without one reports the bare timeout it always did.
-	 *
-	 * The backend bakes it into scripts it generates itself. A caller that
-	 * hands over a `scriptOverride` or a `scriptFactory` builds its own
-	 * script, so it must bake the same id in — passing it here only buys the
-	 * read half.
-	 */
-	testProgressMapId?: string | undefined;
-	/**
 	 * Studio-only, experimental: how many Luau VMs (actor hosts in the plugin
 	 * tree) the run-mode runner splits the configs across. `"auto"` means one
 	 * VM per config. Unset — and any request that resolves to a single VM —
@@ -148,17 +167,27 @@ export interface BackendOptions {
 	workStealing?: boolean | undefined;
 }
 
+/** Time the backend spent on the run. */
 export interface BackendTiming {
+	/** Time spent in execution, in milliseconds. */
 	executionMs: number;
+	/** Time spent uploading the place, in milliseconds. */
 	uploadMs?: number | undefined;
 }
 
+/** Parsed result of one project. */
 export interface ProjectBackendResult {
+	/** Banner text Jest printed before its results. */
 	bannerOutput?: string | undefined;
+	/** Raw coverage hits the project recorded. */
 	coverageData?: RawCoverageData | undefined;
+	/** Color for the project label in the reporter. */
 	displayColor?: string | undefined;
+	/** Name that labels the project's results. */
 	displayName: string;
+	/** Wall time the project took, in milliseconds. */
 	elapsedMs: number;
+	/** Game output captured while the project ran. */
 	gameOutput?: string | undefined;
 	/**
 	 * `"batch"` when this project's game output is the whole run's capture
@@ -166,20 +195,46 @@ export interface ProjectBackendResult {
 	 * `LogService` messages carry no project identity.
 	 */
 	gameOutputScope?: "batch" | undefined;
+	/** Luau-side phase timings, in milliseconds, by phase name. */
 	luauTiming?: Record<string, number> | undefined;
+	/** Coverage hits recorded per test. */
 	perTestCoverage?: Array<PerTestCoverageEntry> | undefined;
+	/** Parsed Jest result. */
 	result: JestResult;
+	/** Time spent on setup before the tests, in milliseconds. */
 	setupMs?: number | undefined;
+	/** Snapshot files the project wrote. */
 	snapshotWrites?: SnapshotWrites | undefined;
 }
 
+/** How often a run raised `NotEmulated` for each member, by `Class.Member`. */
+export type GapTally = Record<string, number>;
+
+/**
+ * Every attribution a run set, each with the gaps it raised, keyed by the
+ * DataModel path Jest names its test files by. `unattributed` holds raises
+ * outside every test file.
+ */
+export interface GapRecord {
+	/** Gaps raised inside each attributed test file or test. */
+	attributed: Array<AttributedGaps>;
+	/** Gaps raised outside every test file. */
+	unattributed: GapTally;
+}
+
+/** One envelope entry as the backend received it, before parsing. */
 export interface RawBackendEntry {
+	/** Envelope entry as the task returned it. */
 	entry: EnvelopeEntry;
+	/** Game output to use when the entry carries none. */
 	fallbackGameOutput?: string | undefined;
 	/** Carried from the envelope; see {@link ProjectBackendResult}. */
 	gameOutputScope?: "batch" | undefined;
+	/** Emulation gaps the entry raised. */
+	gaps?: GapRecord | undefined;
 }
 
+/** Raw output of one backend run. */
 export interface BackendResult {
 	/**
 	 * Workspace `--bail` runs only: indices into the `jobs` array of the
@@ -188,17 +243,44 @@ export interface BackendResult {
 	 * means every job ran.
 	 */
 	bailedJobIndices?: Array<number> | undefined;
+	/** One raw entry per job that ran. */
 	rawResults: Array<RawBackendEntry>;
+	/** Time the backend spent on the run. */
 	timing: BackendTiming;
 }
 
+/** Backend that runs the tests. */
+export type BackendKind = "open-cloud" | "studio" | "studio-cli";
+
+/** Runs test jobs in one execution environment. */
 export interface Backend {
+	/** Releases resources the backend holds. */
 	closeAsync?(): Promise<void> | void;
+	/** Which backend this is. */
 	readonly kind: BackendKind;
+	/** Place the backend dispatches against. */
+	readonly placeInput: PlaceInput;
+	/**
+	 * Runs the jobs and collects their raw results.
+	 * @param options - Jobs and run settings.
+	 * @returns Raw entries and timing of the run.
+	 */
 	runTestsAsync(options: BackendOptions): Promise<BackendResult>;
 }
 
-type BackendKind = "open-cloud" | "studio" | "studio-cli";
+/**
+ * The gaps raised in one test file, or in one test of it: its full name and its
+ * 1-based position among the file's test results.
+ */
+type AttributedGaps =
+	| { file: string; gaps: GapTally; position: number; test: string }
+	| { file: string; gaps: GapTally; position?: undefined; test?: undefined };
+
+/**
+ * The place a backend dispatches against: the one the run builds before
+ * dispatch (`built`), one the backend builds itself (`own`), or none.
+ */
+type PlaceInput = "built" | "none" | "own";
 
 /**
  * Whether this is a workspace (multi-package) run. Workspace jobs each carry
@@ -209,6 +291,8 @@ type BackendKind = "open-cloud" | "studio" | "studio-cli";
  * configs path. `buildWorkspaceEntries` then fails fast if a job is missing
  * `pkg`, so a malformed (mixed) array surfaces as a clear error rather than a
  * bad payload.
+ * @param jobs - Every job the run dispatches.
+ * @returns True when any job carries a package name.
  */
 export function isWorkspaceRun(jobs: ReadonlyArray<ProjectJob>): boolean {
 	return jobs.some((job) => job.pkg !== undefined);
@@ -217,17 +301,9 @@ export function isWorkspaceRun(jobs: ReadonlyArray<ProjectJob>): boolean {
 /**
  * A request to shard across multiple sessions: `"auto"` (the backend picks a
  * count) or an explicit count > 1.
+ * @param parallel - Requested shard count.
+ * @returns True for `"auto"` or a count above 1.
  */
 export function isShardedParallel(parallel: ParallelOption): parallel is "auto" | number {
 	return parallel === "auto" || (typeof parallel === "number" && parallel > 1);
-}
-
-/**
- * A demand for more than one session, spelled out by hand. `"auto"` is not
- * one: it asks the backend for the count the run needs, and a backend driving
- * a single Studio instance needs 1 — so auto runs serially rather than
- * conflicting with it. This is the predicate every serial-backend guard reads.
- */
-export function isExplicitMultiShard(parallel: ParallelOption): parallel is number {
-	return typeof parallel === "number" && parallel > 1;
 }

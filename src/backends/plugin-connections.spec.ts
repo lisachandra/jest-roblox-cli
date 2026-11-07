@@ -1,18 +1,17 @@
 import { fromPartial } from "@total-typescript/shoehorn";
 
 import { Buffer } from "node:buffer";
-import { assert, describe, expect, it } from "vitest";
+import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { WebSocket, WebSocketServer } from "ws";
 
+import { MockWebSocketServer } from "#test/mocks/mock-web-socket-server.ts";
+import { MockWebSocket } from "#test/mocks/mock-web-socket.ts";
 import packageJson from "../../package.json" with { type: "json" };
-import { MockWebSocketServer } from "../../test/mocks/mock-web-socket-server.ts";
-import { MockWebSocket } from "../../test/mocks/mock-web-socket.ts";
 import {
 	closePluginServer,
 	describePluginMismatch,
 	type PluginCandidate,
 	PluginConnectionPool,
-	type PluginHello,
 } from "./plugin-connections.ts";
 
 const EXPECTED_VERSION = 6;
@@ -25,7 +24,18 @@ function makePool(): { pool: PluginConnectionPool; wss: MockWebSocketServer } {
 	return { pool: new PluginConnectionPool(fromPartial<WebSocketServer>(wss)), wss };
 }
 
-/** Connect without announcing — every plugin predating the handshake. */
+function useFakeTimers(): void {
+	vi.useFakeTimers();
+	onTestFinished(() => {
+		vi.useRealTimers();
+	});
+}
+
+/**
+ * Connect without announcing — every plugin predating the handshake.
+ * @param wss - Server the socket connects to.
+ * @returns The connected socket.
+ */
 function connectSilent(wss: MockWebSocketServer): MockWebSocket {
 	const socket = new MockWebSocket();
 	wss.emit("connection", socket);
@@ -42,7 +52,12 @@ async function waitAsync(ms: number): Promise<void> {
 	});
 }
 
-/** Connect a socket and let it announce itself, the way a real plugin does. */
+/**
+ * Connect a socket and let it announce itself, the way a real plugin does.
+ * @param wss - Server the socket connects to.
+ * @param hello - Fields that override the default announcement.
+ * @returns The connected socket.
+ */
 function connectPlugin(
 	wss: MockWebSocketServer,
 	hello: Record<string, unknown> = {},
@@ -152,6 +167,28 @@ describe(PluginConnectionPool, () => {
 		const selection = await selecting;
 
 		expect(selection.kind).toBe("incompatible");
+	});
+
+	it("should not restart the grace window when another stale plugin connects", async () => {
+		expect.assertions(2);
+
+		useFakeTimers();
+		const { pool, wss } = makePool();
+		const selecting = pool.selectAsync({ ...REQUEST, connectTimeoutMs: 600_000, graceMs: 10 });
+		const settled = vi.fn<(selection: unknown) => void>();
+		void selecting.then(settled);
+		connectPlugin(wss, { protocolVersion: EXPECTED_VERSION - 1 });
+
+		await vi.advanceTimersByTimeAsync(9);
+		connectPlugin(wss, { protocolVersion: EXPECTED_VERSION - 2 });
+
+		expect(vi.getTimerCount()).toBe(1);
+
+		await vi.advanceTimersByTimeAsync(1);
+
+		expect(settled).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ kind: "incompatible" }),
+		);
 	});
 
 	it("should give a late plugin the whole grace window past the connect timeout", async () => {
@@ -359,12 +396,14 @@ describe(closePluginServer, () => {
 
 		closePluginServer(fromPartial<WebSocketServer>(wss));
 
-		expect(socket.terminate).toHaveBeenCalledOnce();
-		expect(wss.close).toHaveBeenCalledOnce();
+		expect(socket.terminate).toHaveBeenCalledExactlyOnceWith();
+		expect(wss.close).toHaveBeenCalledExactlyOnceWith();
 	});
 });
 
-function candidate(hello: Partial<PluginHello> & { protocolVersion: number }): PluginCandidate {
+function candidate(
+	hello: Partial<NonNullable<PluginCandidate["hello"]>> & { protocolVersion: number },
+): PluginCandidate {
 	return {
 		hello: { pluginName: "JestRobloxRunner", ...hello, type: "hello" },
 		socket: fromPartial<WebSocket>(new MockWebSocket()),

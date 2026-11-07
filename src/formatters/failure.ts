@@ -2,7 +2,16 @@ import assert from "node:assert";
 import color from "tinyrainbow";
 
 import type { MappedLocation, SourceMapper } from "../source-mapper/index.ts";
-import { execErrorTitle, type TestCaseResult, type TestFileResult } from "../types/jest-result.ts";
+import { execErrorTitle } from "../types/exec-error-file.ts";
+import type { TestCaseResult, TestFileResult } from "../types/jest-result-types.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
+import {
+	cleanExecErrorMessage,
+	getExecErrorHint,
+	type ParsedError,
+	parseErrorMessage,
+} from "./failure-message.ts";
 import {
 	type FailureContext,
 	type FormatOptions,
@@ -12,121 +21,115 @@ import {
 import { resolveSourceSnippets } from "./snippets.ts";
 import { createStyles, type Styles } from "./styles.ts";
 
-const SNAPSHOT_HEADER = /^- Snapshot\s+- \d+/;
-const EXPECTED_VALUE = /Expected\b.*?:\s*(.+)/;
-const RECEIVED_VALUE = /Received\b.*?:\s*(.+)/;
-const ROBLOX_PATH_CHAIN = /^(?:[A-Za-z][\w.@-]*:\d+:\s*)+/;
-
-const EXEC_ERROR_HINTS: Array<[pattern: RegExp, hint: string]> = [
-	[
-		/loadstring\(\) is not available/,
-		'loadstring() must be enabled for Jest to run. Add to your project.json:\n\n  "ServerScriptService": {\n    "$properties": {\n      "LoadStringEnabled": true\n    }\n  }',
-	],
-];
-
-interface ParsedError {
-	expected?: string | undefined;
-	message: string;
-	received?: string | undefined;
-	snapshotDiff?: string | undefined;
-}
-
-export function getExecErrorHint(message: string): string | undefined {
-	for (const [pattern, hint] of EXEC_ERROR_HINTS) {
-		if (pattern.test(message)) {
-			return hint;
-		}
-	}
-
-	return undefined;
-}
-
-export function parseErrorMessage(message: string): ParsedError {
-	const lines = message.split("\n");
-	const firstLine = lines[0];
-	assert(firstLine !== undefined, "split always returns ≥1 element");
-
-	const snapshotHeaderIndex = lines.findIndex((line) => SNAPSHOT_HEADER.test(line));
-	if (snapshotHeaderIndex !== -1) {
-		const diffLines: Array<string> = [];
-		for (let index = snapshotHeaderIndex; index < lines.length; index++) {
-			// eslint-disable-next-line ts/no-non-null-assertion -- Loop condition
-			const line = lines[index]!;
-			if (line.startsWith("[string ")) {
-				break;
-			}
-
-			diffLines.push(line);
-		}
-
-		return {
-			message: firstLine,
-			snapshotDiff: diffLines.join("\n").trimEnd(),
-		};
-	}
-
-	const expectedMatch = message.match(EXPECTED_VALUE);
-	const receivedMatch = message.match(RECEIVED_VALUE);
-	return {
-		expected: expectedMatch?.[1],
-		message: firstLine,
-		received: receivedMatch?.[1],
-	};
+/**
+ * Inputs of `formatFileFailures`.
+ */
+export interface FormatFileFailuresOptions {
+	/**
+	 * Shared failure numbering, advanced once per rendered failure.
+	 */
+	failureCtx: FailureContext;
+	/**
+	 * File whose failed tests to render.
+	 */
+	file: TestFileResult;
+	/**
+	 * Format options.
+	 */
+	options: FormatOptions;
+	/**
+	 * Palette to render with.
+	 */
+	styles: Styles;
 }
 
 /**
- * Extracts the meaningful error message from a Jest `failureMessage` string.
- * Strips the "● Test suite failed to run" header, Roblox DataModel path
- * chains, and stack trace lines.
+ * Inputs of `formatExecErrorDetail`.
  */
-export function cleanExecErrorMessage(raw: string): string {
-	if (raw === "") {
-		return "";
-	}
-
-	const lines = raw.split("\n");
-
-	// Find the first content line after the "● Test suite failed to run" header
-	let contentLine: string | undefined;
-	let isPastHeader = false;
-	for (const line of lines) {
-		const trimmed = line.trim();
-		if (trimmed.startsWith("●")) {
-			isPastHeader = true;
-			continue;
-		}
-
-		if (isPastHeader && trimmed !== "") {
-			contentLine = trimmed;
-			break;
-		}
-	}
-
-	if (contentLine === undefined) {
-		return raw.trim();
-	}
-
-	// Strip chained Roblox path prefixes: "Path:123: Path:456: actual message"
-	return contentLine.replace(ROBLOX_PATH_CHAIN, "");
+export interface FormatExecErrorDetailOptions {
+	/**
+	 * Shared failure numbering, advanced by one.
+	 */
+	failureCtx: FailureContext;
+	/**
+	 * File whose suite threw; `failureMessage` must be set.
+	 */
+	file: TestFileResult;
+	/**
+	 * Root the test file is shown relative to.
+	 */
+	rootDir: string;
+	/**
+	 * Maps the test file to the path it is shown by.
+	 */
+	sourceMapper?: SourceMapper | undefined;
+	/**
+	 * Palette to render with.
+	 */
+	styles: Styles;
 }
 
+/**
+ * Render one failed test: the FAIL header, each message with its diff and snippets, and an optional numbered separator.
+ * @param options - Failed test, its display path, palette and numbering.
+ * @returns The indented failure block.
+ */
 export function formatFailure({
 	failureIndex,
 	filePath,
+	fileSystem = nodeFileSystem,
+	rootDir,
 	showLuau = false,
 	sourceMapper,
+	sourcePath,
 	styles,
 	test,
 	totalFailures,
 	useColor = true,
 }: {
+	/**
+	 * Number shown in the separator; needs `totalFailures`.
+	 */
 	failureIndex?: number | undefined;
+	/**
+	 * Display path that leads the header.
+	 */
 	filePath?: string | undefined;
+	/**
+	 * File system that snippets are read through.
+	 */
+	fileSystem?: FileSystem;
+	/**
+	 * Root snippet paths are shown relative to; full paths when absent.
+	 */
+	rootDir?: string | undefined;
+	/**
+	 * Show the Luau source beside mapped TypeScript snippets.
+	 */
 	showLuau?: boolean | undefined;
+	/**
+	 * Maps Luau locations in the messages back to TypeScript source.
+	 */
 	sourceMapper?: SourceMapper | undefined;
+	/**
+	 * Path snippets read the test file from.
+	 */
+	sourcePath?: string | undefined;
+	/**
+	 * Palette to render with; built from `useColor` when absent.
+	 */
 	styles?: Styles | undefined;
+	/**
+	 * Failed test to render.
+	 */
 	test: TestCaseResult;
+	/**
+	 * Failure total shown in the separator; needs `failureIndex`.
+	 */
 	totalFailures?: number | undefined;
+	/**
+	 * Emit ANSI color; defaults to true.
+	 */
 	useColor?: boolean | undefined;
 }): string {
 	const st = styles ?? createStyles(useColor);
@@ -144,7 +147,9 @@ export function formatFailure({
 	for (const originalMessage of test.failureMessages) {
 		lines.push(
 			...formatFailureMessage(originalMessage, {
-				filePath,
+				filePath: sourcePath,
+				fileSystem,
+				rootDir,
 				showLuau,
 				sourceMapper,
 				styles: st,
@@ -162,15 +167,19 @@ export function formatFailure({
 	return lines.map((line) => `  ${line}`).join("\n");
 }
 
-/** Renders every failed test case in one file, advancing the shared counter. */
-export function formatFileFailures(
-	file: TestFileResult,
-	options: FormatOptions,
-	styles: Styles,
-	failureCtx: FailureContext,
-): string {
+/**
+ * Renders every failed test case in one file, advancing the shared counter.
+ * @param options - File, format options, palette and shared numbering.
+ * @returns The failure blocks joined by newlines.
+ */
+export function formatFileFailures({
+	failureCtx,
+	file,
+	options,
+	styles,
+}: FormatFileFailuresOptions): string {
 	const lines: Array<string> = [];
-	const displayPath = resolveDisplayPath(file.testFilePath, options.sourceMapper);
+	const displayPath = resolveDisplayPath(file.testFilePath, options);
 
 	for (const testCase of file.testResults) {
 		if (testCase.status !== "failed") {
@@ -184,8 +193,10 @@ export function formatFileFailures(
 			formatFailure({
 				failureIndex: index,
 				filePath: displayPath,
+				rootDir: options.rootDir,
 				showLuau: options.showLuau,
 				sourceMapper: options.sourceMapper,
+				sourcePath: file.testFilePath,
 				styles,
 				test: testCase,
 				totalFailures: failureCtx.totalFailures,
@@ -200,18 +211,21 @@ export function formatFileFailures(
 /**
  * Renders a file that never got as far as running tests — the suite itself
  * threw — as one failure block in the shared numbering.
+ * @param options - File, source mapper, palette and shared numbering.
+ * @returns The failure block.
  */
-export function formatExecErrorDetail(
-	file: TestFileResult,
-	styles: Styles,
-	failureCtx: FailureContext,
-	sourceMapper?: SourceMapper,
-): string {
+export function formatExecErrorDetail({
+	failureCtx,
+	file,
+	rootDir,
+	sourceMapper,
+	styles,
+}: FormatExecErrorDetailOptions): string {
 	const index = failureCtx.currentIndex;
 	failureCtx.currentIndex++;
 
-	assert(file.failureMessage !== undefined, "exec error files have failureMessage");
-	const displayPath = resolveDisplayPath(file.testFilePath, sourceMapper);
+	assert(file.failureMessage !== undefined);
+	const displayPath = resolveDisplayPath(file.testFilePath, { rootDir, sourceMapper });
 	const errorMessage = cleanExecErrorMessage(file.failureMessage);
 	const separator = styles.dim(
 		styles.status.fail(formatFailureSeparator(index, failureCtx.totalFailures)),
@@ -240,14 +254,27 @@ export function formatExecErrorDetail(
 	return lines.join("\n");
 }
 
-// The `⎯` rule fills the terminal up to the `[n/total]` counter it ends with.
+/**
+ * The `⎯` rule fills the terminal up to the `[n/total]` counter it ends with.
+ * @param failureIndex - Number of this failure.
+ * @param totalFailures - Failures in the run.
+ * @returns The separator line.
+ */
 function formatFailureSeparator(failureIndex: number, totalFailures: number): string {
 	const counter = `[${failureIndex}/${totalFailures}]`;
 	const fillWidth = Math.max(1, getTerminalWidth() - counter.length - 3);
 	return `${"⎯".repeat(fillWidth)}${counter}⎯`;
 }
 
-function formatErrorLine(parsed: ParsedError, styles: Styles, useColor: boolean): string {
+function formatErrorLine({
+	parsed,
+	styles,
+	useColor,
+}: {
+	parsed: ParsedError;
+	styles: Styles;
+	useColor: boolean;
+}): string {
 	if (useColor && parsed.message.startsWith("Error:")) {
 		return styles.status.fail(color.bold("Error:") + parsed.message.slice(6));
 	}
@@ -289,12 +316,16 @@ function formatFailureMessage(
 	originalMessage: string,
 	{
 		filePath,
+		fileSystem,
+		rootDir,
 		showLuau,
 		sourceMapper,
 		styles,
 		useColor,
 	}: {
 		filePath?: string | undefined;
+		fileSystem: FileSystem;
+		rootDir?: string | undefined;
 		showLuau: boolean;
 		sourceMapper?: SourceMapper | undefined;
 		styles: Styles;
@@ -312,13 +343,15 @@ function formatFailureMessage(
 	const parsed = parseErrorMessage(originalMessage);
 
 	return [
-		formatErrorLine(parsed, styles, useColor),
+		formatErrorLine({ parsed, styles, useColor }),
 		...formatDiffBlock(parsed, styles),
 		...resolveSourceSnippets({
 			filePath,
+			fileSystem,
 			hasSnapshotDiff: parsed.snapshotDiff !== undefined,
 			mappedLocations,
 			message,
+			rootDir,
 			showLuau,
 			sourceMapper,
 			styles,
@@ -327,8 +360,13 @@ function formatFailureMessage(
 	];
 }
 
-// Two spaces on every content line; a blank one is left alone so the block
-// carries neither trailing whitespace nor colour codes wrapping nothing.
+/**
+ * Two spaces on every content line; a blank one is left alone so the block
+ * carries neither trailing whitespace nor colour codes wrapping nothing.
+ * @param message - Message to indent.
+ * @param styles - Palette to paint lines with.
+ * @returns The indented lines.
+ */
 function indentMessage(message: string, styles: Styles): Array<string> {
 	return message.split("\n").map((line) => (line === "" ? "" : `  ${styles.status.fail(line)}`));
 }

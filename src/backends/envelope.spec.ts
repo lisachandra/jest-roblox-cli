@@ -1,15 +1,11 @@
 import { assert, describe, expect, it } from "vitest";
 
-import { DEFAULT_CONFIG } from "../config/schema.ts";
-import type { RawCoverageData } from "../coverage-pipeline/types.ts";
-import { LuauScriptError, type SnapshotWrites } from "../reporter/parser.ts";
-import type { JestResult } from "../types/jest-result.ts";
-import {
-	buildProjectResult,
-	decodeEnvelope,
-	isEnvelopeDeferred,
-	parseEnvelope,
-} from "./envelope.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
+import type { RawCoverageData } from "../coverage-pipeline/coverage-types.ts";
+import { LuauScriptError } from "../reporter/luau-script-error.ts";
+import type { SnapshotWrites } from "../reporter/parser.ts";
+import type { JestResult } from "../types/jest-result-types.ts";
+import { buildProjectResult, decodeEnvelope, isEnvelopeDeferred } from "./envelope.ts";
 import type { EnvelopeEntry, ProjectJob } from "./interface.ts";
 
 interface RunnerFieldOverrides {
@@ -36,7 +32,7 @@ function successJest(overrides: JestPayloadOverrides = {}): string {
 
 function job(displayName: string, overrides: Partial<ProjectJob> = {}): ProjectJob {
 	return {
-		config: DEFAULT_CONFIG,
+		config: createResolvedConfig(),
 		displayColor: `${displayName}-color`,
 		displayName,
 		testFiles: [`${displayName}/test.spec.ts`],
@@ -62,13 +58,13 @@ function captureThrown(action: () => void): Error {
 	throw new Error("Expected the action to throw");
 }
 
-describe(parseEnvelope, () => {
+describe("envelope entries", () => {
 	it("should return the entries array for a valid single-entry envelope", () => {
 		expect.assertions(1);
 
 		const envelope = JSON.stringify({ entries: [{ jestOutput: '{"some":"payload"}' }] });
 
-		const result = parseEnvelope(envelope);
+		const result = decodeEnvelope(envelope).entries;
 
 		expect(result).toStrictEqual([{ jestOutput: '{"some":"payload"}' }]);
 	});
@@ -83,7 +79,7 @@ describe(parseEnvelope, () => {
 			],
 		});
 
-		const result = parseEnvelope(envelope);
+		const result = decodeEnvelope(envelope).entries;
 
 		expect(result).toStrictEqual([
 			{ elapsedMs: 12, jestOutput: '{"a":1}' },
@@ -101,7 +97,7 @@ describe(parseEnvelope, () => {
 			],
 		});
 
-		const result = parseEnvelope(envelope);
+		const result = decodeEnvelope(envelope).entries;
 
 		expect(result).toStrictEqual([
 			{ jestOutput: '{"a":1}', pkg: "@halcyon/foo", project: "client" },
@@ -124,7 +120,7 @@ describe(parseEnvelope, () => {
 			],
 		});
 
-		const result = parseEnvelope(envelope);
+		const result = decodeEnvelope(envelope).entries;
 
 		expect(result).toStrictEqual([
 			{
@@ -142,7 +138,7 @@ describe(parseEnvelope, () => {
 
 		const barePayload = successJest();
 
-		const result = parseEnvelope(barePayload);
+		const result = decodeEnvelope(barePayload).entries;
 
 		expect(result).toStrictEqual([{ jestOutput: barePayload }]);
 	});
@@ -156,7 +152,7 @@ describe(parseEnvelope, () => {
 		const errorPayload = JSON.stringify({ err: "boom", success: false });
 
 		const thrown = captureThrown(() => {
-			parseEnvelope(errorPayload);
+			decodeEnvelope(errorPayload).entries;
 		});
 
 		assert(thrown instanceof LuauScriptError);
@@ -177,7 +173,7 @@ describe(parseEnvelope, () => {
 		const errorPayload = JSON.stringify({ err: promiseTrace, success: false });
 
 		const thrown = captureThrown(() => {
-			parseEnvelope(errorPayload);
+			decodeEnvelope(errorPayload).entries;
 		});
 
 		assert(thrown instanceof LuauScriptError);
@@ -188,7 +184,7 @@ describe(parseEnvelope, () => {
 	it("should propagate JSON.parse errors when the input is not valid JSON", () => {
 		expect.assertions(1);
 
-		expect(() => parseEnvelope("{not valid json")).toThrow(SyntaxError);
+		expect(() => decodeEnvelope("{not valid json").entries).toThrow(SyntaxError);
 	});
 });
 
@@ -196,11 +192,11 @@ describe(buildProjectResult, () => {
 	it("should map a successful entry to ProjectBackendResult fields populated from parseJestOutput", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(
-			entry({ elapsedMs: 42, jestOutput: successJest({ numPassedTests: 3 }) }),
-			job("alpha"),
-			undefined,
-		);
+		const result = buildProjectResult({
+			...entry({ elapsedMs: 42, jestOutput: successJest({ numPassedTests: 3 }) }),
+			fallbackGameOutput: undefined,
+			job: job("alpha"),
+		});
 
 		expect(result).toMatchObject({
 			displayColor: "alpha-color",
@@ -218,11 +214,11 @@ describe(buildProjectResult, () => {
 	it("should use the per-entry gameOutput when present", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(
-			entry({ gameOutput: "per-entry-output" }),
-			job("alpha"),
-			"fallback-output",
-		);
+		const result = buildProjectResult({
+			...entry({ gameOutput: "per-entry-output" }),
+			fallbackGameOutput: "fallback-output",
+			job: job("alpha"),
+		});
 
 		expect(result.gameOutput).toBe("per-entry-output");
 	});
@@ -230,7 +226,11 @@ describe(buildProjectResult, () => {
 	it("should fall back to fallbackGameOutput when the entry has no gameOutput", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(entry(), job("alpha"), "fallback-output");
+		const result = buildProjectResult({
+			...entry(),
+			fallbackGameOutput: "fallback-output",
+			job: job("alpha"),
+		});
 
 		expect(result.gameOutput).toBe("fallback-output");
 	});
@@ -238,7 +238,11 @@ describe(buildProjectResult, () => {
 	it("should default elapsedMs to 0 when the entry has no elapsedMs", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(entry(), job("alpha"), undefined);
+		const result = buildProjectResult({
+			...entry(),
+			fallbackGameOutput: undefined,
+			job: job("alpha"),
+		});
 
 		expect(result.elapsedMs).toBe(0);
 	});
@@ -246,11 +250,11 @@ describe(buildProjectResult, () => {
 	it("should pass through job.displayColor and job.displayName", () => {
 		expect.assertions(2);
 
-		const result = buildProjectResult(
-			entry(),
-			job("alpha", { displayColor: "custom-color" }),
-			undefined,
-		);
+		const result = buildProjectResult({
+			...entry(),
+			fallbackGameOutput: undefined,
+			job: job("alpha", { displayColor: "custom-color" }),
+		});
 
 		expect(result.displayName).toBe("alpha");
 		expect(result.displayColor).toBe("custom-color");
@@ -259,11 +263,11 @@ describe(buildProjectResult, () => {
 	it("should convert setupSeconds to setupMs by multiplying by 1000 and rounding", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(
-			entry({ jestOutput: successJest({ runner: { setup: 1.2345 } }) }),
-			job("alpha"),
-			undefined,
-		);
+		const result = buildProjectResult({
+			...entry({ jestOutput: successJest({ runner: { setup: 1.2345 } }) }),
+			fallbackGameOutput: undefined,
+			job: job("alpha"),
+		});
 
 		expect(result.setupMs).toBe(1235);
 	});
@@ -271,7 +275,11 @@ describe(buildProjectResult, () => {
 	it("should leave setupMs undefined when parseJestOutput returns no setupSeconds", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(entry(), job("alpha"), undefined);
+		const result = buildProjectResult({
+			...entry(),
+			fallbackGameOutput: undefined,
+			job: job("alpha"),
+		});
 
 		expect(result.setupMs).toBeUndefined();
 	});
@@ -279,8 +287,8 @@ describe(buildProjectResult, () => {
 	it("should pass through coverageData, luauTiming, and snapshotWrites from parseJestOutput", () => {
 		expect.assertions(3);
 
-		const result = buildProjectResult(
-			entry({
+		const result = buildProjectResult({
+			...entry({
 				jestOutput: successJest({
 					runner: {
 						coverage: { "src/foo.luau": { s: { 1: 5 } } },
@@ -289,9 +297,9 @@ describe(buildProjectResult, () => {
 					},
 				}),
 			}),
-			job("alpha"),
-			undefined,
-		);
+			fallbackGameOutput: undefined,
+			job: job("alpha"),
+		});
 
 		expect(result.coverageData).toStrictEqual({
 			"src/foo.luau": { s: { "1": 5 } },
@@ -305,8 +313,8 @@ describe(buildProjectResult, () => {
 	it("should prefer entry-level snapshotWrites over the parsed-from-jestOutput value", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(
-			entry({
+		const result = buildProjectResult({
+			...entry({
 				jestOutput: successJest({
 					runner: {
 						snapshotWrites: { "stale/inner.snap": "ignored" },
@@ -314,9 +322,9 @@ describe(buildProjectResult, () => {
 				}),
 				snapshotWrites: { "fresh/outer.snap": "wins" },
 			}),
-			job("alpha"),
-			undefined,
-		);
+			fallbackGameOutput: undefined,
+			job: job("alpha"),
+		});
 
 		expect(result.snapshotWrites).toStrictEqual({ "fresh/outer.snap": "wins" });
 	});
@@ -324,8 +332,8 @@ describe(buildProjectResult, () => {
 	it("should fall back to parsed snapshotWrites when entry-level is an empty object", () => {
 		expect.assertions(1);
 
-		const result = buildProjectResult(
-			entry({
+		const result = buildProjectResult({
+			...entry({
 				jestOutput: successJest({
 					runner: {
 						snapshotWrites: { "legacy.snap": "kept" },
@@ -333,9 +341,9 @@ describe(buildProjectResult, () => {
 				}),
 				snapshotWrites: {},
 			}),
-			job("alpha"),
-			undefined,
-		);
+			fallbackGameOutput: undefined,
+			job: job("alpha"),
+		});
 
 		expect(result.snapshotWrites).toStrictEqual({ "legacy.snap": "kept" });
 	});
@@ -346,11 +354,11 @@ describe(buildProjectResult, () => {
 		const errorPayload = JSON.stringify({ err: "boom", success: false });
 
 		const thrown = captureThrown(() => {
-			buildProjectResult(
-				entry({ jestOutput: errorPayload }),
-				job("alpha"),
-				"fallback-output",
-			);
+			buildProjectResult({
+				...entry({ jestOutput: errorPayload }),
+				fallbackGameOutput: "fallback-output",
+				job: job("alpha"),
+			});
 		});
 
 		assert(thrown instanceof LuauScriptError);
@@ -377,11 +385,11 @@ describe(buildProjectResult, () => {
 		const errorPayload = JSON.stringify({ err: "Exited with code: 1", success: false });
 
 		const thrown = captureThrown(() => {
-			buildProjectResult(
-				entry({ gameOutput: capturedStdout, jestOutput: errorPayload }),
-				job("alpha"),
-				"fallback-not-used",
-			);
+			buildProjectResult({
+				...entry({ gameOutput: capturedStdout, jestOutput: errorPayload }),
+				fallbackGameOutput: "fallback-not-used",
+				job: job("alpha"),
+			});
 		});
 
 		assert(thrown instanceof LuauScriptError);
@@ -408,7 +416,11 @@ describe(buildProjectResult, () => {
 		const errorPayload = JSON.stringify({ err: promiseTrace, success: false });
 
 		const thrown = captureThrown(() => {
-			buildProjectResult(entry({ jestOutput: errorPayload }), job("alpha"), "No tests found");
+			buildProjectResult({
+				...entry({ jestOutput: errorPayload }),
+				fallbackGameOutput: "No tests found",
+				job: job("alpha"),
+			});
 		});
 
 		assert(thrown instanceof LuauScriptError);
@@ -421,7 +433,11 @@ describe(buildProjectResult, () => {
 		expect.assertions(2);
 
 		const thrown = captureThrown(() => {
-			buildProjectResult(entry({ jestOutput: "{}" }), job("alpha"), "fallback-output");
+			buildProjectResult({
+				...entry({ jestOutput: "{}" }),
+				fallbackGameOutput: "fallback-output",
+				job: job("alpha"),
+			});
 		});
 
 		expect(thrown).toBeInstanceOf(Error);
@@ -479,34 +495,36 @@ describe("timed-out entries", () => {
 		expect.assertions(2);
 
 		const thrown = captureThrown(() => {
-			buildProjectResult(
-				entry({
+			buildProjectResult({
+				...entry({
 					jestOutput: JSON.stringify({
-						err: "Timed out after 60s, aborting tests",
+						err: "Timed out after 60s, aborting tests. Raise test.projectTimeout",
 						runner: { abandon: "timeout" },
 						success: false,
 					}),
 				}),
-				job("alpha"),
-				undefined,
-			);
+				fallbackGameOutput: undefined,
+				job: job("alpha"),
+			});
 		});
 
 		assert(thrown instanceof LuauScriptError);
 
 		expect(thrown.timedOut).toBeTrue();
-		expect(thrown.message).toBe("Timed out after 60s, aborting tests");
+		expect(thrown.message).toBe(
+			"Timed out after 60s, aborting tests. Raise test.projectTimeout",
+		);
 	});
 
 	it("should leave an ordinary script failure unmarked", () => {
 		expect.assertions(1);
 
 		const thrown = captureThrown(() => {
-			buildProjectResult(
-				entry({ jestOutput: JSON.stringify({ err: "boom", success: false }) }),
-				job("alpha"),
-				undefined,
-			);
+			buildProjectResult({
+				...entry({ jestOutput: JSON.stringify({ err: "boom", success: false }) }),
+				fallbackGameOutput: undefined,
+				job: job("alpha"),
+			});
 		});
 
 		assert(thrown instanceof LuauScriptError);

@@ -3,19 +3,24 @@
  * summaries, detailed failures and totals produced by the sibling modules into
  * the single-project and multi-project reports.
  *
- * It also stays the barrel every consumer imports from — `output.spec.ts`
- * whole-module-automocks this file, and `index.ts` re-exports its public API —
- * so anything that moved to a sibling is re-exported here.
+ * It also re-exports the sibling functions that `index.ts` and modules outside
+ * `formatters/` import through it.
  */
 
 import { mergeJestTotals, mergeSnapshotSummaries } from "../results/merge.ts";
-import { hasExecError, type JestResult } from "../types/jest-result.ts";
-import type { TimingResult } from "../types/timing.ts";
+import { hasExecError } from "../types/exec-error-file.ts";
+import type { JestResult } from "../types/jest-result-types.ts";
+import type { TimingResult } from "../types/timing-types.ts";
 import { parseGameOutput } from "../utils/game-output.ts";
 import { formatExecErrorDetail, formatFileFailures } from "./failure.ts";
 import { computeProjectStats, formatFileSummary } from "./file-summary.ts";
 import { formatGameOutputBlock } from "./game-output.ts";
-import type { FailureContext, FormatOptions, FormatterProjectEntry } from "./shared.ts";
+import {
+	type FailureContext,
+	type FormatOptions,
+	type FormatterProjectEntry,
+	withPackageRoot,
+} from "./shared.ts";
 import { createStyles, formatProjectBadge, type Styles } from "./styles.ts";
 import {
 	countTestBuckets,
@@ -28,27 +33,60 @@ import {
 } from "./summary.ts";
 
 // Re-exported from its home in `results/merge.ts` so the formatter stays the
-// import site every consumer already knows (and `output.spec.ts`'s whole-module
-// automock of this file keeps covering it).
+// import site every consumer already knows.
 export { mergeSnapshotSummaries } from "../results/merge.ts";
-export {
-	cleanExecErrorMessage,
-	formatFailure,
-	getExecErrorHint,
-	parseErrorMessage,
-} from "./failure.ts";
-export { resolveDisplayPath } from "./shared.ts";
+export { formatFailure } from "./failure.ts";
 export type { FormatOptions, FormatterProjectEntry } from "./shared.ts";
-export { formatSourceSnippet, parseSourceLocation } from "./snippets.ts";
-export { formatProjectBadge } from "./styles.ts";
-export { formatFailedTestsHeader, formatRunHeader, formatTestSummary } from "./summary.ts";
+export { formatRunHeader, formatTestSummary } from "./summary.ts";
+
+/**
+ * Inputs of `formatResult`.
+ */
+export interface FormatResultOptions {
+	/**
+	 * Format options.
+	 */
+	options: FormatOptions;
+	/**
+	 * Merged result to report.
+	 */
+	result: JestResult;
+	/**
+	 * Run timing for the summary.
+	 */
+	timing: TimingResult;
+}
+
+/**
+ * Inputs of `formatMultiProjectResult`.
+ */
+export interface FormatMultiProjectResultOptions {
+	/**
+	 * Format options.
+	 */
+	options: FormatOptions;
+	/**
+	 * Each project's name, color, Game Output and result.
+	 */
+	projects: Array<FormatterProjectEntry>;
+	/**
+	 * Run timing for the summary.
+	 */
+	timing: TimingResult;
+}
+
+interface ReportPhaseOptions {
+	options: FormatOptions;
+	result: JestResult;
+	styles: Styles;
+}
 
 interface ProjectHeaderOptions {
 	displayColor?: string | undefined;
 	displayName: string;
 	result: JestResult;
-	styles?: Styles | undefined;
-	useColor?: boolean | undefined;
+	styles: Styles;
+	useColor: boolean;
 }
 
 interface TypecheckReportOptions {
@@ -63,23 +101,24 @@ interface ProjectSectionOptions {
 	failureCtx: FailureContext;
 	gameOutput?: string | undefined;
 	options: FormatOptions;
+	packageRoot?: string | undefined;
 	result: JestResult;
-	styles?: Styles | undefined;
+	styles: Styles;
 }
 
-// No Game Output block here, deliberately: this renders a MERGED JestResult
-// with no project identity, and Game Output is per-project. Every runtime
-// project result reaches the block through formatProjectSection; the only
-// production path left on this function is the typecheck-only report.
-export function formatResult(
-	result: JestResult,
-	timing: TimingResult,
-	options: FormatOptions,
-): string {
+/**
+ * No Game Output block here, deliberately: this renders a MERGED JestResult
+ * with no project identity, and Game Output is per-project. Every runtime
+ * project result reaches the block through formatProjectSection; the only
+ * production path left on this function is the typecheck-only report.
+ * @param options - Result, format options and run timing.
+ * @returns The report text.
+ */
+export function formatResult({ options, result, timing }: FormatResultOptions): string {
 	const styles = createStyles(options.color, options.slowTestThreshold);
 	// The run header is emitted at the start of the run (see run/run-header.ts);
 	// keep a leading blank line here so results stay visually separated.
-	const lines: Array<string> = ["", ...formatFileSummaries(result, options, styles)];
+	const lines: Array<string> = ["", ...formatFileSummaries({ options, result, styles })];
 
 	const totalDetailedFailures = countDetailedFailures(result);
 	if (totalDetailedFailures > 0) {
@@ -90,81 +129,25 @@ export function formatResult(
 		lines.push(
 			"",
 			formatFailedTestsHeader(totalDetailedFailures, styles),
-			...formatDetailedFailures(result, options, styles, failureCtx),
+			...formatDetailedFailures({ failureCtx, options, result, styles }),
 		);
 	}
 
-	lines.push(...formatSummaryAndHints(result, timing, options, styles));
+	lines.push(...formatSummaryAndHints({ options, result, styles, timing }));
 
 	return lines.join("\n");
 }
 
-export function formatProjectHeader({
-	displayColor,
-	displayName,
-	result,
-	styles: headerStyles,
-	useColor = true,
-}: ProjectHeaderOptions): string {
-	const resolved = headerStyles ?? createStyles(useColor);
-	const stats = computeProjectStats(result);
-
-	const parts = formatSummaryParts(
-		{
-			failed: stats.failedFiles,
-			passed: stats.passedFiles,
-			skipped: stats.skippedFiles,
-		},
-		resolved,
-	);
-
-	const duration = stats.durationMs > 0 ? ` - ${stats.durationMs}ms` : "";
-	const meta = resolved.dim(`(${stats.totalTests} tests${duration})`);
-	const fileStats = parts.join(" | ");
-	const badge = formatProjectBadge(displayName, useColor, displayColor);
-
-	return `${badge}  ${fileStats} ${meta}`;
-}
-
-export function formatProjectSection({
-	displayColor,
-	displayName,
-	failureCtx,
-	gameOutput,
+/**
+ * Render every project's section, then one summary over their merged results.
+ * @param options - Projects, format options and run timing.
+ * @returns The report text.
+ */
+export function formatMultiProjectResult({
 	options,
-	result,
-	styles: sectionStyles,
-}: ProjectSectionOptions): string {
-	const resolved = sectionStyles ?? createStyles(options.color, options.slowTestThreshold);
-	const lines: Array<string> = [
-		formatProjectHeader({
-			displayColor,
-			displayName,
-			result,
-			styles: resolved,
-			useColor: options.color,
-		}),
-		...formatFileSummaries(result, options, resolved),
-	];
-
-	if (countDetailedFailures(result) > 0) {
-		lines.push(...formatDetailedFailures(result, options, resolved, failureCtx));
-	}
-
-	// Only a failing project earns its Game Output inline: on a pass the
-	// reader has nothing to debug, and the file sinks still hold the full dump.
-	if (!result.success) {
-		lines.push(...formatGameOutputBlock(parseGameOutput(gameOutput), resolved));
-	}
-
-	return lines.join("\n");
-}
-
-export function formatMultiProjectResult(
-	projects: Array<FormatterProjectEntry>,
-	timing: TimingResult,
-	options: FormatOptions,
-): string {
+	projects,
+	timing,
+}: FormatMultiProjectResultOptions): string {
 	const styles = createStyles(options.color, options.slowTestThreshold);
 
 	// One counter threaded through every project so the `[n/total]` footers run
@@ -174,13 +157,14 @@ export function formatMultiProjectResult(
 		totalFailures: projects.reduce((sum, { result }) => sum + countDetailedFailures(result), 0),
 	};
 
-	const sections = projects.map(({ displayColor, displayName, gameOutput, result }) => {
+	const sections = projects.map(({ displayColor, displayName, gameOutput, result, rootDir }) => {
 		return formatProjectSection({
 			displayColor,
 			displayName,
 			failureCtx,
 			gameOutput,
 			options,
+			packageRoot: rootDir,
 			result,
 			styles,
 		});
@@ -191,7 +175,7 @@ export function formatMultiProjectResult(
 	const lines: Array<string> = ["", sections.join("\n\n")];
 
 	const mergedResult = mergeJestResults(projects.map((project) => project.result));
-	lines.push(...formatSummaryAndHints(mergedResult, timing, options, styles));
+	lines.push(...formatSummaryAndHints({ options, result: mergedResult, styles, timing }));
 
 	return lines.join("\n");
 }
@@ -206,6 +190,9 @@ export function formatMultiProjectResult(
  * carried those rows — the agent formatter builds them into its own summary
  * block — leaving the failure detail as the only thing missing. A report with
  * no run report beside it owns every row, so the counts travel with it.
+ * @param result - Outcome of the type assertions.
+ * @param options - Summary-row and color switches.
+ * @returns The report, newline-terminated, or empty when there is nothing to show.
  */
 export function formatTypecheckReport(
 	result: JestResult,
@@ -232,12 +219,10 @@ export function formatTypecheckReport(
 
 /**
  * Phase 1 of a report: one summary block per test file, minus filtered files.
+ * @param options - Result, format options and palette.
+ * @returns One entry per shown file.
  */
-function formatFileSummaries(
-	result: JestResult,
-	options: FormatOptions,
-	styles: Styles,
-): Array<string> {
+function formatFileSummaries({ options, result, styles }: ReportPhaseOptions): Array<string> {
 	const lines: Array<string> = [];
 
 	for (const file of result.testResults) {
@@ -245,7 +230,7 @@ function formatFileSummaries(
 			continue;
 		}
 
-		lines.push(formatFileSummary(file, options, styles));
+		lines.push(formatFileSummary({ file, options, styles }));
 	}
 
 	return lines;
@@ -254,59 +239,152 @@ function formatFileSummaries(
 /**
  * The count the `[n/total]` failure footers are numbered against: failed test
  * cases plus files whose suite never ran.
+ * @param result - Result to count.
+ * @returns The failure total.
  */
 function countDetailedFailures(result: JestResult): number {
 	return result.numFailedTests + result.testResults.filter(hasExecError).length;
 }
 
-/** Phase 2 of a report: the expanded failure blocks, in file order. */
-function formatDetailedFailures(
-	result: JestResult,
-	options: FormatOptions,
-	styles: Styles,
-	failureCtx: FailureContext,
-): Array<string> {
+/**
+ * Phase 2 of a report: the expanded failure blocks, in file order.
+ * @param options - Result, format options, palette and shared failure numbering.
+ * @returns The failure blocks, test failures before exec errors.
+ */
+function formatDetailedFailures({
+	failureCtx,
+	options,
+	result,
+	styles,
+}: ReportPhaseOptions & { failureCtx: FailureContext }): Array<string> {
 	const lines: Array<string> = [];
 	const execErrors = result.testResults.filter(hasExecError);
 
 	for (const file of result.testResults) {
-		const failures = formatFileFailures(file, options, styles, failureCtx);
+		const failures = formatFileFailures({ failureCtx, file, options, styles });
 		if (failures !== "") {
 			lines.push(failures);
 		}
 	}
 
 	for (const file of execErrors) {
-		lines.push(formatExecErrorDetail(file, styles, failureCtx, options.sourceMapper));
+		lines.push(
+			formatExecErrorDetail({
+				failureCtx,
+				file,
+				rootDir: options.rootDir,
+				sourceMapper: options.sourceMapper,
+				styles,
+			}),
+		);
 	}
 
 	return lines;
 }
 
-/** Phase 3 of a report: the totals block, plus the hints a failed run earns. */
-function formatSummaryAndHints(
-	result: JestResult,
-	timing: TimingResult,
-	options: FormatOptions,
-	styles: Styles,
-): Array<string> {
+/**
+ * Phase 3 of a report: the totals block, plus the hints a failed run earns.
+ * @param options - Result, format options, palette and run timing.
+ * @returns The summary lines.
+ */
+function formatSummaryAndHints({
+	options,
+	result,
+	styles,
+	timing,
+}: ReportPhaseOptions & { timing: TimingResult }): Array<string> {
 	const lines: Array<string> = [
 		"",
-		formatTestSummary(result, timing, styles, {
+		formatTestSummary({
 			bail: options.bail,
+			result,
 			snapshotWriteFailures: options.snapshotWriteFailures,
+			styles,
+			timing,
 			typeErrors: options.typeErrors,
 		}),
 	];
 
 	if (!result.success) {
-		const hints = formatLogHints(options, styles, result.snapshot);
+		const hints = formatLogHints({ options, snapshot: result.snapshot, styles });
 		if (hints !== "") {
 			lines.push("", hints);
 		}
 	}
 
 	return lines;
+}
+
+/**
+ * Render a project's badge with its file counts, test count and duration.
+ * @param options - Project name, color, result and palette.
+ * @returns The header line.
+ */
+function formatProjectHeader({
+	displayColor,
+	displayName,
+	result,
+	styles: resolved,
+	useColor,
+}: ProjectHeaderOptions): string {
+	const stats = computeProjectStats(result);
+
+	const parts = formatSummaryParts(
+		{
+			failed: stats.failedFiles,
+			passed: stats.passedFiles,
+			skipped: stats.skippedFiles,
+		},
+		resolved,
+	);
+
+	const duration = stats.durationMs > 0 ? ` - ${stats.durationMs}ms` : "";
+	const meta = resolved.dim(`(${stats.totalTests} tests${duration})`);
+	const fileStats = parts.join(" | ");
+	const badge = formatProjectBadge({ displayColor, displayName, useColor });
+
+	return `${badge}  ${fileStats} ${meta}`;
+}
+
+/**
+ * Render one project: header, file summaries, failures and, when it failed, its Game Output.
+ * @param options - Project entry, format options, palette and shared failure numbering.
+ * @returns The section text.
+ */
+function formatProjectSection({
+	displayColor,
+	displayName,
+	failureCtx,
+	gameOutput,
+	options,
+	packageRoot,
+	result,
+	styles: resolved,
+}: ProjectSectionOptions): string {
+	const lines: Array<string> = [
+		formatProjectHeader({
+			displayColor,
+			displayName,
+			result,
+			styles: resolved,
+			useColor: options.color,
+		}),
+		...formatFileSummaries({ options, result, styles: resolved }),
+		...formatDetailedFailures({
+			failureCtx,
+			options: withPackageRoot(options, packageRoot),
+			result,
+			styles: resolved,
+		}),
+	];
+
+	// Only a failing project earns its Game Output inline: on a pass the
+	// reader has nothing to debug, and the file sinks still hold the full dump.
+	if (!result.success) {
+		lines.push(...formatGameOutputBlock(parseGameOutput(gameOutput), resolved));
+	}
+
+	return lines.join("\n");
 }
 
 function mergeJestResults(results: Array<JestResult>): JestResult {
@@ -337,7 +415,12 @@ function formatTypecheckFileFailures(
 	return lines;
 }
 
-/** The expanded type-failure blocks, without the closing summary rows. */
+/**
+ * The expanded type-failure blocks, without the closing summary rows.
+ * @param result - Outcome of the type assertions.
+ * @param styles - Palette to render with.
+ * @returns The failure blocks joined by newlines.
+ */
 function formatTypecheckFailures(result: JestResult, styles: Styles): string {
 	const lines: Array<string> = [];
 

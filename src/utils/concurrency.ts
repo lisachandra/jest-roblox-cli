@@ -6,19 +6,41 @@
  * thread pool at once buys no throughput while it does exhaust file handles.
  * Results come back in the order of `items`, not the order they settled, so a
  * digest taken over them is stable.
+ * @template T
+ * @template R
  */
-export async function mapWithLimitAsync<T, R>(
-	items: ReadonlyArray<T>,
-	limit: number,
-	func: (item: T, index: number) => Promise<R>,
-): Promise<Array<R>> {
+export interface MapWithLimitOptions<T, R> {
+	/** Maps one item, given its index. */
+	readonly func: (item: T, index: number) => Promise<R>;
+	/** The items to map. */
+	readonly items: ReadonlyArray<T>;
+	/** The most calls outstanding at once. */
+	readonly limit: number;
+}
+
+/**
+ * Map `items` through `func`, with at most `limit` calls outstanding.
+ * @template T
+ * @template R
+ * @param options - The items, the mapper and the limit.
+ * @param options.func - Maps one item.
+ * @param options.items - The items to map.
+ * @param options.limit - The most calls outstanding at once.
+ * @returns The results, in the order of `items`.
+ * @rejects Whatever `func` first rejects with.
+ */
+export async function mapWithLimitAsync<T, R>({
+	func,
+	items,
+	limit,
+}: MapWithLimitOptions<T, R>): Promise<Array<R>> {
 	const results: Array<R> = [];
 	let next = 0;
 
 	async function drainAsync(): Promise<void> {
 		for (let index = next; index < items.length; index = next) {
 			next = index + 1;
-			// eslint-disable-next-line ts/no-non-null-assertion -- index is below items.length
+			// oxlint-disable-next-line typescript/no-non-null-assertion -- index is below items.length
 			results[index] = await func(items[index]!, index);
 		}
 	}

@@ -1,12 +1,14 @@
 import assert from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
 
 import type { SourceMapper } from "../source-mapper/index.ts";
-import type { JestResult, TestFileResult } from "../types/jest-result.ts";
+import type { JestResult, TestFileResult } from "../types/jest-result-types.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { hashString } from "../utils/hash.ts";
 import type { TestRecord } from "./manifest.ts";
 import { resolveTestFileHash } from "./test-file-hash.ts";
 
+/** Answers what the harvester records about one test's source. */
 export type TestSourceResolver = (testFilePath: string, testCaseId: string) => TestSource;
 
 /** What the harvester records about one test's source, keyed off its file. */
@@ -32,17 +34,24 @@ interface FileSources {
  * the file `testFileSourceHash` hashes, and a hash of its own range of that
  * file. A test without one (the runtime could not read its call site) is
  * keyed on the whole file, as before.
+ * @param options - File system, Jest result and source mapper.
+ * @returns Resolver that caches its work per test file.
  */
-export function createTestSourceResolver(
-	result: JestResult,
-	sourceMapper: TestSourceMapper | undefined,
-): TestSourceResolver {
+export function createTestSourceResolver({
+	fileSystem = nodeFileSystem,
+	result,
+	sourceMapper,
+}: {
+	fileSystem?: FileSystem;
+	result: JestResult;
+	sourceMapper: TestSourceMapper | undefined;
+}): TestSourceResolver {
 	const filesByPath = new Map<string, FileSources>();
 
 	return (testFilePath, testCaseId) => {
 		let file = filesByPath.get(testFilePath);
 		if (file === undefined) {
-			file = collectFileSources(result, testFilePath, sourceMapper);
+			file = collectFileSources({ fileSystem, result, sourceMapper, testFilePath });
 			filesByPath.set(testFilePath, file);
 		}
 
@@ -74,32 +83,37 @@ function hashTestRanges(sourceText: string, startLines: Iterable<number>): Map<n
 	return rangeHashes;
 }
 
-function findFileResult(
-	result: JestResult,
-	testFilePath: string,
-	diskPath: string | undefined,
-	sourceMapper: TestSourceMapper | undefined,
-): TestFileResult | undefined {
+function findFileResult({
+	diskPath,
+	result,
+	sourceMapper,
+}: {
+	diskPath: string;
+	result: JestResult;
+	sourceMapper: TestSourceMapper;
+}): TestFileResult | undefined {
 	return result.testResults.find((fileResult) => {
-		if (fileResult.testFilePath === testFilePath) {
-			return true;
-		}
-
 		const fileDiskPath =
-			sourceMapper?.resolveTestFilePath(fileResult.testFilePath) ?? fileResult.testFilePath;
-		return diskPath !== undefined && fileDiskPath === diskPath;
+			sourceMapper.resolveTestFilePath(fileResult.testFilePath) ?? fileResult.testFilePath;
+		return fileDiskPath === diskPath;
 	});
 }
 
 /**
  * Each located test's line in the resolved file, by full name. A name that
  * occurs twice (the rows of an `each` table) keeps its first line.
+ * @param options - Jest file result, source mapper and test file path.
+ * @returns Line by full test name.
  */
-function locateTests(
-	fileResult: TestFileResult,
-	testFilePath: string,
-	sourceMapper: TestSourceMapper,
-): Map<string, number> {
+function locateTests({
+	fileResult,
+	sourceMapper,
+	testFilePath,
+}: {
+	fileResult: TestFileResult;
+	sourceMapper: TestSourceMapper;
+	testFilePath: string;
+}): Map<string, number> {
 	const linesByTestCaseId = new Map<string, number>();
 	for (const testCase of fileResult.testResults) {
 		if (testCase.location === undefined || linesByTestCaseId.has(testCase.fullName)) {
@@ -115,31 +129,40 @@ function locateTests(
 	return linesByTestCaseId;
 }
 
-function collectFileSources(
-	result: JestResult,
-	testFilePath: string,
-	sourceMapper: TestSourceMapper | undefined,
-): FileSources {
-	const testFileSourceHash = resolveTestFileHash(sourceMapper, testFilePath) ?? "";
+function collectFileSources({
+	fileSystem,
+	result,
+	sourceMapper,
+	testFilePath,
+}: {
+	fileSystem: FileSystem;
+	result: JestResult;
+	sourceMapper: TestSourceMapper | undefined;
+	testFilePath: string;
+}): FileSources {
+	const testFileSourceHash =
+		resolveTestFileHash({ fileSystem, sourceMapper, testFilePath }) ?? "";
 	const fileOnly: TestSource = { testFileSourceHash };
 	const byTestCaseId = new Map<string, TestSource>();
 
 	const diskPath = sourceMapper?.resolveTestFilePath(testFilePath);
-	const fileResult = findFileResult(result, testFilePath, diskPath, sourceMapper);
-	if (
-		sourceMapper === undefined ||
-		fileResult === undefined ||
-		diskPath === undefined ||
-		!existsSync(diskPath)
-	) {
+	if (sourceMapper === undefined || diskPath === undefined || !fileSystem.existsSync(diskPath)) {
 		return { byTestCaseId, fileOnly };
 	}
 
-	const linesByTestCaseId = locateTests(fileResult, testFilePath, sourceMapper);
-	const rangeHashes = hashTestRanges(readFileSync(diskPath, "utf-8"), linesByTestCaseId.values());
+	const fileResult = findFileResult({ diskPath, result, sourceMapper });
+	if (fileResult === undefined) {
+		return { byTestCaseId, fileOnly };
+	}
+
+	const linesByTestCaseId = locateTests({ fileResult, sourceMapper, testFilePath });
+	const rangeHashes = hashTestRanges(
+		fileSystem.readFileSync(diskPath, "utf-8"),
+		linesByTestCaseId.values(),
+	);
 	for (const [testCaseId, line] of linesByTestCaseId) {
 		const testSourceHash = rangeHashes.get(line);
-		assert(testSourceHash !== undefined, `no range hashed for line ${String(line)}`);
+		assert(testSourceHash !== undefined);
 		byTestCaseId.set(testCaseId, {
 			location: { column: 0, line },
 			testFileSourceHash,

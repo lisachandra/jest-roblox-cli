@@ -1,6 +1,7 @@
-import * as fs from "node:fs";
 import picomatch from "picomatch";
 
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { hashString } from "../utils/hash.ts";
 import type { PosixRoot } from "../utils/normalize-windows-path.ts";
 import { underRoot } from "../utils/normalize-windows-path.ts";
@@ -38,7 +39,10 @@ export interface RootFiles {
 	instrumentable: Set<string>;
 }
 
+/** How {@link discoverRootFiles} walks and splits a root. */
 export interface DiscoverRootFilesOptions {
+	/** Where the walk reads. Defaults to the real filesystem. */
+	fileSystem?: FileSystem;
 	/** Paths the shadow never carries; absent means the whole root. */
 	isCopyIgnored?: CopyIgnoreMatcher | undefined;
 	/** Narrows which prod files probe; absent means all of them. */
@@ -69,6 +73,8 @@ export interface WalkFilter {
  * `coveragePathIgnorePatterns`: this list decides what reaches the built place,
  * where an over-match drops a file the runtime needs rather than a row from a
  * report.
+ * @param patterns - Globs relative to the compiled root.
+ * @returns Matcher that is true for an ignored path.
  */
 export function createCopyIgnoreMatcher(patterns: ReadonlyArray<string>): CopyIgnoreMatcher {
 	return picomatch([...patterns]);
@@ -83,20 +89,36 @@ export function createCopyIgnoreMatcher(patterns: ReadonlyArray<string>): CopyIg
  * moves, so nothing else would invalidate it. Sorted before hashing because the
  * matcher ORs the list — reordering cannot change what is ignored, and a digest
  * that moved anyway would spend a cold rebuild on a no-op config edit.
+ * @param patterns - Copy-ignore globs.
+ * @returns Hash of the sorted list.
  */
 export function hashCopyIgnorePatterns(patterns: ReadonlyArray<string>): string {
 	return hashString(JSON.stringify([...patterns].toSorted()));
 }
 
+/**
+ * Spec, test and snapshot Luau files, which the shadow syncs without probes.
+ * @param filename - File name or path.
+ * @returns True when the name has a non-instrumented suffix.
+ */
 export function isNonInstrumentedFile(filename: string): boolean {
 	return NON_INSTRUMENTED_SUFFIXES.some((suffix) => filename.endsWith(suffix));
 }
 
+/**
+ * Prod `.luau` and `.lua` files, which earn probes.
+ * @param name - File name or path.
+ * @returns True for a Luau file that is not a spec, test or snapshot.
+ */
 export function isInstrumentableFile(name: string): boolean {
 	return (name.endsWith(".luau") || name.endsWith(".lua")) && !isNonInstrumentedFile(name);
 }
 
-/** Directories no pipeline walk descends into. */
+/**
+ * Directories no pipeline walk descends into.
+ * @param name - Directory entry name.
+ * @returns True for `node_modules` and dot-prefixed names.
+ */
 export function isSkippedDirectory(name: string): boolean {
 	return name === "node_modules" || name.startsWith(".");
 }
@@ -107,13 +129,21 @@ export function isSkippedDirectory(name: string): boolean {
  *
  * Every name it reports is built from the entry names it descended through, so
  * how the caller spelled the root never reaches the answer.
+ * @param options - Directory to walk, file system, filter, and the array that
+ *   receives each accepted path relative to the directory.
  */
-export function walkLuauDirectory(
-	directory: string,
-	filter: WalkFilter,
-	results: Array<string>,
-): void {
-	walkFrom(directory, "", filter, results);
+export function walkLuauDirectory({
+	directory,
+	fileSystem = nodeFileSystem,
+	filter,
+	results,
+}: {
+	directory: string;
+	fileSystem?: FileSystem;
+	filter: WalkFilter;
+	results: Array<string>;
+}): void {
+	walkFrom({ directory, fileSystem, filter, relativePrefix: "", results });
 }
 
 /**
@@ -131,10 +161,15 @@ export function walkLuauDirectory(
  */
 export function discoverRootFiles(
 	luauRoot: PosixRoot,
-	{ isCopyIgnored, universe }: DiscoverRootFilesOptions = {},
+	{ fileSystem = nodeFileSystem, isCopyIgnored, universe }: DiscoverRootFilesOptions = {},
 ): RootFiles {
 	const discovered: Array<string> = [];
-	walkLuauDirectory(luauRoot, { accept: isInstrumentableFile, skip: isCopyIgnored }, discovered);
+	walkLuauDirectory({
+		directory: luauRoot,
+		fileSystem,
+		filter: { accept: isInstrumentableFile, skip: isCopyIgnored },
+		results: discovered,
+	});
 
 	if (universe === undefined) {
 		return { excluded: new Set(), instrumentable: new Set(discovered) };
@@ -150,13 +185,19 @@ export function discoverRootFiles(
 	return { excluded, instrumentable };
 }
 
-function walkFrom(
-	directory: string,
-	relativePrefix: string,
-	filter: WalkFilter,
-	results: Array<string>,
-): void {
-	const entries = fs.readdirSync(directory, { withFileTypes: true });
+function walkFrom({
+	directory,
+	relativePrefix,
+	...walk
+}: {
+	directory: string;
+	fileSystem: FileSystem;
+	filter: WalkFilter;
+	relativePrefix: string;
+	results: Array<string>;
+}): void {
+	const { fileSystem, filter, results } = walk;
+	const entries = fileSystem.readdirSync(directory, { withFileTypes: true });
 	for (const entry of entries) {
 		const relative = relativePrefix + entry.name;
 		if (filter.skip?.(relative) === true) {
@@ -169,7 +210,11 @@ function walkFrom(
 			}
 
 			filter.onDirectory?.(relative);
-			walkFrom(`${directory}/${entry.name}`, `${relative}/`, filter, results);
+			walkFrom({
+				...walk,
+				directory: `${directory}/${entry.name}`,
+				relativePrefix: `${relative}/`,
+			});
 		} else if (filter.accept(entry.name)) {
 			results.push(relative);
 		}

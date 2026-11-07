@@ -1,4 +1,4 @@
-const BLOCK_COMMENT_OPEN = /^--(\[=*\[)/;
+const BLOCK_COMMENT_OPEN = /^--\[=*\[/;
 const CARRIAGE_RETURN = "\r";
 const COMMENT_OPEN = "--";
 const DIRECTIVE_OPEN = "--!";
@@ -24,12 +24,14 @@ interface HeaderAdvance {
 }
 
 /** What the text at one column is, read from outside any comment. */
-interface CodeStep {
-	closer: string | undefined;
-	hasEnded: boolean;
-	isDirective: boolean;
-	width: number | undefined;
-}
+type CodeStep =
+	| {
+			closer: string | undefined;
+			hasEnded: false;
+			isDirective: boolean;
+			width: number | undefined;
+	  }
+	| { hasEnded: true };
 
 /**
  * How many lines a caller must leave above code it injects into a Luau file,
@@ -50,6 +52,8 @@ interface CodeStep {
  * ends a comment for Luau without opening a line, so one of those lines can
  * carry a directive and then code; the count stops short of such a line rather
  * than name a place to inject that would land above the code.
+ * @param lines - The file's lines, split on `\n`.
+ * @returns The number of leading lines injected code must stay below.
  */
 export function countLinesThroughLastDirective(lines: ReadonlyArray<string>): number {
 	let closer: string | undefined;
@@ -76,6 +80,8 @@ export function countLinesThroughLastDirective(lines: ReadonlyArray<string>): nu
  * passes, a token closes the run, a block comment hands back its closer, and a
  * `--` comment ends on a bare `\r` as readily as on the line — the lexer reads
  * on from there without counting a line.
+ * @param rest - The line text from the current column on.
+ * @returns The step: the run's end, or the width to advance and any closer.
  */
 function stepFromCode(rest: string): CodeStep {
 	if (WHITESPACE.test(rest.charAt(0))) {
@@ -83,14 +89,14 @@ function stepFromCode(rest: string): CodeStep {
 	}
 
 	if (!rest.startsWith(COMMENT_OPEN)) {
-		return { closer: undefined, hasEnded: true, isDirective: false, width: undefined };
+		return { hasEnded: true };
 	}
 
 	// `[==[` closes on `]==]` alone, so the level rides along in the closer.
-	const [, bracket] = BLOCK_COMMENT_OPEN.exec(rest) ?? [];
-	if (bracket !== undefined) {
-		const closer = bracket.replaceAll("[", "]");
-		const width = COMMENT_OPEN.length + bracket.length;
+	const opener = BLOCK_COMMENT_OPEN.exec(rest)?.[0];
+	if (opener !== undefined) {
+		const closer = opener.slice(COMMENT_OPEN.length).replaceAll("[", "]");
+		const width = opener.length;
 		return { closer, hasEnded: false, isDirective: false, width };
 	}
 
@@ -110,8 +116,21 @@ function stepFromCode(rest: string): CodeStep {
  * A token ends the run and takes any directive that shares its line down with
  * it: the count is in whole lines, so a caller cannot lift such a directive
  * away without carrying the code up too.
+ * @param options - The line, the column to step from and the scan so far.
+ * @param options.column - The column to step from.
+ * @param options.line - The line being scanned.
+ * @param options.state - The scan state before this step.
+ * @returns The next scan state and the width advanced, or `undefined` to stop.
  */
-function advanceOnce(line: string, column: number, state: HeaderLineScan): HeaderAdvance {
+function advanceOnce({
+	column,
+	line,
+	state,
+}: {
+	readonly column: number;
+	readonly line: string;
+	readonly state: HeaderLineScan;
+}): HeaderAdvance {
 	const { closer, isDirective } = state;
 	if (closer !== undefined) {
 		const closeAt = line.indexOf(closer, column);
@@ -144,13 +163,16 @@ function advanceOnce(line: string, column: number, state: HeaderLineScan): Heade
 /**
  * Read one line as far as the opening comment run goes, carrying in whatever
  * closer an earlier line's block comment is still waiting for.
+ * @param line - The line to scan.
+ * @param openCloser - The closer an earlier block comment still waits for.
+ * @returns The scan state at the end of the line's comment run.
  */
 function scanHeaderLine(line: string, openCloser: string | undefined): HeaderLineScan {
 	let state: HeaderLineScan = { closer: openCloser, hasEnded: false, isDirective: false };
 	let column = 0;
 
 	while (column < line.length) {
-		const { state: nextState, width } = advanceOnce(line, column, state);
+		const { state: nextState, width } = advanceOnce({ column, line, state });
 		state = nextState;
 		if (width === undefined) {
 			return state;

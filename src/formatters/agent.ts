@@ -1,25 +1,9 @@
-import path from "node:path";
-
-import {
-	getSourceSnippet,
-	type MappedLocation,
-	type SourceMapper,
-} from "../source-mapper/index.ts";
-import {
-	execErrorReason,
-	type ExecErrorTestFileResult,
-	hasExecError,
-	type JestResult,
-	type TestCaseResult,
-} from "../types/jest-result.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
-import {
-	cleanExecErrorMessage,
-	getExecErrorHint,
-	parseErrorMessage,
-	parseSourceLocation,
-	resolveDisplayPath,
-} from "./formatter.ts";
+import { getSourceSnippet, type SourceMapper } from "../source-mapper/index.ts";
+import { execErrorReason, hasExecError } from "../types/exec-error-file.ts";
+import type { ExecErrorTestFileResult, JestResult } from "../types/jest-result-types.ts";
+import { formatFailures, type SourceSnippetReader } from "./agent-failures.ts";
+import { cleanExecErrorMessage, getExecErrorHint } from "./failure-message.ts";
+import { resolveDisplayPath, withPackageRoot } from "./shared.ts";
 import type { BailSummary } from "./shared.ts";
 import { createStyles } from "./styles.ts";
 import {
@@ -34,32 +18,57 @@ import {
 	type TestRowCounts,
 } from "./summary.ts";
 
+/**
+ * Options of the agent formatter.
+ */
 export interface AgentOptions {
 	/** Set when `--bail` cut the run short; see {@link BailSummary}. */
 	bail?: BailSummary | undefined;
+	/**
+	 * Path of the written Roblox game log, named in the log hints.
+	 */
 	gameOutput?: string | undefined;
+	/**
+	 * Size in bytes of the game log, shown beside its path.
+	 */
 	gameOutputSize?: number | undefined;
+	/**
+	 * Reads the source lines a snippet shows; defaults to the file system
+	 * reader.
+	 */
+	getSourceSnippet?: SourceSnippetReader;
+	/**
+	 * Most failures to render; the rest collapse into one omitted line.
+	 */
 	maxFailures: number;
+	/**
+	 * Path of the written full Jest output, named in the log hints.
+	 */
 	outputFile?: string | undefined;
+	/**
+	 * Size in bytes of the Jest output, shown beside its path.
+	 */
 	outputFileSize?: number | undefined;
+	/**
+	 * Directory that failure paths are shown relative to.
+	 */
 	rootDir: string;
+	/**
+	 * Maps Luau paths and locations back to TypeScript source.
+	 */
 	sourceMapper?: SourceMapper | undefined;
+	/**
+	 * Type errors found; adds a summary row when set.
+	 */
 	typeErrorCount?: number | undefined;
 }
+
+type ResolvedAgentOptions = AgentOptions & { getSourceSnippet: SourceSnippetReader };
 
 interface AgentProjectEntry {
 	displayName: string;
 	result: JestResult;
-}
-
-type SnippetLevel = "both" | "none" | "ts-only";
-
-interface FormatFailureMessageOptions {
-	agentOptions: AgentOptions;
-	filePath: string;
-	originalMessage: string;
-	snippetLevel: SnippetLevel;
-	test: TestCaseResult;
+	rootDir?: string | undefined;
 }
 
 interface AgentProjectStats {
@@ -72,7 +81,14 @@ interface AgentProjectStats {
 // through the no-op palette rather than growing a plain-text twin.
 const PLAIN_STYLES = createStyles(false);
 
-export function formatAgent(result: JestResult, options: AgentOptions): string {
+/**
+ * Render a run as compact plain text for an agent: failures, then the summary.
+ * @param result - Run result.
+ * @param agentOptions - Formatter options.
+ * @returns The rendered output.
+ */
+export function formatAgent(result: JestResult, agentOptions: AgentOptions): string {
+	const options = resolveAgentOptions(agentOptions);
 	const lines: Array<string> = [];
 	const execErrors = result.testResults.filter(hasExecError);
 	const hasFailures = result.numFailedTests > 0 || execErrors.length > 0;
@@ -84,7 +100,7 @@ export function formatAgent(result: JestResult, options: AgentOptions): string {
 			"",
 			`${"⎯".repeat(3)} Failed Tests ${totalFailures} ${"⎯".repeat(3)}`,
 			"",
-			...formatFailures(result, result.numFailedTests, options),
+			...formatFailures({ options, result, totalFailures: result.numFailedTests }),
 		);
 
 		for (const file of execErrors) {
@@ -102,26 +118,37 @@ export function formatAgent(result: JestResult, options: AgentOptions): string {
 	return lines.join("\n");
 }
 
+/**
+ * Render several projects' results as one compact plain-text report.
+ * @param projects - Each project's name and result.
+ * @param agentOptions - Formatter options.
+ * @returns The rendered output.
+ */
 export function formatAgentMultiProject(
 	projects: Array<AgentProjectEntry>,
-	options: AgentOptions,
+	agentOptions: AgentOptions,
 ): string {
+	const options = resolveAgentOptions(agentOptions);
 	const lines: Array<string> = [];
 
-	for (const { displayName, result } of projects) {
-		lines.push(...formatAgentProjectHeader(displayName, result, options));
+	for (const project of projects) {
+		lines.push(...formatAgentProjectHeader({ ...project, options }));
 	}
 
 	const stats = collectMultiProjectStats(projects);
 	const totalFailures = stats.tests.counts.failed + stats.allExecErrors.length;
 
 	if (totalFailures > 0) {
-		lines.push(...formatMultiProjectFailures(projects, stats, options));
+		lines.push(...formatMultiProjectFailures({ options, projects, stats }));
 	}
 
 	lines.push(...formatMultiProjectSummary(stats, options));
 
 	return lines.join("\n");
+}
+
+function resolveAgentOptions(options: AgentOptions): ResolvedAgentOptions {
+	return { getSourceSnippet, ...options };
 }
 
 function formatSummarySection(result: JestResult, options: AgentOptions): Array<string> {
@@ -137,23 +164,11 @@ function formatSummarySection(result: JestResult, options: AgentOptions): Array<
 	return lines;
 }
 
-function makeRelative(filePath: string, rootDirectory: string): string {
-	const normalizedPath = normalizeWindowsPath(filePath);
-	const normalizedRoot = normalizeWindowsPath(rootDirectory);
-
-	if (normalizedPath.startsWith(normalizedRoot)) {
-		return normalizeWindowsPath(path.relative(normalizedRoot, normalizedPath));
-	}
-
-	return filePath;
-}
-
 function formatFileHeaderExecError(
 	file: JestResult["testResults"][number],
 	options: AgentOptions,
 ): Array<string> {
-	const displayPath = resolveDisplayPath(file.testFilePath, options.sourceMapper);
-	const relativePath = makeRelative(displayPath, options.rootDir);
+	const relativePath = resolveDisplayPath(file.testFilePath, options);
 
 	return [` ❯ ${relativePath} (suite ${execErrorReason(file)})`];
 }
@@ -163,8 +178,7 @@ function formatFileHeaderFailures(
 	options: AgentOptions,
 ): Array<string> {
 	const lines: Array<string> = [];
-	const displayPath = resolveDisplayPath(file.testFilePath, options.sourceMapper);
-	const relativePath = makeRelative(displayPath, options.rootDir);
+	const relativePath = resolveDisplayPath(file.testFilePath, options);
 	const totalTests = file.numFailingTests + file.numPassingTests + file.numPendingTests;
 	const testWord = totalTests === 1 ? "test" : "tests";
 
@@ -203,8 +217,7 @@ function formatFileHeaders(result: JestResult, options: AgentOptions): Array<str
 
 function formatExecError(file: ExecErrorTestFileResult, options: AgentOptions): Array<string> {
 	const lines: Array<string> = [];
-	const displayPath = resolveDisplayPath(file.testFilePath, options.sourceMapper);
-	const relativePath = makeRelative(displayPath, options.rootDir);
+	const relativePath = resolveDisplayPath(file.testFilePath, options);
 
 	const errorMessage = cleanExecErrorMessage(file.failureMessage);
 
@@ -246,278 +259,16 @@ function formatAgentLogHints(options: AgentOptions): string {
 	return lines.join("\n");
 }
 
-function collectFailedTests(
-	result: JestResult,
-	sourceMapper?: SourceMapper,
-): Array<{ filePath: string; test: TestCaseResult }> {
-	const failures: Array<{ filePath: string; test: TestCaseResult }> = [];
-
-	for (const file of result.testResults) {
-		const displayPath = resolveDisplayPath(file.testFilePath, sourceMapper);
-		for (const test of file.testResults) {
-			if (test.status === "failed") {
-				failures.push({ filePath: displayPath, test });
-			}
-		}
-	}
-
-	return failures;
-}
-
-function getSnippetLevel(totalFailures: number): SnippetLevel {
-	if (totalFailures <= 2) {
-		return "both";
-	}
-
-	if (totalFailures <= 5) {
-		return "ts-only";
-	}
-
-	return "none";
-}
-
-function findFailureLocation(
-	mappedLocations: Array<MappedLocation>,
-	message: string,
-): undefined | { line: number; path: string } {
-	const [loc] = mappedLocations;
-	if (loc !== undefined) {
-		if (loc.tsPath !== undefined && loc.tsLine !== undefined) {
-			return { line: loc.tsLine, path: loc.tsPath };
-		}
-
-		return { line: loc.luauLine, path: loc.luauPath };
-	}
-
-	return parseSourceLocation(message);
-}
-
-function formatSnippetBlock(
-	snippetResult: ReturnType<typeof getSourceSnippet>,
-): string | undefined {
-	if (snippetResult === undefined) {
-		return undefined;
-	}
-
-	const lines: Array<string> = [];
-	for (const line of snippetResult.lines) {
-		const prefix = line.num === snippetResult.failureLine ? ">" : " ";
-		lines.push(`${prefix} ${line.num}| ${line.content}`);
-	}
-
-	return lines.join("\n");
-}
-
-function getTsSnippets(
-	loc: MappedLocation & { tsLine: number; tsPath: string },
-	snippetLevel: SnippetLevel,
-	rootDirectory: string,
-): Array<string> {
-	const result: Array<string> = [];
-
-	const tsSnippet = formatSnippetBlock(
-		getSourceSnippet({
-			column: loc.tsColumn,
-			context: 1,
-			filePath: loc.tsPath,
-			line: loc.tsLine,
-			sourceContent: loc.sourceContent,
-		}),
-	);
-
-	if (tsSnippet !== undefined) {
-		const relativeTsPath = makeRelative(loc.tsPath, rootDirectory);
-		const label = snippetLevel === "both" ? `TS  ${relativeTsPath}:${loc.tsLine}\n` : "";
-		result.push(`${label}${tsSnippet}`);
-	}
-
-	if (snippetLevel === "both") {
-		const luauSnippet = formatSnippetBlock(
-			getSourceSnippet({ context: 1, filePath: loc.luauPath, line: loc.luauLine }),
-		);
-
-		if (luauSnippet !== undefined) {
-			const relativeLuauPath = makeRelative(loc.luauPath, rootDirectory);
-			result.push(`Luau  ${relativeLuauPath}:${loc.luauLine}\n${luauSnippet}`);
-		}
-	}
-
-	return result;
-}
-
-function getLuauOnlySnippet(loc: MappedLocation): Array<string> {
-	const snippet = formatSnippetBlock(
-		getSourceSnippet({ context: 1, filePath: loc.luauPath, line: loc.luauLine }),
-	);
-
-	return snippet !== undefined ? [snippet] : [];
-}
-
-function getMappedSnippets(
-	loc: MappedLocation,
-	snippetLevel: SnippetLevel,
-	rootDirectory: string,
-): Array<string> {
-	if (loc.tsPath !== undefined && loc.tsLine !== undefined) {
-		return getTsSnippets(
-			{ ...loc, tsLine: loc.tsLine, tsPath: loc.tsPath },
-			snippetLevel,
-			rootDirectory,
-		);
-	}
-
-	return getLuauOnlySnippet(loc);
-}
-
-function getFallbackSnippet(location: { line: number; path: string }): Array<string> {
-	const snippet = formatSnippetBlock(
-		getSourceSnippet({ context: 1, filePath: location.path, line: location.line }),
-	);
-
-	return snippet !== undefined ? [snippet] : [];
-}
-
-function getFailureSnippets(
-	mappedLocations: Array<MappedLocation>,
-	location: undefined | { line: number; path: string },
-	snippetLevel: SnippetLevel,
-	rootDirectory: string,
-): Array<string> {
-	if (snippetLevel === "none") {
-		return [];
-	}
-
-	const [loc] = mappedLocations;
-	if (loc !== undefined) {
-		return getMappedSnippets(loc, snippetLevel, rootDirectory);
-	}
-
-	if (location !== undefined) {
-		return getFallbackSnippet(location);
-	}
-
-	return [];
-}
-
-// The expectation detail under a failure header: a snapshot diff, an
-// expected/received pair, or the raw message when neither was parsed out.
-function buildFailureDetail(parsed: ReturnType<typeof parseErrorMessage>): Array<string> {
-	if (parsed.snapshotDiff !== undefined) {
-		return [parsed.snapshotDiff];
-	}
-
-	if (parsed.expected !== undefined && parsed.received !== undefined) {
-		return [`Expected: ${parsed.expected}`, `Received: ${parsed.received}`];
-	}
-
-	return [parsed.message];
-}
-
-// One failure message: the ` FAIL <file>:<line> > <test>` header, the
-// expectation detail (snapshot diff, expected/received pair, or the raw
-// message), the source snippets, and a trailing blank line.
-function formatFailureMessage({
-	agentOptions,
-	filePath,
-	originalMessage,
-	snippetLevel,
-	test,
-}: FormatFailureMessageOptions): Array<string> {
-	const lines: Array<string> = [];
-
-	let mappedLocations: Array<MappedLocation> = [];
-	let message = originalMessage;
-
-	if (agentOptions.sourceMapper !== undefined) {
-		({ locations: mappedLocations, message } =
-			agentOptions.sourceMapper.mapFailureWithLocations(originalMessage));
-	}
-
-	const parsed = parseErrorMessage(originalMessage);
-	const location = findFailureLocation(mappedLocations, message);
-	const relativePath = makeRelative(location?.path ?? filePath, agentOptions.rootDir);
-	const lineInfo = location?.line !== undefined ? `:${location.line}` : "";
-	const ancestors = test.ancestorTitles.length > 0 ? ` > ${test.ancestorTitles.join(" > ")}` : "";
-
-	lines.push(
-		` FAIL ${relativePath}${lineInfo}${ancestors} > ${test.title}`,
-		...buildFailureDetail(parsed),
-	);
-
-	const snippets = getFailureSnippets(
-		mappedLocations,
-		location,
-		snippetLevel,
-		agentOptions.rootDir,
-	);
-	for (const snippet of snippets) {
-		lines.push(snippet);
-	}
-
-	lines.push("");
-	return lines;
-}
-
-function formatAgentFailure(
-	test: TestCaseResult,
-	filePath: string,
-	options: AgentOptions,
-	snippetLevel: SnippetLevel,
-): string {
-	const lines: Array<string> = [];
-
-	for (const originalMessage of test.failureMessages) {
-		lines.push(
-			...formatFailureMessage({
-				agentOptions: options,
-				filePath,
-				originalMessage,
-				snippetLevel,
-				test,
-			}),
-		);
-	}
-
-	return lines.join("\n");
-}
-
-function formatFailures(
-	result: JestResult,
-	totalFailures: number,
-	options: AgentOptions,
-): Array<string> {
-	const lines: Array<string> = [];
-	const failures = collectFailedTests(result, options.sourceMapper);
-	const snippetLevel = getSnippetLevel(totalFailures);
-
-	for (const [index, { filePath, test }] of failures.entries()) {
-		if (index >= options.maxFailures) {
-			lines.push(`... ${result.numFailedTests - index} more failures omitted`, "");
-			break;
-		}
-
-		lines.push(formatAgentFailure(test, filePath, options, snippetLevel));
-	}
-
-	return lines;
-}
-
-function formatAgentProjectHeader(
-	displayName: string,
-	result: JestResult,
-	options: AgentOptions,
-): Array<string> {
-	const execErrors = result.testResults.filter(hasExecError);
-	const hasFailures = result.numFailedTests > 0 || execErrors.length > 0;
-
+function formatAgentProjectHeader({
+	displayName,
+	options,
+	result,
+}: AgentProjectEntry & { options: AgentOptions }): Array<string> {
 	const fileParts = formatSummaryParts(countFileBuckets(result), PLAIN_STYLES);
-	const lines = [`▶ ${displayName}  ${fileParts.join(" | ")} (${result.numTotalTests} tests)`];
-
-	if (hasFailures) {
-		lines.push(...formatFileHeaders(result, options));
-	}
-
-	return lines;
+	return [
+		`▶ ${displayName}  ${fileParts.join(" | ")} (${result.numTotalTests} tests)`,
+		...formatFileHeaders(result, options),
+	];
 }
 
 function addCounts(running: SummaryCounts, next: SummaryCounts): void {
@@ -544,11 +295,15 @@ function collectMultiProjectStats(projects: Array<AgentProjectEntry>): AgentProj
 	return stats;
 }
 
-function formatMultiProjectFailures(
-	projects: Array<AgentProjectEntry>,
-	stats: AgentProjectStats,
-	options: AgentOptions,
-): Array<string> {
+function formatMultiProjectFailures({
+	options,
+	projects,
+	stats,
+}: {
+	options: ResolvedAgentOptions;
+	projects: Array<AgentProjectEntry>;
+	stats: AgentProjectStats;
+}): Array<string> {
 	const totalFailures = stats.tests.counts.failed + stats.allExecErrors.length;
 	const lines: Array<string> = [
 		"",
@@ -556,14 +311,22 @@ function formatMultiProjectFailures(
 		"",
 	];
 
-	for (const { result } of projects) {
-		if (result.numFailedTests > 0) {
-			lines.push(...formatFailures(result, totalFailures, options));
-		}
+	for (const { result, rootDir } of projects) {
+		lines.push(
+			...formatFailures({
+				options: withPackageRoot(options, rootDir),
+				result,
+				totalFailures,
+			}),
+		);
 	}
 
-	for (const file of stats.allExecErrors) {
-		lines.push(...formatExecError(file, options));
+	for (const { result, rootDir } of projects) {
+		for (const file of result.testResults) {
+			if (hasExecError(file)) {
+				lines.push(...formatExecError(file, withPackageRoot(options, rootDir)));
+			}
+		}
 	}
 
 	const hints = formatAgentLogHints(options);

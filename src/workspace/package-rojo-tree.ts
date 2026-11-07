@@ -3,6 +3,7 @@ import { loadRojoProject, rebaseTreePaths } from "@isentinel/rojo-utils";
 import * as path from "node:path";
 
 import type { RojoTreeNode } from "../types/rojo.ts";
+import type { FileSystem } from "../utils/file-system.ts";
 
 /**
  * Load a package's Rojo tree with every `$path` expressed relative to the
@@ -14,12 +15,26 @@ import type { RojoTreeNode } from "../types/rojo.ts";
  * subdirectory (e.g. `test/default.project.json`) the two bases diverge, so
  * rebase the tree to package-relative paths so mount resolution (findInTree /
  * collectMounts) compares like-for-like.
+ * @param options - Package directory, project file and file system.
+ * @param options.fileSystem - File system to read through.
+ * @param options.packageDirectory - Package directory the paths become relative to.
+ * @param options.rojoProjectPath - Rojo project file to load.
+ * @returns The tree with package-relative `$path` values.
  */
-export function loadPackageRojoTree(
-	rojoProjectPath: string,
-	packageDirectory: string,
-): RojoTreeNode {
+export function loadPackageRojoTree({
+	fileSystem,
+	packageDirectory,
+	rojoProjectPath,
+}: {
+	readonly fileSystem?: FileSystem;
+	readonly packageDirectory: string;
+	readonly rojoProjectPath: string;
+}): RojoTreeNode {
 	const rojoDirectory = path.dirname(rojoProjectPath);
-	const project = loadRojoProject(rojoProjectPath);
-	return rebaseTreePaths(project.tree, rojoDirectory, packageDirectory);
+	const project = loadRojoProject(rojoProjectPath, fileSystem);
+	return rebaseTreePaths({
+		fromDirectory: rojoDirectory,
+		node: project.tree,
+		toDirectory: packageDirectory,
+	});
 }

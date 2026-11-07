@@ -1,17 +1,34 @@
-import { type } from "arktype";
 import { getTsconfig } from "get-tsconfig";
-import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { executorTsconfigSchema, type TsconfigCompilerOptions } from "../config/tsconfig-schema.ts";
-import type { TsconfigMapping } from "../types/tsconfig.ts";
+import type { TsconfigCompilerOptions, TsconfigMapping } from "../types/tsconfig-types.ts";
 import { isTsSource } from "../utils/extensions.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 
 const TSCONFIG_FILENAME = /^tsconfig.*\.json$/i;
 
+/**
+ * How a tsconfig is located and parsed, named once so every caller takes it as
+ * a parameter rather than importing `get-tsconfig` itself.
+ *
+ * Same reason as `FileSystem` in `../utils/file-system.ts`: `get-tsconfig` is
+ * an externalized dependency that reads through a `node:fs` binding of its
+ * own, and `vi.mock` of one holds only while no earlier file in the same worker
+ * evaluated it unmocked — a guarantee Vitest gives with process isolation and
+ * takes away without it.
+ */
+export type TsconfigReader = typeof getTsconfig;
+
+/** The real reader, and the only one production ever uses. */
+export const nodeTsconfigReader: TsconfigReader = getTsconfig;
+
+/** The output and source directories one tsconfig declares. */
 export interface TsconfigDirectories {
+	/** Compiled output directory, if known. */
 	outDir: string | undefined;
+	/** Source root directory, if known. */
 	rootDir: string | undefined;
 }
 
@@ -25,10 +42,32 @@ export interface TsconfigDirectories {
  */
 export type TsconfigMappingCache = Map<string, Array<TsconfigMapping>>;
 
+/** Inputs for `resolveAllTsconfigMappings`. */
+export interface ResolveAllTsconfigMappingsOptions {
+	/** Cache shared across one pass, if any. */
+	cache?: TsconfigMappingCache | undefined;
+	/** File system to scan; defaults to Node's. */
+	fileSystem?: FileSystem | undefined;
+	/** Project root to scan for tsconfigs. */
+	projectRoot: string;
+	/** Reader for tsconfig files; defaults to the real reader. */
+	tsconfigReader?: TsconfigReader | undefined;
+}
+
+/**
+ * Create an empty mapping cache.
+ * @returns A new, empty cache.
+ */
 export function createTsconfigMappingCache(): TsconfigMappingCache {
 	return new Map();
 }
 
+/**
+ * Tell whether a project is plain Luau.
+ * @param testFiles - Paths of the project's tests.
+ * @param tsconfigMappings - Mappings found for the project root.
+ * @returns True when there are no mappings and no TypeScript test file.
+ */
 export function isLuauProject(
 	testFiles: ReadonlyArray<string>,
 	tsconfigMappings: ReadonlyArray<TsconfigMapping>,
@@ -44,39 +83,42 @@ export function isLuauProject(
 	return true;
 }
 
-export function readTsconfigMapping(tsconfigPath: string): TsconfigDirectories | undefined {
-	try {
-		const raw = executorTsconfigSchema(JSON.parse(fs.readFileSync(tsconfigPath, "utf-8")));
-		if (raw instanceof type.errors || raw.compilerOptions === undefined) {
-			return undefined;
-		}
-
-		const mappings = parseTsconfigMappings(raw.compilerOptions);
-		return mappings[0];
-	} catch {
-		return undefined;
-	}
-}
-
-export function resolveAllTsconfigMappings(
-	projectRoot: string,
-	cache?: TsconfigMappingCache,
-): Array<TsconfigMapping> {
+/**
+ * Scan a project root for tsconfig mappings, through the cache when one is given.
+ * @param options - Project root, cache, file system and reader.
+ * @returns The mappings for the project root.
+ */
+export function resolveAllTsconfigMappings({
+	cache,
+	fileSystem = nodeFileSystem,
+	projectRoot,
+	tsconfigReader = nodeTsconfigReader,
+}: ResolveAllTsconfigMappingsOptions): Array<TsconfigMapping> {
 	const resolvedRoot = path.resolve(projectRoot);
 	const cached = cache?.get(resolvedRoot);
 	if (cached !== undefined) {
 		return cached;
 	}
 
-	const mappings = scanTsconfigMappings(resolvedRoot);
+	const mappings = scanTsconfigMappings({ fileSystem, resolvedRoot, tsconfigReader });
 	cache?.set(resolvedRoot, mappings);
 	return mappings;
 }
 
-export function resolveTsconfigDirectories(projectRoot: string): TsconfigDirectories {
+/**
+ * Resolve the project's out and root directories from its local tsconfig.
+ * @param projectRoot - Project root to read from.
+ * @param tsconfigReader - Reader for tsconfig files.
+ * @returns The directories, or both undefined when no local tsconfig has compiler options.
+ */
+export function resolveTsconfigDirectories(
+	projectRoot: string,
+	tsconfigReader: TsconfigReader = nodeTsconfigReader,
+): TsconfigDirectories {
 	// Prefer tsconfig.lib.json (roblox-ts compilation config with correct outDir)
 	// over tsconfig.json (which may point to type-checking outDir like out-tsc/)
-	const tsconfig = getTsconfig(projectRoot, "tsconfig.lib.json") ?? getTsconfig(projectRoot);
+	const tsconfig =
+		tsconfigReader(projectRoot, "tsconfig.lib.json") ?? tsconfigReader(projectRoot);
 
 	// Only use tsconfig if it lives within the project root — ignore
 	// parent-directory tsconfigs that getTsconfig walks up to find.
@@ -109,8 +151,11 @@ function normalizeDirectoryPath(directory: string): string {
 	return normalizeWindowsPath(path.normalize(directory));
 }
 
-function parseTsconfigMappings(options: TsconfigCompilerOptions): Array<TsconfigMapping> {
-	const outDirectory = normalizeDirectoryPath(options.outDir ?? "out");
+function parseTsconfigMappings(
+	options: TsconfigCompilerOptions,
+	declaredOutDirectory: string,
+): Array<TsconfigMapping> {
+	const outDirectory = normalizeDirectoryPath(declaredOutDirectory);
 
 	if (options.rootDirs !== undefined && options.rootDirs.length > 0) {
 		// rootDirs creates a virtual merged root. Output preserves directory
@@ -120,16 +165,16 @@ function parseTsconfigMappings(options: TsconfigCompilerOptions): Array<Tsconfig
 		const commonAncestor = normalized.reduce((ancestor, directory) => {
 			const parts = ancestor.split("/");
 			const directoryParts = directory.split("/");
-			let common = 0;
-			while (
-				common < parts.length &&
-				common < directoryParts.length &&
-				parts[common] === directoryParts[common]
-			) {
-				common++;
+			const common: Array<string> = [];
+			for (const [index, part] of parts.entries()) {
+				if (part !== directoryParts[index]) {
+					break;
+				}
+
+				common.push(part);
 			}
 
-			return parts.slice(0, common).join("/");
+			return common.join("/");
 		});
 		return [{ outDir: outDirectory, rootDir: commonAncestor || "." }];
 	}
@@ -141,10 +186,18 @@ function parseTsconfigMappings(options: TsconfigCompilerOptions): Array<Tsconfig
 	return [{ outDir: outDirectory, rootDir: normalizeDirectoryPath(options.rootDir ?? "src") }];
 }
 
-function scanTsconfigMappings(resolvedRoot: string): Array<TsconfigMapping> {
+function scanTsconfigMappings({
+	fileSystem,
+	resolvedRoot,
+	tsconfigReader,
+}: {
+	fileSystem: FileSystem;
+	resolvedRoot: string;
+	tsconfigReader: TsconfigReader;
+}): Array<TsconfigMapping> {
 	let files: Array<string>;
 	try {
-		files = fs.readdirSync(resolvedRoot).filter((file) => TSCONFIG_FILENAME.test(file));
+		files = fileSystem.readdirSync(resolvedRoot).filter((file) => TSCONFIG_FILENAME.test(file));
 	} catch {
 		return [];
 	}
@@ -153,13 +206,14 @@ function scanTsconfigMappings(resolvedRoot: string): Array<TsconfigMapping> {
 	const mappings: Array<TsconfigMapping> = [];
 
 	for (const file of files) {
-		const tsconfig = getTsconfig(resolvedRoot, file);
+		const tsconfig = tsconfigReader(resolvedRoot, file);
 		const compilerOptions = tsconfig?.config.compilerOptions;
-		if (compilerOptions?.outDir === undefined) {
+		const outDirectory = compilerOptions?.outDir;
+		if (compilerOptions === undefined || outDirectory === undefined) {
 			continue;
 		}
 
-		const parsed = parseTsconfigMappings(compilerOptions);
+		const parsed = parseTsconfigMappings(compilerOptions, outDirectory);
 		for (const entry of parsed) {
 			const key = `${entry.outDir}:${entry.rootDir}`;
 			if (!seen.has(key)) {

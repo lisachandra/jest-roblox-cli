@@ -2,8 +2,9 @@ import { collectPaths } from "@isentinel/rojo-utils";
 
 import * as path from "node:path";
 
+import { createFsClassifier } from "../config/project-mounts.ts";
 import type { ResolvedProjectConfig } from "../config/projects.ts";
-import { createFsClassifier, resolveAllProjects } from "../config/projects.ts";
+import { assertKnownProjectNames, resolveAllProjects } from "../config/projects.ts";
 import type {
 	InlineProjectConfig,
 	ProjectEntry,
@@ -11,28 +12,65 @@ import type {
 	ResolvedConfig,
 } from "../config/schema.ts";
 import {
+	applySetupResolver,
 	createRojoResolverCache,
 	createSetupResolver,
 	type RojoResolverCache,
 } from "../config/setup-resolver.ts";
-import type { PackageDescriptor } from "../staging/synthesizer.ts";
+import type { TsconfigReader } from "../executor/tsconfig-mappings.ts";
+import { nodeTsconfigReader } from "../executor/tsconfig-mappings.ts";
+import type { PackageDescriptor } from "../staging/synthesizer-types.ts";
 import type { RojoTreeNode } from "../types/rojo.ts";
+import type { ChildProcessRunner } from "../utils/child-process.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
+import type { RojoResolverFactory } from "../utils/rojo-project-reader.ts";
+import { nodeRojoResolverFactory } from "../utils/rojo-project-reader.ts";
 import type { LoadedPackage } from "./package-loader.ts";
 import type { PackageInfo } from "./package-resolver.ts";
 import { loadPackageRojoTree } from "./package-rojo-tree.ts";
 
+/** A loaded package with its cache root and resolved projects. */
 export interface PackageContext {
+	/** Directory under the run cache that holds the package's stubs. */
 	cacheRoot: string;
+	/** Descriptor the synthesizer mounts the package from. */
 	descriptor: PackageDescriptor;
+	/** Package name and directory. */
 	info: PackageInfo;
+	/** Package config merged with the CLI options. */
 	pkgConfig: ResolvedConfig;
+	/** Projects the package runs. */
 	projects: Array<ResolvedProjectConfig>;
+}
+
+interface PackageReaders {
+	childProcess: ChildProcessRunner;
+	createResolver: RojoResolverFactory;
+	fileSystem: FileSystem;
+	rojoCache: RojoResolverCache;
+	tsconfigReader: TsconfigReader;
+}
+
+/**
+ * One package's inputs to project synthesis, in the frame its mounts are in.
+ */
+interface VirtualProjectInput {
+	fileSystem: FileSystem;
+	packageConfig: ResolvedConfig;
+	packageDirectory: string;
+	packageName: string;
+	rojoTree: RojoTreeNode;
 }
 
 /**
  * Narrow the resolved contexts to the `--project` names the caller asked for,
  * dropping packages left with no project. An unknown name is a hard error
  * listing what is available.
+ * @param contexts - Resolved package contexts.
+ * @param filter - Project names to keep, or `undefined` to keep all.
+ * @returns The contexts that keep at least one project.
+ * @throws {Error} When a name matches no project.
  */
 export function applyProjectFilter(
 	contexts: Array<PackageContext>,
@@ -50,12 +88,7 @@ export function applyProjectFilter(
 		}
 	}
 
-	const unknown = filter.filter((name) => !available.has(name));
-	if (unknown.length > 0) {
-		throw new Error(
-			`Unknown project name(s): ${unknown.join(", ")}. Available: ${[...available].join(", ")}`,
-		);
-	}
+	assertKnownProjectNames(filter, available);
 
 	return contexts
 		.map((ctx) => {
@@ -67,21 +100,57 @@ export function applyProjectFilter(
 		.filter((ctx) => ctx.projects.length > 0);
 }
 
+/**
+ * Resolve each loaded package's projects and setup files.
+ * @param options - Cache directory, loaded packages and reader seams.
+ * @param options.cacheDirectory - Run cache directory.
+ * @param options.childProcess - Runs lute for a Luau Config that holds code.
+ * @param options.createResolver - Rojo resolver factory.
+ * @param options.fileSystem - File system to read through.
+ * @param options.loaded - Loaded packages.
+ * @param options.tsconfigReader - Reads each project's tsconfig.
+ * @returns One context per loaded package, in order.
+ * @rejects When a package's projects fail to resolve.
+ */
 export async function resolvePackageContextsAsync({
 	cacheDirectory,
+	childProcess,
+	createResolver = nodeRojoResolverFactory,
+	fileSystem = nodeFileSystem,
 	loaded,
+	tsconfigReader = nodeTsconfigReader,
 }: {
+	/** Run cache directory; each package gets a directory below it. */
 	cacheDirectory: string;
+	/** How a Luau Config that holds code runs lute. */
+	childProcess: ChildProcessRunner;
+	/** Rojo resolver factory. Defaults to the real one. */
+	createResolver?: RojoResolverFactory;
+	/**
+	 * Where each package's rojo project is read from. Defaults to the real
+	 * one.
+	 */
+	fileSystem?: FileSystem;
+	/** Loaded packages to resolve. */
 	loaded: Array<LoadedPackage>;
+	/** Tsconfig reader. Defaults to the real one. */
+	tsconfigReader?: TsconfigReader;
 }): Promise<Array<PackageContext>> {
 	const contexts: Array<PackageContext> = [];
 	// Packages commonly mount the same rojo project (a shared test project at
 	// the workspace root, or one package extending another's). Sharing the
 	// cache across the loop walks each distinct project file once.
 	const rojoCache = createRojoResolverCache();
+	const readers: PackageReaders = {
+		childProcess,
+		createResolver,
+		fileSystem,
+		rojoCache,
+		tsconfigReader,
+	};
 
 	for (const entry of loaded) {
-		const projects = await resolvePackageProjectsAsync(entry, rojoCache);
+		const projects = await resolvePackageProjectsAsync(entry, readers);
 		contexts.push({
 			cacheRoot: path.join(cacheDirectory, entry.info.name),
 			descriptor: entry.descriptor,
@@ -94,19 +163,20 @@ export async function resolvePackageContextsAsync({
 	return contexts;
 }
 
-function synthesizeVirtualProjectEntry(
-	packageName: string,
-	packageConfig: ResolvedConfig,
-	rojoTree: RojoTreeNode,
-	packageDirectory: string,
-): InlineProjectConfig {
+function synthesizeVirtualProjectEntry({
+	fileSystem,
+	packageConfig,
+	packageDirectory,
+	packageName,
+	rojoTree,
+}: VirtualProjectInput): InlineProjectConfig {
 	const mountPaths: Array<string> = [];
 	collectPaths(rojoTree, mountPaths);
 
 	// Use the FS classifier so dotted-name directories (e.g. `src/has.dot`)
 	// are not mis-classified as files. `path.posix.extname` would treat
 	// `.dot` as an extension and skip the directory entirely.
-	const classify = createFsClassifier(packageDirectory);
+	const classify = createFsClassifier(packageDirectory, fileSystem);
 	const directoryRoots = mountPaths.filter((value) => classify(value) === "directory");
 
 	const include = directoryRoots.flatMap((root) => {
@@ -125,47 +195,38 @@ function synthesizeVirtualProjectEntry(
 	return { test };
 }
 
-function resolveProjectEntries(
-	packageName: string,
-	packageConfig: ResolvedConfig,
-	rojoTree: RojoTreeNode,
-	packageDirectory: string,
-): Array<ProjectEntry> {
-	const rawProjects = packageConfig.projects;
+function resolveProjectEntries(input: VirtualProjectInput): Array<ProjectEntry> {
+	const rawProjects = input.packageConfig.projects;
 	if (rawProjects !== undefined && rawProjects.length > 0) {
 		return rawProjects;
 	}
 
-	return [synthesizeVirtualProjectEntry(packageName, packageConfig, rojoTree, packageDirectory)];
+	return [synthesizeVirtualProjectEntry(input)];
 }
 
-function applySetupResolver(
-	config: Pick<ResolvedConfig, "setupFiles" | "setupFilesAfterEnv">,
-	resolve: (input: string) => string,
-): void {
-	if (config.setupFiles !== undefined) {
-		config.setupFiles = config.setupFiles.map(resolve);
-	}
-
-	if (config.setupFilesAfterEnv !== undefined) {
-		config.setupFilesAfterEnv = config.setupFilesAfterEnv.map(resolve);
-	}
-}
-
-// Resolve setupFiles / setupFilesAfterEnv for every project against the
-// package's own rojo tree. Without this, the materializer payload carries raw
-// filesystem paths that Jest cannot find as ModuleScript Instances.
-//
-// `createSetupResolver` eagerly builds a `RojoResolver` (a full project-tree
-// filesystem walk) — by far the dominant resolveContexts cost. Skip it entirely
-// when no project declares setup files, mirroring the guard in
-// `resolveSetupFilePaths` (run/discovery.ts). Packages with no setup files (the
-// common case) then pay nothing here.
-function resolvePackageSetupFiles(
-	projects: Array<ResolvedProjectConfig>,
-	entry: LoadedPackage,
-	rojoCache: RojoResolverCache,
-): void {
+/**
+ * Resolve setupFiles / setupFilesAfterEnv for every project against the
+ * package's own rojo tree. Without this, the materializer payload carries raw
+ * filesystem paths that Jest cannot find as ModuleScript Instances.
+ *
+ * `createSetupResolver` eagerly builds a `RojoResolver` (a full project-tree
+ * filesystem walk) — by far the dominant resolveContexts cost. Skip it entirely
+ * when no project declares setup files, mirroring the guard in
+ * `resolveSetupFilePaths` (run/discovery.ts). Packages with no setup files (the
+ * common case) then pay nothing here.
+ * @param options - Package, projects and reader seams.
+ * @param options.entry - Loaded package whose Rojo tree to resolve against.
+ * @param options.projects - Projects whose setup files to resolve.
+ */
+function resolvePackageSetupFiles({
+	createResolver,
+	entry,
+	projects,
+	rojoCache,
+}: PackageReaders & {
+	readonly entry: LoadedPackage;
+	readonly projects: Array<ResolvedProjectConfig>;
+}): void {
 	const hasSetupFiles = projects.some((project) => {
 		return (
 			project.config.setupFiles !== undefined ||
@@ -179,6 +240,7 @@ function resolvePackageSetupFiles(
 	const resolveSetup = createSetupResolver({
 		cache: rojoCache,
 		configDirectory: entry.info.packageDirectory,
+		createResolver,
 		rojoConfigPath: entry.descriptor.rojoProjectPath,
 	});
 	for (const project of projects) {
@@ -188,23 +250,32 @@ function resolvePackageSetupFiles(
 
 async function resolvePackageProjectsAsync(
 	entry: LoadedPackage,
-	rojoCache: RojoResolverCache,
+	readers: PackageReaders,
 ): Promise<Array<ResolvedProjectConfig>> {
+	const { childProcess, fileSystem, tsconfigReader } = readers;
 	const { descriptor, info, pkgConfig } = entry;
-	const rojoTree = loadPackageRojoTree(descriptor.rojoProjectPath, descriptor.packageDirectory);
-	const projectEntries = resolveProjectEntries(
-		info.name,
-		pkgConfig,
+	const rojoTree = loadPackageRojoTree({
+		fileSystem,
+		packageDirectory: descriptor.packageDirectory,
+		rojoProjectPath: descriptor.rojoProjectPath,
+	});
+	const projectEntries = resolveProjectEntries({
+		fileSystem,
+		packageConfig: pkgConfig,
+		packageDirectory: info.packageDirectory,
+		packageName: info.name,
 		rojoTree,
-		info.packageDirectory,
-	);
-	const projects = await resolveAllProjects(
-		projectEntries,
-		pkgConfig,
+	});
+	const projects = await resolveAllProjects({
+		childProcess,
+		cwd: info.packageDirectory,
+		entries: projectEntries,
+		fileSystem,
 		rojoTree,
-		info.packageDirectory,
-	);
+		rootConfig: pkgConfig,
+		tsconfigReader,
+	});
 
-	resolvePackageSetupFiles(projects, entry, rojoCache);
+	resolvePackageSetupFiles({ ...readers, entry, projects });
 	return projects;
 }

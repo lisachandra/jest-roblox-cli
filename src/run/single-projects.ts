@@ -4,34 +4,34 @@ import { findInTree } from "@isentinel/rojo-utils";
 import * as path from "node:path";
 
 import { ConfigError } from "../config/errors.ts";
+import { dedupeMounts } from "../config/project-mounts.ts";
 import type { ResolvedProjectConfig } from "../config/projects.ts";
-import { dedupeMounts } from "../config/projects.ts";
 import type { TypecheckConfig } from "../config/resolve-typecheck-config.ts";
 import type { ResolvedConfig } from "../config/schema.ts";
-import { resolveLuauRoots } from "../coverage-pipeline/prepare.ts";
+import { resolveLuauRoots } from "../coverage-pipeline/luau-roots.ts";
+import type { TsconfigReader } from "../executor/tsconfig-mappings.ts";
+import { isTypeTestFile } from "../typecheck/type-test-pattern.ts";
 import type { RojoTreeNode } from "../types/rojo.ts";
 import { stripTsExtension } from "../utils/extensions.ts";
+import type { FileSystem } from "../utils/file-system.ts";
 import type { PosixRoot } from "../utils/normalize-windows-path.ts";
-import { TYPE_TEST_PATTERN } from "./discovery.ts";
 
-/**
- * Map each compiled-Luau root to its Rojo mount (FS path ↔ DataModel path) via
- * the Rojo tree. Roots that don't map (a compiled-output dir the Rojo project
- * doesn't mount) are skipped; mounts are de-duplicated by DataModel path so
- * two roots resolving to the same mount yield one entry.
- */
-export function deriveProjectMounts(
-	luauRoots: ReadonlyArray<PosixRoot>,
-	rojoTree: RojoTreeNode,
-): Array<Mount> {
-	// `findInTree` does an exact string match, which is why the roots arrive
-	// canonical: "out/shared/" and "./out/shared" find no mount.
-	const mounts = luauRoots.flatMap((fsPath) => {
-		const dataModelPath = findInTree(rojoTree, fsPath, "");
-		return dataModelPath !== undefined ? [{ dataModelPath, fsPath }] : [];
-	});
+/** Inputs of {@link buildImplicitProject}. */
+export interface BuildImplicitProjectOptions extends ImplicitProjectSeams {
+	/** Root config without `projects`. */
+	config: ResolvedConfig;
+	/**
+	 * Rojo tree to map roots through; `undefined` on a `--typecheckOnly` run.
+	 */
+	rojoTree: RojoTreeNode | undefined;
+}
 
-	return dedupeMounts(mounts);
+/** Seams the implicit project reads its Luau roots through. */
+interface ImplicitProjectSeams {
+	/** File system to read tsconfig and roots from. */
+	fileSystem: FileSystem;
+	/** Reads tsconfig files. */
+	tsconfigReader: TsconfigReader;
 }
 
 /**
@@ -52,13 +52,22 @@ export function deriveProjectMounts(
  * needs no Rojo project **on disk** at all, so the tree is never loaded and
  * the project carries no mounts. The "no mounts" `ConfigError` therefore only
  * fires when a tree was actually consulted.
+ *
+ * @param options - Config, Rojo tree and seams.
+ * @param options.config - Root config without `projects`.
+ * @param options.rojoTree - Rojo tree, or `undefined` on a `--typecheckOnly` run.
+ * @returns One project over the derived mounts and runtime globs.
+ * @throws {ConfigError} When a Rojo tree is given and no root maps to a mount.
  */
-export function buildImplicitProject(
-	config: ResolvedConfig,
-	rojoTree: RojoTreeNode | undefined,
-): ResolvedProjectConfig {
+export function buildImplicitProject({
+	config,
+	rojoTree,
+	...seams
+}: BuildImplicitProjectOptions): ResolvedProjectConfig {
 	const mounts =
-		rojoTree === undefined ? [] : deriveProjectMounts(resolveLuauRoots(config), rojoTree);
+		rojoTree === undefined
+			? []
+			: deriveProjectMounts(resolveLuauRoots({ ...seams, config }), rojoTree);
 	if (rojoTree !== undefined && mounts.length === 0) {
 		throw new ConfigError(
 			"No test projects could be derived: none of the resolved luauRoots map to a $path mount in your Rojo project.",
@@ -72,7 +81,7 @@ export function buildImplicitProject(
 	// `include` entry — a `-d` glob has no `.spec`/`.test` source extension and
 	// would throw, crashing a `--coverage` run. Mirrors `resolveProjectConfig`,
 	// which never folds `-d` globs into a project's `include`.
-	const runtimeGlobs = config.testMatch.filter((glob) => !matchesTypeTestGlob(glob));
+	const runtimeGlobs = config.testMatch.filter((glob) => !isTypeTestFile(glob));
 
 	const singleMount = mounts.length === 1 ? mounts[0] : undefined;
 	const displayColor =
@@ -91,8 +100,32 @@ export function buildImplicitProject(
 	};
 }
 
-function matchesTypeTestGlob(glob: string): boolean {
-	return TYPE_TEST_PATTERN.test(glob);
+/**
+ * Map each compiled-Luau root to its Rojo mount (FS path ↔ DataModel path) via
+ * the Rojo tree. Roots that don't map (a compiled-output dir the Rojo project
+ * doesn't mount) are skipped; mounts are de-duplicated by DataModel path so
+ * two roots resolving to the same mount yield one entry.
+ *
+ * @param luauRoots - Canonical compiled-Luau roots.
+ * @param rojoTree - Tree that maps filesystem paths to DataModel paths.
+ * @returns One mount per DataModel path that a root maps to.
+ */
+function deriveProjectMounts(
+	luauRoots: ReadonlyArray<PosixRoot>,
+	rojoTree: RojoTreeNode,
+): Array<Mount> {
+	// `findInTree` does an exact string match, which is why the roots arrive
+	// canonical: "out/shared/" and "./out/shared" find no mount.
+	const mounts = luauRoots.flatMap((fsPath) => {
+		const dataModelPath = findInTree({
+			currentDataModelPath: "",
+			node: rojoTree,
+			targetPath: fsPath,
+		});
+		return dataModelPath !== undefined ? [{ dataModelPath, fsPath }] : [];
+	});
+
+	return dedupeMounts(mounts);
 }
 
 /**
@@ -102,9 +135,12 @@ function matchesTypeTestGlob(glob: string): boolean {
  * `testMatch` is *only* `-d` globs discovers nothing. An explicit
  * `test.typecheck.include` wins, and an empty derivation is left unset so
  * `deriveTypecheckInclude` still runs off the runtime globs.
+ *
+ * @param config - Root config.
+ * @returns The typecheck config, with `include` seeded when globs exist.
  */
 function resolveImplicitTypecheck(config: ResolvedConfig): TypecheckConfig | undefined {
-	const include = config.typecheck?.include ?? config.testMatch.filter(matchesTypeTestGlob);
+	const include = config.typecheck?.include ?? config.testMatch.filter(isTypeTestFile);
 	if (include.length === 0) {
 		return config.typecheck;
 	}
@@ -112,10 +148,16 @@ function resolveImplicitTypecheck(config: ResolvedConfig): TypecheckConfig | und
 	return { ...config.typecheck, include };
 }
 
-// Mirror `resolveProjectConfig`'s `testMatch` derivation: strip the test-file
-// extension, then qualify a bare basename glob with `**/` so it matches at any
-// depth (the runner matches Instance-namespace paths) — keeping the implicit
-// project's matcher identical to a configured project's for the same globs.
+/**
+ * Mirror `resolveProjectConfig`'s `testMatch` derivation: strip the test-file
+ * extension, then qualify a bare basename glob with a `**` directory so it
+ * matches at any depth (the runner matches Instance-namespace paths) — keeping
+ * the implicit project's matcher identical to a configured project's for the
+ * same globs.
+ *
+ * @param glob - Runtime `testMatch` glob.
+ * @returns The runner-side `testMatch` pattern.
+ */
 function toTestMatchPattern(glob: string): string {
 	const stripped = stripTsExtension(glob);
 	return stripped.includes("/") ? stripped : `**/${stripped}`;

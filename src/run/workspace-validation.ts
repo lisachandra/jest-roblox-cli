@@ -2,8 +2,9 @@ import { resolveCredentials, type RunnerCredentials } from "@isentinel/roblox-ru
 
 import assert from "node:assert";
 
-import { isExplicitMultiShard } from "../backends/interface.ts";
-import type { Backend, CliOptions, WorkspaceRunOptions } from "../config/schema.ts";
+import type { CliOptions, WorkspaceRunOptions } from "../config/schema.ts";
+import type { ChildProcessRunner } from "../utils/child-process.ts";
+import type { FileSystem } from "../utils/file-system.ts";
 import { getAffectedPackages } from "../workspace/affected.ts";
 import {
 	enumerateWorkspacePackages,
@@ -12,6 +13,12 @@ import {
 	type PackageInfo,
 	resolvePackages,
 } from "../workspace/package-resolver.ts";
+
+/** {@link EnumerationOptions} plus what `--affected-since` launches. */
+interface WorkspacePackageSelection extends EnumerationOptions {
+	childProcess: ChildProcessRunner;
+	fileSystem: FileSystem;
+}
 
 interface WorkspaceValidationOk {
 	ok: true;
@@ -43,12 +50,23 @@ const WORKSPACE_ONLY_FLAGS: ReadonlyArray<{
 	{ name: "--bail", isPresent: (cli) => cli.bail === true },
 ];
 
+/** Inputs of {@link resolveWorkspacePackages}. */
+export interface ResolveWorkspacePackagesOptions extends WorkspacePackageSelection {
+	/** Parsed command-line options. */
+	cli: CliOptions;
+	/** Absolute workspace root directory. */
+	workspaceRoot: string;
+}
+
 /**
  * Whether this invocation belongs on the workspace path.
  *
  * `--workspace` says so outright; the workspace-only flags say so by being
  * present without it, which is what lets the validation below reject them by
  * name rather than leaving them silently inert on a single-package run.
+ *
+ * @param cli - Parsed command-line options.
+ * @returns `true` when the run takes the workspace path.
  */
 export function isWorkspaceInvocation(cli: CliOptions): boolean {
 	return cli.workspace === true || WORKSPACE_ONLY_FLAGS.some((flag) => flag.isPresent(cli));
@@ -57,6 +75,9 @@ export function isWorkspaceInvocation(cli: CliOptions): boolean {
 /**
  * Pure CLI-shape checks — runs before package resolution or config loading.
  * Catches mutually-exclusive flag combos and the missing --workspace.
+ *
+ * @param cli - Parsed command-line options.
+ * @returns Ok, or exit code `2` with the error message.
  */
 export function validateBasicWorkspaceFlags(cli: CliOptions): WorkspaceValidationResult {
 	if (cli.packages !== undefined && cli.affectedSince !== undefined) {
@@ -75,63 +96,11 @@ export function validateBasicWorkspaceFlags(cli: CliOptions): WorkspaceValidatio
 		};
 	}
 
-	const vmParallelError = rejectVmParallel(cli);
-	if (vmParallelError !== undefined) {
-		return vmParallelError;
-	}
-
 	// A bare `--workspace` means every package, so an empty `--packages` cannot
 	// fall through to it: the user narrowed the run and then named nothing, and
 	// running the whole workspace is the one answer they did not ask for.
 	if (cli.packages !== undefined && !hasNonEmptyPackages(cli.packages)) {
 		return { exitCode: 2, message: "Error: --packages names no packages.\n", ok: false };
-	}
-
-	return { ok: true };
-}
-
-/**
- * Checks the resolved WorkspaceRunOptions for invariants that depend on the
- * fully resolved values (CLI > per-package consensus > defaults).
- *
- * Every backend now runs workspace (studio-cli launches its own mega-place;
- * the attached `studio` backend runs against an open Studio for debugging),
- * so what is left are the two things a Studio transport cannot do: shard (it
- * drives one Studio instance — see {@link isExplicitMultiShard} for why
- * `"auto"` is not a conflict), and carry a bail back to the CLI.
- */
-export function assertWorkspaceRunOptions({
-	backend,
-	bail,
-	parallel,
-}: WorkspaceRunOptions): WorkspaceValidationResult {
-	if (backend === "studio-cli" && isExplicitMultiShard(parallel)) {
-		return {
-			exitCode: 2,
-			// Source-agnostic: the count reaching here may come from a package
-			// config rather than a flag, so "drop --parallel" would name a
-			// remedy the user does not have.
-			message:
-				"Error: studio-cli backend is serial (one Studio instance) and cannot " +
-				'shard; set parallel to 1 or "auto" for a --workspace run.\n',
-			ok: false,
-		};
-	}
-
-	// Bail lives in the staged materializer's entry loop, and travels back on
-	// the Open Cloud task envelope (between parallel tasks, through a
-	// MemoryStore signal map). The Studio plugin drives that same loop but its
-	// protocol carries neither channel, so a Studio run would test every
-	// package while the user waits for it to stop early. Teaching the plugin
-	// protocol to report a bail is what would lift this, not anything here.
-	if (bail && isStudioBackend(backend)) {
-		return {
-			exitCode: 2,
-			message:
-				"Error: --bail is Open Cloud only; a Studio backend runs every " +
-				"package in the workspace regardless.\n",
-			ok: false,
-		};
 	}
 
 	return { ok: true };
@@ -144,22 +113,39 @@ export function assertWorkspaceRunOptions({
  *
  * The `--affected-since` branch already carries directory +
  * `package.json#name` from turbo/nx, so it skips enumeration entirely.
+ *
+ * @param options - CLI options, workspace root and enumeration inputs.
+ * @param options.childProcess - Runs the change detector for `--affected-since`.
+ * @param options.cli - Parsed command-line options.
+ * @param options.exclude - Package globs to exclude.
+ * @param options.fileSystem - File system to enumerate.
+ * @param options.patterns - Package globs to enumerate.
+ * @param options.workspaceRoot - Absolute workspace root directory.
+ * @returns The selected packages.
  */
-export function resolveWorkspacePackages(
-	cli: CliOptions,
-	workspaceRoot: string,
-	{ exclude, patterns }: EnumerationOptions = {},
-): Array<PackageInfo> {
+export function resolveWorkspacePackages({
+	childProcess,
+	cli,
+	exclude,
+	fileSystem,
+	patterns,
+	workspaceRoot,
+}: ResolveWorkspacePackagesOptions): Array<PackageInfo> {
 	if (cli.affectedSince !== undefined) {
-		return excludePackages(
-			getAffectedPackages(workspaceRoot, cli.affectedSince),
-			workspaceRoot,
+		return excludePackages({
 			exclude,
-		);
+			packages: getAffectedPackages({
+				childProcess,
+				fileSystem,
+				ref: cli.affectedSince,
+				workspaceRoot,
+			}),
+			workspaceRoot,
+		});
 	}
 
 	if (cli.packages === undefined) {
-		return enumerateWorkspacePackages(workspaceRoot, { exclude, patterns });
+		return enumerateWorkspacePackages(workspaceRoot, { exclude, fileSystem, patterns });
 	}
 
 	// One enumeration for the whole flag rather than one per name, which is what
@@ -167,9 +153,22 @@ export function resolveWorkspacePackages(
 	//
 	// No exclude here. Naming a package is asking for it, whatever a
 	// workspace-wide default says.
-	return resolvePackages(workspaceRoot, splitPackageNames(cli.packages), { patterns });
+	return resolvePackages({
+		fileSystem,
+		names: splitPackageNames(cli.packages),
+		patterns,
+		workspaceRoot,
+	});
 }
 
+/**
+ * Resolve Open Cloud credentials from CLI flags, `JEST_` environment variables
+ * and the workspace run options.
+ *
+ * @param cli - Parsed command-line options.
+ * @param runOptions - Workspace run options with default IDs.
+ * @returns The resolved credentials.
+ */
 export function buildWorkspaceCredentials(
 	cli: CliOptions,
 	runOptions: WorkspaceRunOptions,
@@ -182,42 +181,16 @@ export function buildWorkspaceCredentials(
 }
 
 /**
- * In-session parallelism splits the configs of ONE multi-project run across
- * Luau VMs, so a workspace run has nothing for it to split.
- *
- * A deliberate per-mode fork, against the package's cross-mode parity rule:
- * the two modes do not share an execution model here. Multi dispatches a
- * `configs` array to `Runner.runProjects`, which is what the VM hosts slice
- * up; workspace dispatches `workspace.entries` to
- * `EmbeddedRunner.runEmbedded`, which materializes a package from the
- * mega-place's stage, runs it, and resets the DataModel before the next one.
- * That materialize/run/reset cycle owns the DataModel for its package by
- * design, so overlapping packages would corrupt each other's staging rather
- * than merely contend for services. Rejecting the flag says so; leaving it
- * inert would read as a silent no-op.
- */
-function rejectVmParallel(cli: CliOptions): undefined | WorkspaceValidationError {
-	if (cli.experimentalVmParallel === undefined) {
-		return undefined;
-	}
-
-	return {
-		exitCode: 2,
-		message:
-			"Error: --experimental-vm-parallel is not supported in workspace mode; " +
-			"it splits the configs of a single multi-project run.\n",
-		ok: false,
-	};
-}
-
-/**
  * Which workspace-only flag routed this invocation here without `--workspace`.
+ *
+ * @param cli - Parsed command-line options.
+ * @returns The first present workspace-only flag, as the error names it.
  */
 function namePresentWorkspaceFlag(cli: CliOptions): string {
 	const present = WORKSPACE_ONLY_FLAGS.find((flag) => flag.isPresent(cli));
 	// `isWorkspaceInvocation` is what routed the run here, and `--workspace` is
 	// absent, so one of these is set — a miss means the two have drifted apart.
-	assert(present !== undefined, "a workspace-only flag routed this invocation");
+	assert(present !== undefined);
 	return present.name;
 }
 
@@ -230,15 +203,4 @@ function splitPackageNames(packages: string): Array<string> {
 
 function hasNonEmptyPackages(packages: string): boolean {
 	return splitPackageNames(packages).length > 0;
-}
-
-/**
- * Whether this backend drives a Studio process rather than Open Cloud.
- *
- * Named as a deny-list on purpose: `"auto"` is the default and workspace mode
- * resolves it to Open Cloud without probing, so asking `!== "open-cloud"` would
- * catch the default invocation.
- */
-function isStudioBackend(backend: Backend): boolean {
-	return backend === "studio" || backend === "studio-cli";
 }

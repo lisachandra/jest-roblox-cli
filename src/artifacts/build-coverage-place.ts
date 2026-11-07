@@ -1,8 +1,6 @@
 import * as path from "node:path";
 
 import { mergeCliWithConfig } from "../config/merge.ts";
-import { resolveAllProjects } from "../config/projects.ts";
-import type { ResolvedProjectConfig } from "../config/projects.ts";
 import type { CliOptions, ResolvedConfig } from "../config/schema.ts";
 import { cleanLeftoverStubs, generateProjectStubs } from "../config/stubs.ts";
 import type {
@@ -14,9 +12,12 @@ import {
 	COVERAGE_BUILD_MANIFEST_PATH,
 	COVERAGE_MANIFEST_PATH,
 } from "../coverage-pipeline/prepare.ts";
-import { loadRojoTree } from "../run/multi.ts";
-import { buildImplicitProject } from "../run/single-projects.ts";
+import type { RunEntryOptions } from "../run.ts";
+import { nodeRunDispatch } from "../run.ts";
+import { nodeRunSeams } from "../run/seams.ts";
 import { prepareBakedCoverageAsync } from "../run/staging.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
+import { resolveProjectsAsync } from "./place-projects.ts";
 
 const CACHE_DIR = path.join(".jest-roblox", "cache");
 
@@ -28,6 +29,7 @@ const CACHE_DIR = path.join(".jest-roblox", "cache");
  * caller to copy to the run machine — it is never cleaned.
  */
 export interface CoveragePlaceBundle {
+	/** Build id shared by the place and its sibling manifests. */
 	buildId: string;
 	/** The always-on build record's path (`build-manifest.json`). */
 	buildManifestPath: string;
@@ -57,34 +59,46 @@ export interface CoveragePlaceBundle {
  * the `prepareBakedCoverage` seam with the run path but always bakes stubs
  * (the run path skips baking for studio-cli, which injects configs at
  * runtime), because a place handed to a foreign runner must be self-contained.
+ *
+ * @param config - Resolved config; coverage collection is forced on.
+ * @param options - Optional dispatch, file system and run seams.
+ * @returns The built place, its manifest paths and the baked projects.
  */
 export async function buildCoveragePlaceAsync(
 	config: ResolvedConfig,
+	{
+		dispatch = nodeRunDispatch(),
+		fileSystem = nodeFileSystem,
+		seams = nodeRunSeams(),
+	}: RunEntryOptions = {},
 ): Promise<CoveragePlaceBundle> {
 	const cli: CliOptions = {};
 	const merged = mergeCliWithConfig(cli, { ...config, collectCoverage: true });
 
-	const projects = await resolveProjectsAsync(merged);
+	const projects = await resolveProjectsAsync(merged, { dispatch, fileSystem, seams });
 
 	const cacheRoot = path.resolve(merged.rootDir, CACHE_DIR);
 	// Mirror the run path's pre-flight: drop marker-bearing leftover stubs, then
 	// regenerate the current set into the cache (never the user's source tree) so
 	// `prepareBakedCoverage` can bake them into the place.
-	cleanLeftoverStubs(projects, merged.rootDir);
-	generateProjectStubs(projects, merged.rootDir, cacheRoot);
+	const stubRoot = { fileSystem, rootDirectory: merged.rootDir };
+	cleanLeftoverStubs({ projects, ...stubRoot });
+	generateProjectStubs({ projects, ...stubRoot, outputRoot: cacheRoot });
 
 	const { artifacts } = await prepareBakedCoverageAsync({
 		bakeStubs: true,
 		cacheRoot,
 		config: merged,
+		fileSystem,
 		projects,
+		seams,
 	});
 
 	// Emit only when the place was rebuilt this run, matching `runJestRoblox`:
 	// the reuse path leaves the prior (still-valid) build manifest in place, and
 	// `prepareCoverage`'s reuse gate already re-validated it against disk.
 	if (artifacts.rebuilt) {
-		emitBuildManifest(COVERAGE_BUILD_MANIFEST_PATH, artifacts);
+		emitBuildManifest({ artifacts, filePath: COVERAGE_BUILD_MANIFEST_PATH, fileSystem });
 	}
 
 	return {
@@ -95,21 +109,4 @@ export async function buildCoveragePlaceAsync(
 		projects: artifacts.projects,
 		rebuilt: artifacts.rebuilt,
 	};
-}
-
-/**
- * Resolve the project set the place is built from, mirroring
- * `runSingleOrMulti` dispatch: an explicit `projects:` config resolves through
- * `resolveAllProjects`; a bare config collapses to the single implicit project
- * derived from its luau roots. Type-only configs are irrelevant here — a build
- * always instruments.
- */
-async function resolveProjectsAsync(config: ResolvedConfig): Promise<Array<ResolvedProjectConfig>> {
-	const rojoTree = loadRojoTree(config);
-	const rawProjects = config.projects;
-	if (rawProjects !== undefined && rawProjects.length > 0) {
-		return resolveAllProjects(rawProjects, config, rojoTree, config.rootDir);
-	}
-
-	return [buildImplicitProject(config, rojoTree)];
 }

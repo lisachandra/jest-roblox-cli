@@ -26,8 +26,8 @@ import type {
 	TestDefinition,
 	TestFileResult,
 	TestStatus,
-	TscErrorInfo,
 	TypecheckOptions,
+	TypeTestDiagnostic,
 } from "./index.ts";
 import {
 	buildJestArgv,
@@ -52,6 +52,7 @@ import {
 	readBuildManifest,
 	readCoverageManifest,
 	resolveConfig,
+	resolveLayoutProject,
 	runProjectsAsync,
 	runTypecheckAsync,
 	writeGameOutput,
@@ -108,20 +109,26 @@ describe(resolveConfig, () => {
 	});
 });
 
+describe(resolveLayoutProject, () => {
+	it("should give back the config the CLI runs", () => {
+		expectTypeOf(resolveLayoutProject).returns.toEqualTypeOf<ResolvedConfig>();
+	});
+});
+
 describe(loadConfig, () => {
 	it("should return Promise<ResolvedConfig>", () => {
 		expectTypeOf(loadConfig).returns.toEqualTypeOf<Promise<ResolvedConfig>>();
 	});
 
-	it("should accept optional configPath and cwd", () => {
+	it("should accept optional configPath and cwd in one options object", () => {
 		expectTypeOf(loadConfig).toBeCallableWith();
-		expectTypeOf(loadConfig).toBeCallableWith("path");
-		expectTypeOf(loadConfig).toBeCallableWith("path", "cwd");
+		expectTypeOf(loadConfig).toBeCallableWith({ configPath: "path" });
+		expectTypeOf(loadConfig).toBeCallableWith({ configPath: "path", cwd: "cwd" });
 	});
 
-	it("should reject non-string arguments", () => {
-		// @ts-expect-error number is not a valid config path
-		void loadConfig(123);
+	it("should reject positional arguments", () => {
+		// @ts-expect-error configPath moved into the options object
+		void loadConfig("path", "cwd");
 	});
 });
 
@@ -267,10 +274,10 @@ describe("type exports", () => {
 		expectTypeOf<TestDefinition>().toHaveProperty("type");
 	});
 
-	it("should export TscErrorInfo with required fields", () => {
-		expectTypeOf<TscErrorInfo>().toHaveProperty("filePath");
-		expectTypeOf<TscErrorInfo>().toHaveProperty("line");
-		expectTypeOf<TscErrorInfo>().toHaveProperty("errorMessage");
+	it("should export TypeTestDiagnostic with required fields", () => {
+		expectTypeOf<TypeTestDiagnostic>().toHaveProperty("filePath");
+		expectTypeOf<TypeTestDiagnostic>().toHaveProperty("line");
+		expectTypeOf<TypeTestDiagnostic>().toHaveProperty("message");
 	});
 
 	it("should export CliOptions with optional fields", () => {

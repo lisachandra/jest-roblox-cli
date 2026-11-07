@@ -1,19 +1,63 @@
-import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { JestResult } from "../types/jest-result.ts";
+import type { JestResult } from "../types/jest-result-types.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
+import { makeRelative } from "./shared.ts";
 
-export function formatJson(result: JestResult): string {
-	return JSON.stringify(result, null, 2);
+/**
+ * Inputs of `writeJsonFileAsync`.
+ */
+export interface WriteJsonFileOptions {
+	/**
+	 * Destination, resolved against the working directory.
+	 */
+	filePath: string;
+	/**
+	 * File system to write through; defaults to Node's.
+	 */
+	fileSystem?: FileSystem;
+	/**
+	 * Result to serialize.
+	 */
+	result: JestResult;
+	/**
+	 * Root that test file paths are written relative to.
+	 */
+	rootDir: string;
 }
 
-// Awaits through `node:fs`'s own promises API rather than importing
-// `node:fs/promises`: every spec that exercises an output sink mocks `node:fs`
-// with memfs, and a second module specifier would slip past those mocks and
-// write to the real disk.
-export async function writeJsonFileAsync(result: JestResult, filePath: string): Promise<void> {
+/**
+ * Serialize a result as indented JSON.
+ * @param result - Result to serialize.
+ * @param rootDirectory - Root that test file paths are written relative to;
+ *   absent writes them as they are.
+ * @returns The JSON text.
+ */
+export function formatJson(result: JestResult, rootDirectory?: string): string {
+	if (rootDirectory === undefined) {
+		return JSON.stringify(result, null, 2);
+	}
+
+	const testResults = result.testResults.map((file) => {
+		return { ...file, testFilePath: makeRelative(file.testFilePath, rootDirectory) };
+	});
+	return JSON.stringify({ ...result, testResults }, null, 2);
+}
+
+/**
+ * Write a result as indented JSON, creating parent directories.
+ * @param options - Destination, file system and result.
+ * @rejects When a directory or the file cannot be written.
+ */
+export async function writeJsonFileAsync({
+	filePath,
+	fileSystem = nodeFileSystem,
+	result,
+	rootDir,
+}: WriteJsonFileOptions): Promise<void> {
 	const absolutePath = path.resolve(filePath);
 
-	await fs.promises.mkdir(path.dirname(absolutePath), { recursive: true });
-	await fs.promises.writeFile(absolutePath, formatJson(result), "utf8");
+	await fileSystem.promises.mkdir(path.dirname(absolutePath), { recursive: true });
+	await fileSystem.promises.writeFile(absolutePath, formatJson(result, rootDir), "utf8");
 }

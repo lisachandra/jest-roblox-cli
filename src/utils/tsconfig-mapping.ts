@@ -1,10 +1,35 @@
-import type { TsconfigMapping } from "../types/tsconfig.ts";
+import type { TsconfigMapping } from "../types/tsconfig-types.ts";
 
-export function findMapping(
-	filePath: string,
-	mappings: ReadonlyArray<TsconfigMapping>,
-	key: "outDir" | "rootDir" = "outDir",
-): TsconfigMapping | undefined {
+/** Inputs for {@link findMapping}. */
+export interface FindMappingOptions {
+	/** Which root to match the path against; defaults to `outDir`. */
+	readonly key?: "outDir" | "rootDir";
+	/** The path to find a mapping for. */
+	readonly filePath: string;
+	/** The candidate mappings. */
+	readonly mappings: ReadonlyArray<TsconfigMapping>;
+}
+
+/** Inputs for {@link replacePrefix}. */
+export interface ReplacePrefixOptions {
+	/** The path to rewrite. */
+	readonly filePath: string;
+	/** The directory prefix to remove. */
+	readonly from: string;
+	/** The directory prefix to put in its place. */
+	readonly to: string;
+}
+
+/**
+ * Find the mapping whose root contains a path, preferring the longest root.
+ * @param options - The path, the mappings and which root to match.
+ * @returns The best mapping, or `undefined` when none contains the path.
+ */
+export function findMapping({
+	key = "outDir",
+	filePath,
+	mappings,
+}: FindMappingOptions): TsconfigMapping | undefined {
 	let best: TsconfigMapping | undefined;
 	let bestLength = -1;
 
@@ -21,7 +46,12 @@ export function findMapping(
 	return best;
 }
 
-export function replacePrefix(filePath: string, from: string, to: string): string {
+/**
+ * Move a path from one directory prefix to another.
+ * @param options - The path and the two prefixes.
+ * @returns The rewritten path, or the input when it is not under `from`.
+ */
+export function replacePrefix({ filePath, from, to }: ReplacePrefixOptions): string {
 	if (filePath === from) {
 		return to;
 	}

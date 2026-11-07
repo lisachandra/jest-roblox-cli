@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
 import type { ResolvedConfig } from "./config/schema.ts";
-import { DEFAULT_CONFIG } from "./config/schema.ts";
 import { buildJestArgv, generateTestScript, type JestArgvInput } from "./test-script.ts";
 
 function createConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
-	return { ...DEFAULT_CONFIG, ...overrides };
+	return { ...createResolvedConfig(), ...overrides };
 }
 
 function createOptions(overrides?: {
@@ -41,6 +41,35 @@ describe(buildJestArgv, () => {
 		);
 
 		expect(argv.testMatch).toStrictEqual(["**/*.spec.ts.backup", "**/*.spec"]);
+	});
+
+	it("should drop Type Test patterns from the Roblox testMatch", () => {
+		expect.assertions(1);
+
+		const argv = buildJestArgv(
+			createOptions({
+				config: {
+					testMatch: [
+						"**/*.spec.ts",
+						"**/*.spec-d.ts",
+						"**/*.test-d.luau",
+						"**/*.test.luau",
+					],
+				},
+			}),
+		);
+
+		expect(argv.testMatch).toStrictEqual(["**/*.spec", "**/*.test"]);
+	});
+
+	it("should ignore Type Test modules on top of the configured ignore patterns", () => {
+		expect.assertions(1);
+
+		const argv = buildJestArgv(
+			createOptions({ config: { testPathIgnorePatterns: ["/node_modules/"] } }),
+		);
+
+		expect(argv.testPathIgnorePatterns).toStrictEqual(["/node_modules/", "\\.(spec|test)-d$"]);
 	});
 
 	it("should pass through bail when set", () => {
@@ -348,13 +377,27 @@ describe(generateTestScript, () => {
 	});
 
 	it("should embed config as JSON", () => {
-		expect.assertions(4);
+		expect.assertions(5);
 
 		const script = generateTestScript(createOptions({ config: { verbose: true } }));
 
 		expect(script).toContain("JSONDecode");
 		expect(script).toContain('"verbose":true');
-		expect(script).toStartWith("local __WELD_MODULES = {");
+		expect(script).toStartWith("--!strict\n");
+		expect(script).toMatch(/^local __WELD_MODULES = \{/mu);
 		expect(script).not.toContain("__CONFIG_JSON__");
+	});
+
+	it("should embed one argv per config of a bucket", () => {
+		expect.assertions(1);
+
+		const first = createOptions({ testFiles: ["src/a.spec.ts"] });
+		const second = createOptions({ testFiles: ["src/b.spec.ts"] });
+
+		const script = generateTestScript([first, second]);
+
+		expect(script).toContain(
+			JSON.stringify({ configs: [buildJestArgv(first), buildJestArgv(second)] }),
+		);
 	});
 });

@@ -1,575 +1,29 @@
 import { fromAny } from "@total-typescript/shoehorn";
 
-import * as childProcess from "node:child_process";
-import * as fs from "node:fs";
-import { createRequire } from "node:module";
+import type * as childProcess from "node:child_process";
 import * as path from "node:path";
 import process from "node:process";
 import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { posixPath } from "#test/mocks/posix-path.ts";
 import { ConfigError } from "../config/errors.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
-import {
-	createLocationsIndexMap,
-	isCompositeProject,
-	mapErrorsToTests,
-	runTypecheckAsync,
-} from "./runner.ts";
-import type { RawErrorsMap, TestDefinition } from "./types.ts";
-
-vi.mock(import("node:child_process"));
-vi.mock(import("node:fs"));
-
-// `resolveTsgoScript` locates the tsgo binary through `createRequire`. `spy`
-// keeps every export's real implementation, so only the missing-package test
-// overrides it and every other test resolves the installed package.
-vi.mock(import("node:module"), { spy: true });
-
-describe(createLocationsIndexMap, () => {
-	it("should map line:column pairs to character indices", () => {
-		expect.assertions(3);
-
-		const source = "abc\ndef\n";
-		const indexMap = createLocationsIndexMap(source);
-
-		expect(indexMap.get("1:1")).toBe(0);
-		expect(indexMap.get("1:3")).toBe(2);
-		expect(indexMap.get("2:1")).toBe(4);
-	});
-});
-
-describe(mapErrorsToTests, () => {
-	it("should mark all tests as passed when no errors exist", () => {
-		expect.assertions(2);
-
-		const errors: RawErrorsMap = new Map();
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"/test.ts",
-				{
-					definitions: [
-						{ name: "should pass", ancestorNames: [], end: 27, start: 0, type: "test" },
-					],
-					source: 'it("should pass", () => {});',
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, Date.now());
-
-		expect(result.success).toBeTrue();
-		expect(result.testResults[0]!.testResults[0]!.status).toBe("passed");
-	});
-
-	it("should fail the test containing the error", () => {
-		expect.assertions(4);
-
-		const source =
-			'describe("suite", () => {\n  it("should fail", () => {\n    bad;\n  });\n});';
-		const errors: RawErrorsMap = new Map([
-			[
-				"/test.ts",
-				[
-					{
-						column: 5,
-						errorCode: 2322,
-						errorMessage: "Type mismatch",
-						filePath: "/test.ts",
-						line: 3,
-					},
-				],
-			],
-		]);
-
-		const definitions: Array<TestDefinition> = [
-			{ name: "suite", ancestorNames: [], end: source.length - 1, start: 0, type: "suite" },
-			{ name: "should fail", ancestorNames: ["suite"], end: 64, start: 26, type: "test" },
-		];
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			["/test.ts", { definitions, source }],
-		]);
-
-		const result = mapErrorsToTests(errors, files, 123);
-
-		expect(result.success).toBeFalse();
-		expect(result.testResults[0]!.testResults[0]!.status).toBe("failed");
-		expect(result.testResults[0]!.testResults[0]!.failureMessages).toHaveLength(1);
-		expect(result).toMatchSnapshot();
-	});
-
-	it("should attribute error outside test blocks to file-level failure", () => {
-		expect.assertions(3);
-
-		const source = 'const x: number = "bad";\nit("should pass", () => {});';
-		const errors: RawErrorsMap = new Map([
-			[
-				"/test.ts",
-				[
-					{
-						column: 7,
-						errorCode: 2322,
-						errorMessage: "Type mismatch",
-						filePath: "/test.ts",
-						line: 1,
-					},
-				],
-			],
-		]);
-
-		const definitions: Array<TestDefinition> = [
-			{ name: "should pass", ancestorNames: [], end: 52, start: 25, type: "test" },
-		];
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			["/test.ts", { definitions, source }],
-		]);
-
-		const result = mapErrorsToTests(errors, files, 123);
-
-		expect(result.success).toBeFalse();
-		expect(result.numFailedTests).toBePositive();
-		expect(result).toMatchSnapshot();
-	});
-
-	it("should collect multiple errors in the same test", () => {
-		expect.assertions(1);
-
-		const source = 'it("should fail", () => {\n  a;\n  b;\n});';
-		const errors: RawErrorsMap = new Map([
-			[
-				"/test.ts",
-				[
-					{
-						column: 3,
-						errorCode: 2322,
-						errorMessage: "Error one",
-						filePath: "/test.ts",
-						line: 2,
-					},
-					{
-						column: 3,
-						errorCode: 2322,
-						errorMessage: "Error two",
-						filePath: "/test.ts",
-						line: 3,
-					},
-				],
-			],
-		]);
-
-		const definitions: Array<TestDefinition> = [
-			{ name: "should fail", ancestorNames: [], end: 39, start: 0, type: "test" },
-		];
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			["/test.ts", { definitions, source }],
-		]);
-
-		const result = mapErrorsToTests(errors, files, Date.now());
-
-		expect(result.testResults[0]!.testResults[0]!.failureMessages).toHaveLength(2);
-	});
-
-	it("should handle mixed files with and without errors", () => {
-		expect.assertions(4);
-
-		const errors: RawErrorsMap = new Map([
-			[
-				"/fail.ts",
-				[
-					{
-						column: 1,
-						errorCode: 2322,
-						errorMessage: "Error",
-						filePath: "/fail.ts",
-						line: 1,
-					},
-				],
-			],
-		]);
-
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"/fail.ts",
-				{
-					definitions: [
-						{ name: "should fail", ancestorNames: [], end: 27, start: 0, type: "test" },
-					],
-					source: 'it("should fail", () => {});',
-				},
-			],
-			[
-				"/pass.ts",
-				{
-					definitions: [
-						{ name: "should pass", ancestorNames: [], end: 27, start: 0, type: "test" },
-					],
-					source: 'it("should pass", () => {});',
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, 123);
-
-		// The result crosses the Jest reporter boundary. Pin its complete shape
-		// alongside the aggregate counts below.
-		expect(result).toMatchSnapshot();
-
-		expect(result.numFailedTests).toBe(1);
-		expect(result.numPassedTests).toBe(1);
-		expect(result.numTotalTests).toBe(2);
-	});
-
-	it("should surface errors for non-test source files as source-level failures", () => {
-		expect.assertions(5);
-
-		const errors: RawErrorsMap = new Map([
-			[
-				"src/source.ts",
-				[
-					{
-						column: 7,
-						errorCode: 2322,
-						errorMessage: "Type 'string' is not assignable to type 'number'.",
-						filePath: "src/source.ts",
-						line: 1,
-					},
-				],
-			],
-		]);
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"src/test.test-d.ts",
-				{
-					definitions: [
-						{ name: "should pass", ancestorNames: [], end: 27, start: 0, type: "test" },
-					],
-					source: 'it("should pass", () => {});',
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, 123, false);
-
-		const sourceResult = result.testResults.find(
-			(file) => file.testFilePath === "src/source.ts",
-		);
-
-		expect(result.success).toBeFalse();
-		expect(result.numFailedTests).toBe(1);
-		expect(sourceResult).toBeDefined();
-		expect(sourceResult!.testResults[0]!.failureMessages[0]).toContain("TS2322");
-		expect(result).toMatchSnapshot();
-	});
-
-	it("should suppress non-test source file errors when ignoreSourceErrors is true", () => {
-		expect.assertions(4);
-
-		const errors: RawErrorsMap = new Map([
-			[
-				"src/source.ts",
-				[
-					{
-						column: 7,
-						errorCode: 2322,
-						errorMessage: "Type 'string' is not assignable to type 'number'.",
-						filePath: "src/source.ts",
-						line: 1,
-					},
-				],
-			],
-		]);
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"src/test.test-d.ts",
-				{
-					definitions: [
-						{ name: "should pass", ancestorNames: [], end: 27, start: 0, type: "test" },
-					],
-					source: 'it("should pass", () => {});',
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, 123, true);
-
-		expect(result.success).toBeTrue();
-		expect(result.numFailedTests).toBe(0);
-		expect(
-			result.testResults.find((file) => file.testFilePath === "src/source.ts"),
-		).toBeUndefined();
-		expect(result).toMatchSnapshot();
-	});
-
-	it("should produce correct JestResult counts", () => {
-		expect.assertions(4);
-
-		const errors: RawErrorsMap = new Map();
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"/test.ts",
-				{
-					definitions: [
-						{ name: "should a", ancestorNames: [], end: 23, start: 0, type: "test" },
-						{ name: "should b", ancestorNames: [], end: 48, start: 25, type: "test" },
-					],
-					source: 'it("should a", () => {});\nit("should b", () => {});',
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, Date.now());
-
-		expect(result.numTotalTests).toBe(2);
-		expect(result.numPassedTests).toBe(2);
-		expect(result.numFailedTests).toBe(0);
-		expect(result.success).toBeTrue();
-	});
-
-	it("should treat error with out-of-bounds position as file-level failure", () => {
-		expect.assertions(1);
-
-		const source = 'it("should pass", () => {});';
-		const errors: RawErrorsMap = new Map([
-			[
-				"/test.ts",
-				[
-					{
-						column: 1,
-						errorCode: 2322,
-						errorMessage: "Out of bounds",
-						filePath: "/test.ts",
-						line: 999,
-					},
-				],
-			],
-		]);
-
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"/test.ts",
-				{
-					definitions: [
-						{ name: "should pass", ancestorNames: [], end: 27, start: 0, type: "test" },
-					],
-					source,
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, Date.now());
-
-		expect(result.numFailedTests).toBe(1);
-	});
-
-	it("should attribute an end-boundary diagnostic to the innermost overlapping test", () => {
-		expect.assertions(1);
-
-		const source = 'it("outer", () => { it("inner", () => { bad; }); });';
-		const badIndex = source.indexOf("bad");
-		const innerStart = source.indexOf('it("inner"');
-		const errors: RawErrorsMap = new Map([
-			[
-				"src/nested.spec.ts",
-				[
-					{
-						column: badIndex + 1,
-						errorCode: 2322,
-						errorMessage: "Nested mismatch",
-						filePath: "src/nested.spec.ts",
-						line: 1,
-					},
-				],
-			],
-		]);
-		const files = new Map<string, { definitions: Array<TestDefinition>; source: string }>([
-			[
-				"src/nested.spec.ts",
-				{
-					definitions: [
-						{
-							name: "outer",
-							ancestorNames: [],
-							end: source.length,
-							start: 0,
-							type: "test",
-						},
-						{
-							name: "inner",
-							ancestorNames: ["outer"],
-							end: badIndex,
-							start: innerStart,
-							type: "test",
-						},
-					],
-					source,
-				},
-			],
-		]);
-
-		const result = mapErrorsToTests(errors, files, 123);
-
-		expect(result.testResults[0]!.testResults).toStrictEqual([
-			{
-				ancestorTitles: [],
-				failureMessages: [],
-				fullName: "outer",
-				status: "passed",
-				title: "outer",
-			},
-			{
-				ancestorTitles: ["outer"],
-				failureMessages: ["TS2322: Nested mismatch"],
-				fullName: "outer > inner",
-				status: "failed",
-				title: "inner",
-			},
-		]);
-	});
-});
-
-describe(isCompositeProject, () => {
-	it("should return true when compilerOptions.composite is true", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			JSON.stringify({ compilerOptions: { composite: true } }),
-		);
-
-		expect(isCompositeProject("/project")).toBeTrue();
-	});
-
-	it("should return false when composite is absent", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			JSON.stringify({ compilerOptions: { strict: true } }),
-		);
-
-		expect(isCompositeProject("/project")).toBeFalse();
-	});
-
-	it("should return false when compilerOptions is absent", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ include: ["src"] }));
-
-		expect(isCompositeProject("/project")).toBeFalse();
-	});
-
-	it("should return false when compilerOptions is null", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue('{ "compilerOptions": null }');
-
-		expect(isCompositeProject("/project")).toBeFalse();
-	});
-
-	it("should return false when compilerOptions is an array", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue('{ "compilerOptions": [] }');
-
-		expect(isCompositeProject("/project")).toBeFalse();
-	});
-
-	it("should return false when tsconfig does not exist", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockImplementation(() => {
-			throw new Error("ENOENT");
-		});
-
-		expect(isCompositeProject("/project")).toBeFalse();
-	});
-
-	it("should return false on malformed JSON", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue("not json{{{");
-
-		expect(isCompositeProject("/project")).toBeFalse();
-	});
-
-	it("should detect composite in tsconfig with comments", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			'// this is a comment\n{ "compilerOptions": { "composite": true } }',
-		);
-
-		expect(isCompositeProject("/project")).toBeTrue();
-	});
-
-	it("should detect composite in tsconfig with trailing commas", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			'{ "compilerOptions": { "composite": true, }, }',
-		);
-
-		expect(isCompositeProject("/project")).toBeTrue();
-	});
-
-	it("should warn when custom tsconfig cannot be read", () => {
-		expect.assertions(2);
-
-		const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-
-		vi.mocked(fs.readFileSync).mockImplementation(() => {
-			throw new Error("ENOENT");
-		});
-
-		const isComposite = isCompositeProject("/project", "tsconfig.build.json");
-
-		expect(isComposite).toBeFalse();
-		expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("tsconfig.build.json"));
-	});
-
-	it("should warn with stringified error when thrown value is not an Error", () => {
-		expect.assertions(2);
-
-		const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-
-		vi.mocked(fs.readFileSync).mockImplementation(() => {
-			// eslint-disable-next-line ts/only-throw-error -- testing non-Error throw
-			throw "raw string error";
-		});
-
-		const isComposite = isCompositeProject("/project", "tsconfig.build.json");
-
-		expect(isComposite).toBeFalse();
-		expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining("raw string error"));
-	});
-
-	it("should not warn when default tsconfig does not exist", () => {
-		expect.assertions(2);
-
-		const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-
-		vi.mocked(fs.readFileSync).mockImplementation(() => {
-			throw new Error("ENOENT");
-		});
-
-		const isComposite = isCompositeProject("/project");
-
-		expect(isComposite).toBeFalse();
-		expect(stderrSpy).not.toHaveBeenCalled();
-	});
-
-	it("should resolve custom tsconfig path against root directory", () => {
-		expect.assertions(1);
-
-		vi.mocked(fs.readFileSync).mockReturnValue(
-			JSON.stringify({ compilerOptions: { composite: true } }),
-		);
-
-		isCompositeProject("/project", "tsconfig.build.json");
-
-		expect(vi.mocked(fs.readFileSync)).toHaveBeenCalledWith(
-			path.resolve("/project", "tsconfig.build.json"),
-			"utf-8",
-		);
-	});
-});
+import type { ChildProcessRunner } from "../utils/child-process.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { runTypecheckAsync } from "./runner.ts";
+
+const LUAU_SPEC = path.resolve("/project/src/a.spec-d.luau");
+const LUAU_SOURCE = [
+	"--!strict",
+	'describe("suite", function()',
+	'\tit("passes", function() end)',
+	'\tit("fails", function()',
+	'\t\tlocal _s = "ü"; local _n: number = "x"',
+	"\tend)",
+	"end)",
+].join("\n");
+
+const TSC_7_MANIFEST = JSON.stringify({ bin: { tsc: "./bin/tsc" }, version: "7.0.2" });
 
 describe(runTypecheckAsync, () => {
 	interface TsgoSpawnError extends Error {
@@ -586,17 +40,20 @@ describe(runTypecheckAsync, () => {
 		options: { timeout?: number };
 	}
 
-	// `spawnTsgo` drives `execFile` in callback form and listens once for the
-	// child `spawn` event to clear its launch timer. `stubTsgo` returns the
-	// recorded invocations plus a fake child (`emitSpawn` fires the registered
-	// `spawn` listener, `kill` is the spy `spawnTsgo` calls on a launch timeout)
-	// and lets a test simulate tsgo finishing (exit 0), exiting non-zero with
-	// diagnostics, failing to spawn, or never launching.
+	/**
+	 * `spawnTsgo` drives `execFile` in callback form and listens once for the
+	 * child `spawn` event to clear its launch timer. `stubTsgo` returns the
+	 * recorded invocations plus a fake child (`emitSpawn` fires the registered
+	 * `spawn` listener, `kill` is the spy `spawnTsgo` calls on a launch timeout)
+	 * and lets a test simulate tsgo finishing (exit 0), exiting non-zero with
+	 * diagnostics, failing to spawn, or never launching.
+	 * @param respond - Answers each `execFile` call through its callback.
+	 * @returns The stub runner, `emitSpawn`, the invocations and the spies.
+	 */
 	function stubTsgo(respond: (callback: TsgoCallback) => void) {
 		let spawnListener: (() => void) | undefined;
 		const invocations: Array<TsgoInvocation> = [];
 		const kill = vi.fn<() => void>();
-		let child: childProcess.ChildProcess;
 		const once = vi.fn<(event: string, listener: () => void) => childProcess.ChildProcess>(
 			(event, listener) => {
 				if (event === "spawn") {
@@ -606,48 +63,122 @@ describe(runTypecheckAsync, () => {
 				return child;
 			},
 		);
-		child = fromAny({ kill, once });
+		const child: childProcess.ChildProcess = fromAny({ kill, once });
 		const execFileStub: typeof childProcess.execFile = fromAny(
 			(
-				_file: string,
-				commandArguments: Array<string>,
-				options: { timeout?: number },
-				callback: TsgoCallback,
+				...[, commandArguments, options, callback]: [
+					string,
+					Array<string>,
+					{ timeout?: number },
+					TsgoCallback,
+				]
 			) => {
 				invocations.push({ arguments: commandArguments, options });
 				respond(callback);
 				return child;
 			},
 		);
-		vi.mocked(childProcess.execFile).mockImplementation(execFileStub);
-		return { emitSpawn: () => spawnListener?.(), invocations, kill, once };
+		const runner: ChildProcessRunner = fromAny({ execFile: execFileStub });
+		return {
+			childProcess: runner,
+			emitSpawn: () => spawnListener?.(),
+			invocations,
+			kill,
+			once,
+		};
 	}
 
 	function exitWith(code: number): TsgoSpawnError {
 		return Object.assign(new Error(`tsgo exit ${String(code)}`), { code });
 	}
 
-	function mockReadFileSync(tsconfigContent: string, testFileContent: string): void {
-		vi.mocked(fs.readFileSync).mockImplementation((filePath, _encoding) => {
-			const fileString = String(filePath);
-			if (fileString.endsWith("tsconfig.json") || fileString.endsWith("tsconfig.test.json")) {
-				return tsconfigContent;
-			}
+	/**
+	 * A volume answering every tsconfig read with one text and every other read
+	 * with another, which is the only distinction these cases need.
+	 *
+	 * @param tsconfigContent - What a tsconfig read returns.
+	 * @param testFileContent - What every other read returns.
+	 * @returns The stub filesystem.
+	 */
+	function readingFiles(tsconfigContent: string, testFileContent: string): FileSystem {
+		return fromAny({
+			readFileSync: (filePath: string) => {
+				const fileString = filePath;
+				if (fileString.endsWith("package.json")) {
+					return JSON.stringify({ bin: { tsc: "./bin/tsc" }, version: "7.0.2" });
+				}
 
-			return testFileContent;
+				return fileString.endsWith("tsconfig.json") ||
+					fileString.endsWith("tsconfig.test.json")
+					? tsconfigContent
+					: testFileContent;
+			},
+		});
+	}
+
+	type TypecheckOverrides = Partial<Parameters<typeof runTypecheckAsync>[0]>;
+
+	async function compileAsync(
+		overrides: TypecheckOverrides = {},
+	): Promise<Array<TsgoInvocation>> {
+		const { childProcess, invocations } = stubTsgo((callback) => {
+			callback(null, "", "");
+		});
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
+
+		await runTypecheckAsync({
+			childProcess,
+			files: ["src/test.spec.ts"],
+			fileSystem,
+			rootDir: "/project",
+			...overrides,
+		});
+		return invocations;
+	}
+
+	async function typecheckWithSourceErrorAsync(
+		overrides: TypecheckOverrides = {},
+	): ReturnType<typeof runTypecheckAsync> {
+		const filePath = "src/test.spec.ts";
+		const { childProcess } = stubTsgo((callback) => {
+			callback(
+				exitWith(2),
+				"other.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.",
+				"",
+			);
+		});
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
+
+		return runTypecheckAsync({
+			childProcess,
+			files: [filePath],
+			fileSystem,
+			rootDir: path.dirname(path.resolve(filePath)),
+			...overrides,
 		});
 	}
 
 	it("should pass tsconfig option to tsgo for non-composite project", async () => {
 		expect.assertions(4);
 
-		const { invocations } = stubTsgo((callback) => {
+		const { childProcess, invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		const result = await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 			tsconfig: "tsconfig.test.json",
 		});
@@ -656,7 +187,7 @@ describe(runTypecheckAsync, () => {
 
 		const [tsgoScript, ...callArgs] = invocations[0]!.arguments;
 
-		expect(normalizeWindowsPath(tsgoScript)).toEndWith("/bin/tsgo.js");
+		expect(posixPath(tsgoScript!)).toEndWith("/bin/tsc");
 		expect(callArgs).toStrictEqual([
 			"--noEmit",
 			"--pretty",
@@ -675,13 +206,18 @@ describe(runTypecheckAsync, () => {
 	it("should use --noEmit for non-composite projects", async () => {
 		expect.assertions(2);
 
-		const { invocations } = stubTsgo((callback) => {
+		const { childProcess, invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		const result = await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 		});
 
@@ -694,16 +230,18 @@ describe(runTypecheckAsync, () => {
 	it("should use --build --emitDeclarationOnly for composite projects", async () => {
 		expect.assertions(2);
 
-		const { invocations } = stubTsgo((callback) => {
+		const { childProcess, invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
-		mockReadFileSync(
+		const fileSystem = readingFiles(
 			JSON.stringify({ compilerOptions: { composite: true } }),
 			'it("should pass", () => {});',
 		);
 
 		const result = await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 		});
 
@@ -716,55 +254,60 @@ describe(runTypecheckAsync, () => {
 	it("should pass tsconfig as positional arg for composite --build", async () => {
 		expect.assertions(1);
 
-		const { invocations } = stubTsgo((callback) => {
+		const { childProcess, invocations } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
-		mockReadFileSync(
+		const fileSystem = readingFiles(
 			JSON.stringify({ compilerOptions: { composite: true } }),
 			'it("should pass", () => {});',
 		);
 
 		await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 			tsconfig: "tsconfig.test.json",
 		});
 
-		const callArgs = invocations[0]!.arguments;
+		const [, ...callArgs] = invocations[0]!.arguments;
 
-		expect(callArgs.at(-1)).toBe(path.resolve("/project", "tsconfig.test.json"));
+		expect(callArgs).toStrictEqual([
+			"--build",
+			"--emitDeclarationOnly",
+			"--pretty",
+			"false",
+			path.resolve("/project", "tsconfig.test.json"),
+		]);
 	});
 
 	it("should store testFilePath as relative to rootDir", async () => {
 		expect.assertions(1);
 
-		stubTsgo((callback) => {
+		const { childProcess } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		const result = await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 		});
 
 		expect(result.testResults[0]!.testFilePath).toBe(
-			normalizeWindowsPath(path.relative("/project", path.resolve("src/test.spec.ts"))),
+			posixPath(path.relative("/project", path.resolve("src/test.spec.ts"))),
 		);
 	});
 
 	it("should bound the tsgo compile with the default run timeout", async () => {
 		expect.assertions(1);
 
-		const { invocations } = stubTsgo((callback) => {
-			callback(null, "", "");
-		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
-
-		await runTypecheckAsync({
-			files: ["src/test.spec.ts"],
-			rootDir: "/project",
-		});
+		const invocations = await compileAsync();
 
 		expect(invocations[0]!.options.timeout).toBe(300_000);
 	});
@@ -772,16 +315,7 @@ describe(runTypecheckAsync, () => {
 	it("should bound the tsgo compile with a custom run timeout", async () => {
 		expect.assertions(1);
 
-		const { invocations } = stubTsgo((callback) => {
-			callback(null, "", "");
-		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
-
-		await runTypecheckAsync({
-			files: ["src/test.spec.ts"],
-			rootDir: "/project",
-			timeout: 250,
-		});
+		const invocations = await compileAsync({ timeout: 250 });
 
 		expect(invocations[0]!.options.timeout).toBe(250);
 	});
@@ -789,18 +323,23 @@ describe(runTypecheckAsync, () => {
 	it("should throw when the tsgo compile exceeds the run timeout", async () => {
 		expect.assertions(1);
 
-		stubTsgo((callback) => {
+		const { childProcess } = stubTsgo((callback) => {
 			callback(
 				Object.assign(new Error("killed"), { killed: true, signal: "SIGTERM" }),
 				"",
 				"",
 			);
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		await expect(
 			runTypecheckAsync({
+				childProcess,
 				files: ["src/test.spec.ts"],
+				fileSystem,
 				rootDir: "/project",
 				timeout: 250,
 			}),
@@ -814,20 +353,25 @@ describe(runTypecheckAsync, () => {
 		// process is stuck before launch, so only the launch timer can settle
 		// the promise.
 		let captured: TsgoCallback | undefined;
-		const { kill } = stubTsgo((callback) => {
+		const { childProcess, kill } = stubTsgo((callback) => {
 			captured = callback;
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		await expect(
 			runTypecheckAsync({
+				childProcess,
 				files: ["src/test.spec.ts"],
+				fileSystem,
 				rootDir: "/project",
 				spawnTimeout: 1,
 			}),
 		).rejects.toThrow(/spawn timed out after 1ms \(spawnTimeout\)/);
 
-		expect(kill).toHaveBeenCalledOnce();
+		expect(kill).toHaveBeenCalledExactlyOnceWith();
 
 		// The kill's late `killed` callback arrives after the launch timer
 		// already settled the promise — it must be a silent no-op.
@@ -841,15 +385,20 @@ describe(runTypecheckAsync, () => {
 
 		// Defer the exit callback past the synchronous setup so the launch timer
 		// is armed, then `emitSpawn` exercises the clear-on-spawn path.
-		const { emitSpawn, kill } = stubTsgo((callback) => {
+		const { childProcess, emitSpawn, kill } = stubTsgo((callback) => {
 			queueMicrotask(() => {
 				callback(null, "", "");
 			});
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		const promise = runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 			spawnTimeout: 10_000,
 		});
@@ -858,6 +407,43 @@ describe(runTypecheckAsync, () => {
 		const result = await promise;
 
 		expect(result.success).toBeTrue();
+		expect(kill).not.toHaveBeenCalled();
+	});
+
+	it("should cancel the launch deadline when execution completes before spawn", async () => {
+		expect.assertions(2);
+
+		vi.useFakeTimers();
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
+		let completed: TsgoCallback | undefined;
+		const { childProcess, kill } = stubTsgo((callback) => {
+			completed = callback;
+		});
+		const manifestPath = "/tsgo/package.json";
+		const { fileSystem } = createMemoryFileSystem({
+			"/project/src/test.spec.ts": 'it("passes", () => {});',
+			"/project/tsconfig.json": "{}",
+			[manifestPath]: JSON.stringify({ bin: { tsc: "./bin/tsc" }, version: "7.0.2" }),
+		});
+		const pending = runTypecheckAsync({
+			childProcess,
+			files: ["/project/src/test.spec.ts"],
+			fileSystem,
+			resolveModule: () => manifestPath,
+			rootDir: "/project",
+			spawnTimeout: 5,
+		});
+		assert(completed !== undefined);
+		completed(null, "", "");
+
+		await pending;
+
+		expect(vi.getTimerCount()).toBe(0);
+
+		await vi.advanceTimersByTimeAsync(10);
+
 		expect(kill).not.toHaveBeenCalled();
 	});
 
@@ -870,13 +456,18 @@ describe(runTypecheckAsync, () => {
 		});
 
 		let captured: TsgoCallback | undefined;
-		const { emitSpawn, kill, once } = stubTsgo((callback) => {
+		const { childProcess, emitSpawn, kill, once } = stubTsgo((callback) => {
 			captured = callback;
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		const guarded = runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 			spawnTimeout: 5,
 		}).catch((err: unknown) => err);
@@ -900,13 +491,18 @@ describe(runTypecheckAsync, () => {
 			vi.useRealTimers();
 		});
 
-		const { kill } = stubTsgo((callback) => {
+		const { childProcess, kill } = stubTsgo((callback) => {
 			callback(null, "", "");
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 			spawnTimeout: 5,
 		});
@@ -919,13 +515,18 @@ describe(runTypecheckAsync, () => {
 		expect.assertions(2);
 
 		const spawnFailure = Object.assign(new Error("spawn failed"), { code: "ENOENT" });
-		stubTsgo((callback) => {
+		const { childProcess } = stubTsgo((callback) => {
 			callback(spawnFailure, "", "");
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		const error: unknown = await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 		}).catch((err: unknown) => err);
 
@@ -937,28 +538,157 @@ describe(runTypecheckAsync, () => {
 	it("should name the optional peer dependency when tsgo is not installed", async () => {
 		expect.assertions(1);
 
-		vi.mocked(createRequire).mockReturnValueOnce(
-			fromAny({
-				resolve: () => {
-					throw Object.assign(new Error("Cannot find module"), {
-						code: "MODULE_NOT_FOUND",
-					});
-				},
-			}),
-		);
+		function resolveModule(): string {
+			throw Object.assign(new Error("Cannot find module"), { code: "MODULE_NOT_FOUND" });
+		}
 
 		const error: unknown = await runTypecheckAsync({
 			files: ["src/test.spec.ts"],
+			resolveModule,
 			rootDir: "/project",
 		}).catch((err: unknown) => err);
 
 		assert(error instanceof ConfigError, "expected a ConfigError");
 
 		expect({ hint: error.hint, message: error.message }).toStrictEqual({
-			hint: "npm install -D @typescript/native-preview — or run without --typecheck/--typecheckOnly.",
+			hint: "npm install -D typescript@7 — or run without --typecheck/--typecheckOnly.",
 			message:
-				"Type tests need '@typescript/native-preview', an optional peer dependency that is not installed.",
+				"Type tests need TypeScript 7 ('typescript' 7+, or '@typescript/native' beside TypeScript 6), an optional peer dependency that is not installed.",
 		});
+	});
+
+	/**
+	 * Resolves each listed specifier to its manifest path; any other package
+	 * reads as not installed.
+	 *
+	 * @param manifests - Manifest path per `<package>/package.json` specifier.
+	 * @returns A resolver that throws `MODULE_NOT_FOUND` for unlisted specifiers.
+	 */
+	function resolvingManifests(manifests: Record<string, string>): (specifier: string) => string {
+		return (specifier) => {
+			const manifest = manifests[specifier];
+			if (manifest === undefined) {
+				throw Object.assign(new Error("Cannot find module"), { code: "MODULE_NOT_FOUND" });
+			}
+
+			return manifest;
+		};
+	}
+
+	it("should prefer '@typescript/native' over 'typescript'", async () => {
+		expect.assertions(1);
+
+		const { childProcess, invocations } = stubTsgo((callback) => {
+			callback(null, "", "");
+		});
+		const { fileSystem } = createMemoryFileSystem({
+			"/native/package.json": TSC_7_MANIFEST,
+			"/project/src/test.spec.ts": 'it("passes", () => {});',
+			"/project/tsconfig.json": "{}",
+			"/typescript/package.json": TSC_7_MANIFEST,
+		});
+
+		await runTypecheckAsync({
+			childProcess,
+			files: ["/project/src/test.spec.ts"],
+			fileSystem,
+			resolveModule: resolvingManifests({
+				"@typescript/native/package.json": "/native/package.json",
+				"typescript/package.json": "/typescript/package.json",
+			}),
+			rootDir: "/project",
+		});
+
+		expect(posixPath(invocations[0]!.arguments[0]!)).toBe("/native/bin/tsc");
+	});
+
+	it("should fall back to 'typescript' when it is TypeScript 7", async () => {
+		expect.assertions(1);
+
+		const { childProcess, invocations } = stubTsgo((callback) => {
+			callback(null, "", "");
+		});
+		const { fileSystem } = createMemoryFileSystem({
+			"/project/src/test.spec.ts": 'it("passes", () => {});',
+			"/project/tsconfig.json": "{}",
+			"/typescript/package.json": JSON.stringify({
+				bin: { tsc: "./bin/tsc" },
+				version: "7.1.0-dev.20260924.1",
+			}),
+		});
+
+		await runTypecheckAsync({
+			childProcess,
+			files: ["/project/src/test.spec.ts"],
+			fileSystem,
+			resolveModule: resolvingManifests({
+				"typescript/package.json": "/typescript/package.json",
+			}),
+			rootDir: "/project",
+		});
+
+		expect(posixPath(invocations[0]!.arguments[0]!)).toBe("/typescript/bin/tsc");
+	});
+
+	it("should fall back to '@typescript/native-preview'", async () => {
+		expect.assertions(1);
+
+		const { childProcess, invocations } = stubTsgo((callback) => {
+			callback(null, "", "");
+		});
+		const { fileSystem } = createMemoryFileSystem({
+			"/preview/package.json": JSON.stringify({
+				bin: { tsgo: "./bin/tsgo" },
+				version: "7.0.0-dev.20260707.2",
+			}),
+			"/project/src/test.spec.ts": 'it("passes", () => {});',
+			"/project/tsconfig.json": "{}",
+			"/typescript/package.json": JSON.stringify({
+				bin: { tsc: "./bin/tsc" },
+				version: "6.0.3",
+			}),
+		});
+
+		await runTypecheckAsync({
+			childProcess,
+			files: ["/project/src/test.spec.ts"],
+			fileSystem,
+			resolveModule: resolvingManifests({
+				"@typescript/native-preview/package.json": "/preview/package.json",
+				"typescript/package.json": "/typescript/package.json",
+			}),
+			rootDir: "/project",
+		});
+
+		expect(posixPath(invocations[0]!.arguments[0]!)).toBe("/preview/bin/tsgo");
+	});
+
+	it("should not run a 'typescript' older than 7", async () => {
+		expect.assertions(1);
+
+		const { fileSystem } = createMemoryFileSystem({
+			"/typescript/package.json": JSON.stringify({
+				bin: { tsc: "./bin/tsc", tsserver: "./bin/tsserver" },
+				version: "6.0.3",
+			}),
+		});
+
+		await expect(
+			runTypecheckAsync({
+				files: ["src/test.spec.ts"],
+				fileSystem,
+				resolveModule: resolvingManifests({
+					"typescript/package.json": "/typescript/package.json",
+				}),
+				rootDir: "/project",
+			}),
+		).rejects.toThrow(
+			expect.objectContaining({
+				hint: "npm install -D typescript@7 — or run without --typecheck/--typecheckOnly.",
+				message:
+					"Type tests need TypeScript 7 ('typescript' 7+, or '@typescript/native' beside TypeScript 6), an optional peer dependency that is not installed.",
+			}),
+		);
 	});
 
 	// Only a missing module means "not installed". Relabelling every failure
@@ -967,17 +697,14 @@ describe(runTypecheckAsync, () => {
 	it("should rethrow a resolution failure that is not a missing module", async () => {
 		expect.assertions(1);
 
-		vi.mocked(createRequire).mockReturnValueOnce(
-			fromAny({
-				resolve: () => {
-					throw Object.assign(new Error("permission denied"), { code: "EACCES" });
-				},
-			}),
-		);
+		function resolveModule(): string {
+			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+		}
 
 		await expect(
 			runTypecheckAsync({
 				files: ["src/test.spec.ts"],
+				resolveModule,
 				rootDir: "/project",
 			}),
 		).rejects.toThrow("permission denied");
@@ -991,20 +718,22 @@ describe(runTypecheckAsync, () => {
 		const rootDirectory = path.dirname(resolvedFile);
 		const relativePath = path.relative(rootDirectory, resolvedFile);
 
-		stubTsgo((callback) => {
+		const { childProcess } = stubTsgo((callback) => {
 			callback(
 				exitWith(2),
 				`${relativePath}(1,7): error TS2322: Type 'string' is not assignable to type 'number'.`,
 				"",
 			);
 		});
-		mockReadFileSync(
+		const fileSystem = readingFiles(
 			JSON.stringify({ compilerOptions: {} }),
 			'const x: number = "bad";\nit("should fail", () => {});',
 		);
 
 		const result = await runTypecheckAsync({
+			childProcess,
 			files: [filePath],
+			fileSystem,
 			rootDir: rootDirectory,
 		});
 
@@ -1019,20 +748,22 @@ describe(runTypecheckAsync, () => {
 		const rootDirectory = path.dirname(resolvedFile);
 		const relativePath = path.relative(rootDirectory, resolvedFile);
 
-		stubTsgo((callback) => {
+		const { childProcess } = stubTsgo((callback) => {
 			callback(
 				exitWith(2),
 				"",
 				`${relativePath}(1,7): error TS2322: Type 'string' is not assignable to type 'number'.`,
 			);
 		});
-		mockReadFileSync(
+		const fileSystem = readingFiles(
 			JSON.stringify({ compilerOptions: {} }),
 			'const x: number = "bad";\nit("should fail", () => {});',
 		);
 
 		const result = await runTypecheckAsync({
+			childProcess,
 			files: [filePath],
+			fileSystem,
 			rootDir: rootDirectory,
 		});
 
@@ -1042,13 +773,18 @@ describe(runTypecheckAsync, () => {
 	it("should treat a non-zero exit with empty output as success", async () => {
 		expect.assertions(1);
 
-		stubTsgo((callback) => {
+		const { childProcess } = stubTsgo((callback) => {
 			callback(exitWith(2), "", "");
 		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("should pass", () => {});',
+		);
 
 		const result = await runTypecheckAsync({
+			childProcess,
 			files: ["src/test.spec.ts"],
+			fileSystem,
 			rootDir: "/project",
 		});
 
@@ -1058,20 +794,7 @@ describe(runTypecheckAsync, () => {
 	it("should surface tsgo errors in non-test source files by default", async () => {
 		expect.assertions(2);
 
-		const filePath = "src/test.spec.ts";
-		const resolvedFile = path.resolve(filePath);
-		const rootDirectory = path.dirname(resolvedFile);
-
-		stubTsgo((callback) => {
-			callback(
-				exitWith(2),
-				"other.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.",
-				"",
-			);
-		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
-
-		const result = await runTypecheckAsync({ files: [filePath], rootDir: rootDirectory });
+		const result = await typecheckWithSourceErrorAsync();
 
 		const sourceResult = result.testResults.find((file) => file.testFilePath === "other.ts");
 
@@ -1082,25 +805,215 @@ describe(runTypecheckAsync, () => {
 	it("should suppress non-test source file errors when ignoreSourceErrors is true", async () => {
 		expect.assertions(1);
 
-		const filePath = "src/test.spec.ts";
-		const resolvedFile = path.resolve(filePath);
-		const rootDirectory = path.dirname(resolvedFile);
-
-		stubTsgo((callback) => {
-			callback(
-				exitWith(2),
-				"other.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.",
-				"",
-			);
-		});
-		mockReadFileSync(JSON.stringify({ compilerOptions: {} }), 'it("should pass", () => {});');
-
-		const result = await runTypecheckAsync({
-			files: [filePath],
-			ignoreSourceErrors: true,
-			rootDir: rootDirectory,
-		});
+		const result = await typecheckWithSourceErrorAsync({ ignoreSourceErrors: true });
 
 		expect(result.success).toBeTrue();
+	});
+
+	it.for(["a.spec-d.ts", "a.test-d.ts"])(
+		"should check %s with tsgo and report its diagnostic",
+		async (fileName) => {
+			expect.assertions(2);
+
+			const resolvedFile = path.resolve("src", fileName);
+			const { childProcess } = stubTsgo((callback) => {
+				callback(exitWith(2), `${fileName}(1,7): error TS2345: Bad argument.`, "");
+			});
+			const fileSystem = readingFiles(
+				JSON.stringify({ compilerOptions: {} }),
+				'const x: number = "bad";',
+			);
+
+			const result = await runTypecheckAsync({
+				childProcess,
+				files: [path.join("src", fileName)],
+				fileSystem,
+				rootDir: path.dirname(resolvedFile),
+			});
+
+			expect(result.success).toBeFalse();
+			expect(result.testResults[0]!.testResults[0]!.failureMessages[0]).toContain(
+				"TS2345: Bad argument.",
+			);
+		},
+	);
+
+	it("should check a file no checker claims with tsgo", async () => {
+		expect.assertions(2);
+
+		const { childProcess, invocations } = stubTsgo((callback) => {
+			callback(null, "", "");
+		});
+		const fileSystem = readingFiles(
+			JSON.stringify({ compilerOptions: {} }),
+			'it("passes", () => {});',
+		);
+
+		const result = await runTypecheckAsync({
+			childProcess,
+			files: ["/project/src/a.spec.ts"],
+			fileSystem,
+			rootDir: "/project",
+		});
+
+		expect(invocations).toHaveLength(1);
+		expect(result.testResults[0]!.testFilePath).toBe("src/a.spec.ts");
+	});
+
+	it("should run tsgo once when given no files", async () => {
+		expect.assertions(2);
+
+		const { childProcess, invocations } = stubTsgo((callback) => {
+			callback(exitWith(2), "src/source.ts(1,7): error TS2322: Bad source.", "");
+		});
+		const fileSystem = readingFiles(JSON.stringify({ compilerOptions: {} }), "");
+
+		const result = await runTypecheckAsync({
+			childProcess,
+			files: [],
+			fileSystem,
+			rootDir: "/project",
+		});
+
+		expect(invocations).toHaveLength(1);
+		expect(result.testResults[0]!.testResults[0]!.title).toBe("<source type error>");
+	});
+});
+
+describe("runTypecheckAsync with Luau Type Tests", () => {
+	type Callback = (error: Error | null, stdout: string, stderr: string) => void;
+
+	function exitOne(): Error {
+		return Object.assign(new Error("exit 1"), { code: 1 });
+	}
+
+	function runnerByCommand(outputs: { luau: string; node?: string }) {
+		const commands: Array<string> = [];
+		const child: childProcess.ChildProcess = fromAny({
+			kill: vi.fn<() => void>(),
+			once: vi.fn<() => void>(),
+		});
+		const execFile: typeof childProcess.execFile = fromAny(
+			(...[command, args, , callback]: [string, Array<string>, object, Callback]) => {
+				commands.push([command, ...args].join(" "));
+				const output = command === process.execPath ? outputs.node : outputs.luau;
+				callback(
+					output === undefined || output === "" ? null : exitOne(),
+					output ?? "",
+					"",
+				);
+				return child;
+			},
+		);
+		const runner: ChildProcessRunner = fromAny({ execFile });
+		return { childProcess: runner, commands };
+	}
+
+	function luauFiles(files: Record<string, string>): FileSystem {
+		return fromAny({
+			readFileSync: (filePath: string) => {
+				if (filePath.endsWith("package.json")) {
+					return TSC_7_MANIFEST;
+				}
+
+				return files[filePath] ?? "{}";
+			},
+		});
+	}
+
+	it("should attribute a lute diagnostic in byte columns to its it", async () => {
+		expect.assertions(3);
+
+		const { childProcess, commands } = runnerByCommand({
+			luau: `${LUAU_SPEC}:5:38-40: (W0) TypeError: Expected this to be 'number', but got 'string'\n`,
+		});
+
+		const result = await runTypecheckAsync({
+			childProcess,
+			files: [LUAU_SPEC],
+			fileSystem: luauFiles({ [LUAU_SPEC]: LUAU_SOURCE }),
+			rootDir: "/project",
+		});
+
+		const cases = result.testResults[0]!.testResults;
+
+		expect(commands).toHaveLength(1);
+		expect(cases.map(({ status, title }) => [title, status])).toStrictEqual([
+			["passes", "passed"],
+			["fails", "failed"],
+		]);
+		expect(cases[1]!.failureMessages).toStrictEqual([
+			"TypeError: Expected this to be 'number', but got 'string'",
+		]);
+	});
+
+	it("should fail the file when the spec lacks --!strict", async () => {
+		expect.assertions(2);
+
+		const { childProcess } = runnerByCommand({ luau: "" });
+
+		const result = await runTypecheckAsync({
+			childProcess,
+			files: [LUAU_SPEC],
+			fileSystem: luauFiles({
+				[LUAU_SPEC]: LUAU_SOURCE.replace("--!strict", "--!nonstrict"),
+			}),
+			rootDir: "/project",
+		});
+
+		const [fileCase] = result.testResults[0]!.testResults;
+
+		expect(fileCase!.title).toBe("<file-level type error>");
+		expect(fileCase!.failureMessages[0]).toContain("--!strict");
+	});
+
+	it("should replace lute diagnostics with the parser message when the spec does not parse", async () => {
+		expect.assertions(1);
+
+		const { childProcess } = runnerByCommand({
+			luau: `${LUAU_SPEC}:2:1-3: (W0) SyntaxError: Expected identifier\n`,
+		});
+
+		const result = await runTypecheckAsync({
+			childProcess,
+			files: [LUAU_SPEC],
+			fileSystem: luauFiles({ [LUAU_SPEC]: "--!strict\nlocal x = " }),
+			rootDir: "/project",
+		});
+
+		expect(result.testResults[0]!.testResults[0]!.failureMessages).toStrictEqual([
+			expect.stringMatching(/^SyntaxError: /),
+		]);
+	});
+
+	it("should merge diagnostics two checkers report against the same file", async () => {
+		expect.assertions(2);
+
+		const tsSpec = path.resolve("/project/src/b.spec-d.ts");
+		const shared = path.resolve("/project/src/shared.luau");
+		const { childProcess, commands } = runnerByCommand({
+			luau: `${shared}:1:1-2: (W0) TypeError: From lute\n`,
+			node: "src/shared.luau(1,1): error TS1000: From tsgo.",
+		});
+
+		const result = await runTypecheckAsync({
+			childProcess,
+			files: [LUAU_SPEC, tsSpec],
+			fileSystem: luauFiles({
+				[LUAU_SPEC]: LUAU_SOURCE,
+				[tsSpec]: 'it("passes", () => {});',
+			}),
+			rootDir: "/project",
+		});
+
+		const sourceResult = result.testResults.find(
+			({ testFilePath }) => testFilePath === "src/shared.luau",
+		);
+
+		expect(commands).toHaveLength(2);
+		expect(sourceResult!.testResults[0]!.failureMessages).toStrictEqual([
+			"TypeError: From lute",
+			"TS1000: From tsgo.",
+		]);
 	});
 });

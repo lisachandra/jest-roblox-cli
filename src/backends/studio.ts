@@ -1,53 +1,51 @@
 import { type } from "arktype";
 import type buffer from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { WebSocketServer } from "ws";
-import type { WebSocket } from "ws";
+import type { WebSocket, WebSocketServer } from "ws";
 
 import { NOOP_RUN_PROGRESS } from "../progress/reporter.ts";
 import { describeProjectCount } from "../progress/stages.ts";
 import { decodeEnvelope } from "./envelope.ts";
-import type { Backend, BackendOptions, BackendResult, RawBackendEntry } from "./interface.ts";
+import type { Backend, BackendOptions, BackendResult } from "./interface.ts";
 import {
 	closePluginServer,
 	describePluginMismatch,
 	PluginConnectionPool,
 } from "./plugin-connections.ts";
-import { buildRunPayload, type RunPayloadRequest } from "./plugin-payload.ts";
-import type { RunPayload } from "./plugin-payload.ts";
+import {
+	buildRunPayload,
+	pairPluginEntries,
+	type RunPayload,
+	type RunPayloadRequest,
+} from "./plugin-payload.ts";
+import { nodeWebSocketServerFactory } from "./web-socket-server-factory.ts";
+import type { WebSocketServerFactory } from "./web-socket-server-factory.ts";
 
 const DEFAULT_STUDIO_TIMEOUT = 300_000;
 
-interface PreConnected {
-	/** The probe's connection pool, carrying what each plugin announced. */
-	pool: PluginConnectionPool;
-	server: WebSocketServer;
-	/** The socket the auto probe already selected by protocol version. */
-	socket: WebSocket;
-}
-
 interface StudioOptions {
-	createServer?: ((port: number) => WebSocketServer) | undefined;
 	port: number;
-	preConnected?: PreConnected | undefined;
 	timeout?: number | undefined;
+	webSocketServerFactory?: undefined | WebSocketServerFactory;
 }
 
 /**
  * Plugin/CLI protocol version. Must match `PROTOCOL_VERSION` in
- * `plugin/src/init.server.luau`. Increment when the runtime contract
- * changes — v7 adds the `runnerTimeoutMs` argv the runner enforces a project's
- * budget from and strips before calling Jest, so a v6 plugin handed one runs
- * unbounded and passes the key through to Jest; v6 adds the `hello`
- * announcement a plugin sends on connect, which is what lets the CLI pick
- * between several installed copies rather than dispatching to whichever one
- * connected first; v4 nests the fields the runner adds to Jest's result under
- * `runner` and renames the frame key `request_id` to `requestId`. A connection
- * that announces another version is never dispatched to, so `version_mismatch`
- * is now only reachable from a plugin whose announcement and request handling
- * disagree.
+ * `plugin/src/init.server.luau`. Increment when the runtime contract changes —
+ * v9 adds the workspace payload's `vmParallel` count, which a v8 plugin would
+ * ignore and run sequentially; v8 adds the `pluginKey` a `studio-cli` run asks
+ * for, which this backend never sends; v7 adds the `runnerTimeoutMs` argv the
+ * runner enforces a project's budget from and strips before calling Jest, so a
+ * v6 plugin handed one runs unbounded and passes the key through to Jest; v6
+ * adds the `hello` announcement a plugin sends on connect, which is what lets
+ * the CLI pick between several installed copies rather than dispatching to
+ * whichever one connected first; v4 nests the fields the runner adds to Jest's
+ * result under `runner` and renames the frame key `request_id` to `requestId`.
+ * A connection that announces another version is never dispatched to, so
+ * `version_mismatch` is now only reachable from a plugin whose announcement
+ * and request handling disagree.
  */
-export const STUDIO_PROTOCOL_VERSION = 7;
+const STUDIO_PROTOCOL_VERSION = 10;
 
 const pluginResultSchema = type({
 	"gameOutput?": "string",
@@ -93,41 +91,40 @@ interface PluginSocketAttachment {
 	timer: NodeJS.Timeout;
 }
 
+/** Runs tests through the Studio plugin over a local WebSocket server. */
 export class StudioBackend implements Backend {
-	private readonly createServer: (port: number) => WebSocketServer;
 	private readonly port: number;
 	private readonly timeout: number;
+	private readonly webSocketServerFactory: WebSocketServerFactory;
 
 	private pool: PluginConnectionPool | undefined;
-	private preConnected: PreConnected | undefined;
 	private wss: undefined | WebSocketServer;
 
 	public readonly kind = "studio" as const;
+	public readonly placeInput = "none" as const;
 
+	/**
+	 * Stores the options; the server opens on the first run.
+	 * @param options - Port, run timeout and server factory.
+	 */
 	constructor(options: StudioOptions) {
 		this.port = options.port;
 		this.timeout = options.timeout ?? DEFAULT_STUDIO_TIMEOUT;
-		this.createServer = options.createServer ?? ((port) => new WebSocketServer({ port }));
-		this.preConnected = options.preConnected;
-		// Adopted rather than rebuilt: an announcement is sent once per socket,
-		// so a pool built after the probe would see the probe's connections
-		// without knowing what any of them are.
-		this.pool = options.preConnected?.pool;
+		this.webSocketServerFactory = options.webSocketServerFactory ?? nodeWebSocketServerFactory;
 	}
 
+	/**
+	 * Ends any in-flight plugin selection and closes the server and its
+	 * sockets.
+	 */
 	public closeAsync(): void {
-		// Fall back to the pre-connected server: the auto probe can detect a
-		// Studio (preConnected) and then close the backend via a zero-jobs flow
-		// that never calls runTests, so `this.wss` is never assigned.
-		const server = this.wss ?? this.preConnected?.server;
+		const server = this.wss;
 		// Abort before dropping the reference: closing the server does not stop
 		// the pool's connect timer, and on the default timeout that is a live
-		// handle holding the process open for five minutes after an explicit
-		// failure or a fallback to Open Cloud.
+		// handle holding the process open for five minutes after a failure.
 		this.pool?.abortSelection();
 		this.pool = undefined;
 		this.wss = undefined;
-		this.preConnected = undefined;
 		if (server === undefined) {
 			return;
 		}
@@ -135,29 +132,32 @@ export class StudioBackend implements Backend {
 		closePluginServer(server);
 	}
 
+	/**
+	 * Opens the server if needed, dispatches the jobs to a compatible plugin, and waits for its results.
+	 * @param options - Jobs and run options.
+	 * @returns The per-job results and execution timing.
+	 * @rejects {Error} When no compatible plugin connects, the plugin fails, or the run times out.
+	 */
 	public async runTestsAsync(options: BackendOptions): Promise<BackendResult> {
-		const pre = this.preConnected;
-		this.preConnected = undefined;
-
-		this.wss ??= pre?.server ?? this.createServer(this.port);
+		this.wss ??= this.webSocketServerFactory({ port: this.port });
 
 		// Announced here rather than in the executor, which wraps every backend
 		// alike and so would open the stage around the upload too: only a
 		// backend knows when its own dispatch window starts.
 		const progress = options.progress ?? NOOP_RUN_PROGRESS;
 		const done = progress.begin("tests", describeProjectCount(options.jobs.length));
-		const result = await this.executeViaPluginAsync(this.wss, options, pre?.socket);
+		const result = await this.executeViaPluginAsync(this.wss, options);
 		done();
 		return result;
 	}
 
 	private async executeViaPluginAsync(
 		wss: WebSocketServer,
-		{ jobs, vmParallel }: BackendOptions,
-		existingSocket?: WebSocket,
+		{ bail, jobs, vmParallel }: BackendOptions,
 	): Promise<BackendResult> {
 		const requestId = randomUUID();
 		const requestMessage = buildRunTestsMessage({
+			bail,
 			jobs,
 			requestId,
 			runBudgetMs: this.timeout,
@@ -165,12 +165,7 @@ export class StudioBackend implements Backend {
 		});
 
 		const executionStart = Date.now();
-		const message = await this.waitForResultAsync(
-			wss,
-			requestMessage,
-			requestId,
-			existingSocket,
-		);
+		const message = await this.waitForResultAsync({ requestId, requestMessage, wss });
 
 		// Unreachable against a plugin whose announcement matches what it
 		// serves, since a connection announcing another protocol is never
@@ -183,27 +178,23 @@ export class StudioBackend implements Backend {
 		}
 
 		return {
-			rawResults: buildRawResults(message, jobs.length),
+			...pairResults(message, jobs.length),
 			timing: { executionMs: Date.now() - executionStart },
 		};
 	}
 
 	/**
-	 * The socket to run on: the one the auto probe already selected, or the
-	 * connection that announces this CLI's protocol version.
+	 * The socket to run on: the connection that announces this CLI's protocol
+	 * version.
 	 *
 	 * Several installed plugin copies each open their own socket, so this is
 	 * where "a Studio is listening" narrows to "this Studio can serve the run".
 	 * Failing here means failing before the place is built, rather than after.
+	 * @param wss - Plugin server to select from.
+	 * @returns The selected socket.
+	 * @rejects {Error} When only incompatible plugins connect, or none connects in time.
 	 */
-	private async selectSocketAsync(
-		wss: WebSocketServer,
-		existingSocket: undefined | WebSocket,
-	): Promise<WebSocket> {
-		if (existingSocket !== undefined) {
-			return existingSocket;
-		}
-
+	private async selectSocketAsync(wss: WebSocketServer): Promise<WebSocket> {
 		// Assigned before the first await of this chain, so a plugin connecting
 		// into the same tick as the dispatch is still recorded.
 		this.pool ??= new PluginConnectionPool(wss);
@@ -223,19 +214,25 @@ export class StudioBackend implements Backend {
 		throw new Error("Timed out waiting for Studio plugin connection");
 	}
 
-	private async waitForResultAsync(
-		wss: WebSocketServer,
-		requestMessage: RunTestsMessage,
-		requestId: string,
-		existingSocket?: WebSocket,
-	): Promise<PluginMessage> {
+	private async waitForResultAsync({
+		requestId,
+		requestMessage,
+		wss,
+	}: {
+		/** Correlation ID of the request. */
+		readonly requestId: string;
+		/** Message to send to the plugin. */
+		readonly requestMessage: RunTestsMessage;
+		/** Plugin server. */
+		readonly wss: WebSocketServer;
+	}): Promise<PluginMessage> {
 		return new Promise((resolve, reject) => {
 			// One error listener spans both halves of the wait — selecting a
 			// compatible plugin, then the run itself. A bind failure surfaces
-			// as the EADDRINUSE `StudioWithFallback` reads, not as a timeout.
+			// as EADDRINUSE, not as a timeout.
 			wss.on("error", reject);
 
-			this.selectSocketAsync(wss, existingSocket)
+			this.selectSocketAsync(wss)
 				.then((socket) => {
 					awaitPluginMessage({
 						reject,
@@ -251,6 +248,11 @@ export class StudioBackend implements Backend {
 	}
 }
 
+/**
+ * Creates a Studio backend.
+ * @param options - Port, run timeout and server factory.
+ * @returns The new backend.
+ */
 export function createStudioBackend(options: StudioOptions): StudioBackend {
 	return new StudioBackend(options);
 }
@@ -263,41 +265,35 @@ export function createStudioBackend(options: StudioOptions): StudioBackend {
  * plus the filtered `runtimeStubMounts` (parallel to `configs`) so the runner
  * injects `jest.config` only where Rojo doesn't already sync a user-authored
  * one.
+ * @param root0 - Run payload request and its correlation ID.
+ * @returns The `run_tests` message.
  */
 function buildRunTestsMessage({
-	jobs,
 	requestId,
-	runBudgetMs,
-	vmParallel,
+	...request
 }: RunPayloadRequest & { requestId: string }): RunTestsMessage {
 	return {
 		action: "run_tests",
 		protocolVersion: STUDIO_PROTOCOL_VERSION,
 		requestId,
-		...buildRunPayload({ jobs, runBudgetMs, vmParallel }),
+		...buildRunPayload(request),
 	};
 }
 
 /**
- * The per-job raw entries a `results` frame carries, in request order.
- *
- * `gameOutputScope` rides along from the envelope: it is the runner's report of
- * whether the run's game output was captured once for the batch (an in-session
- * parallel run) or per project.
+ * The per-job entries a `results` frame carries, in request order.
+ * @param message - The `results` frame.
+ * @param jobCount - Number of jobs in the request.
+ * @returns The raw per-job results and the indices of bailed jobs.
  */
-function buildRawResults(
+function pairResults(
 	message: Extract<PluginMessage, { type: "results" }>,
 	jobCount: number,
-): Array<RawBackendEntry> {
-	const { entries, gameOutputScope } = decodeEnvelope(message.jestOutput);
-	if (entries.length !== jobCount) {
-		throw new Error(
-			`Studio backend returned ${entries.length.toString()} entries but request had ${jobCount.toString()} jobs`,
-		);
-	}
-
-	return entries.map((entry) => {
-		return { entry, fallbackGameOutput: message.gameOutput, gameOutputScope };
+): Pick<BackendResult, "bailedJobIndices" | "rawResults"> {
+	return pairPluginEntries(decodeEnvelope(message.jestOutput), {
+		backendName: "Studio backend",
+		gameOutput: message.gameOutput,
+		jobCount,
 	});
 }
 
@@ -306,6 +302,7 @@ function buildRawResults(
  * plugin's reply — resolving the correlated `results`/`version_mismatch`
  * message, or rejecting on a message that fails validation, a disconnect, or a
  * socket error.
+ * @param root0 - Socket, request, settle callbacks and run timer.
  */
 function attachPluginSocket({
 	reject,
@@ -352,6 +349,7 @@ function attachPluginSocket({
  * what let a second, stale plugin decide the run: it refuses the version the
  * instant it is asked, while the plugin actually running the suite answers
  * minutes later.
+ * @param root0 - Socket, request, settle callbacks and run timeout.
  */
 function awaitPluginMessage({
 	reject,

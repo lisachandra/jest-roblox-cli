@@ -30,6 +30,32 @@ describe(relativizeProjectPaths, () => {
 		expect(result.tree).toStrictEqual({ $path: "../../out/client" });
 	});
 
+	it("should express the inner path of an optional $path relative to the project directory", () => {
+		expect.assertions(1);
+
+		const result = parse(
+			relativizeProjectPaths(
+				JSON.stringify({ tree: { $path: { optional: OUT_DIR } } }),
+				PROJECT_DIR,
+			),
+		);
+
+		expect(result.tree).toStrictEqual({ $path: { optional: "../../out/client" } });
+	});
+
+	it("should leave an attribute named optional as written", () => {
+		expect.assertions(1);
+
+		const result = parse(
+			relativizeProjectPaths(
+				JSON.stringify({ tree: { $attributes: { optional: OUT_DIR } } }),
+				PROJECT_DIR,
+			),
+		);
+
+		expect(result.tree).toStrictEqual({ $attributes: { optional: OUT_DIR } });
+	});
+
 	it("should rewrite $path entries at every depth", () => {
 		expect.assertions(1);
 
@@ -75,25 +101,59 @@ describe(relativizeProjectPaths, () => {
 		expect(result.tree).toStrictEqual({ $path: 42 });
 	});
 
+	it("should express an absolute globIgnorePaths entry relative to the project directory", () => {
+		expect.assertions(1);
+
+		const result = parse(
+			relativizeProjectPaths(
+				JSON.stringify({
+					globIgnorePaths: ["**/tsconfig.json", path.join(OUT_DIR, "jest.config.luau")],
+				}),
+				PROJECT_DIR,
+			),
+		);
+
+		expect(result.globIgnorePaths).toStrictEqual([
+			"**/tsconfig.json",
+			"../../out/client/jest.config.luau",
+		]);
+	});
+
 	it("should carry non-path fields through untouched", () => {
 		expect.assertions(1);
 
 		const result = parse(
 			relativizeProjectPaths(
 				JSON.stringify({
-					name: "jest-roblox-workspace",
+					name: OUT_DIR,
 					globIgnorePaths: ["**/tsconfig.json"],
-					tree: { $className: "DataModel", $properties: { StreamingEnabled: true } },
+					tree: {
+						$className: "DataModel",
+						$properties: { StreamingEnabled: true, Tags: ["Enemy"] },
+					},
 				}),
 				PROJECT_DIR,
 			),
 		);
 
 		expect(result).toStrictEqual({
-			name: "jest-roblox-workspace",
+			name: OUT_DIR,
 			globIgnorePaths: ["**/tsconfig.json"],
-			tree: { $className: "DataModel", $properties: { StreamingEnabled: true } },
+			tree: {
+				$className: "DataModel",
+				$properties: { StreamingEnabled: true, Tags: ["Enemy"] },
+			},
 		});
+	});
+
+	it("should leave a globIgnorePaths below the project root alone", () => {
+		expect.assertions(1);
+
+		const tree = { $attributes: { globIgnorePaths: [OUT_DIR] } };
+
+		const result = parse(relativizeProjectPaths(JSON.stringify({ tree }), PROJECT_DIR));
+
+		expect(result.tree).toStrictEqual(tree);
 	});
 
 	it("should carry a null member through untouched", () => {

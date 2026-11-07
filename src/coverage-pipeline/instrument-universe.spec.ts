@@ -1,31 +1,23 @@
-import { fromAny } from "@total-typescript/shoehorn";
-
-import { vol } from "memfs";
 import * as path from "node:path";
 import process from "node:process";
-import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import type { MemoryVolume } from "#test/mocks/memory-file-system.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { posixPath } from "#test/mocks/posix-path.ts";
+import type { FileSystem } from "../utils/file-system.ts";
 import type { CoverageUniverseFilter } from "./coverage-universe.ts";
 import { createInstrumentUniverse, type InstrumentUniverse } from "./instrument-universe.ts";
 
-vi.mock(import("node:fs"), async () => {
-	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, default: memfs.fs });
-});
-
-const CWD = normalizeWindowsPath(process.cwd());
+const CWD = posixPath(process.cwd());
 /** A package sited away from the invocation directory. */
-const PACKAGE_ROOT = normalizeWindowsPath(path.resolve("/repo/packages/foo"));
+const PACKAGE_ROOT = posixPath(path.resolve("/repo/packages/foo"));
 
-/** Empties the in-memory volume after the calling test, not right now. */
-function resetVolumeAfterTest(): void {
-	onTestFinished(() => {
-		vol.reset();
-	});
-}
-
-/** Absolute POSIX path for a cwd-relative one, as the walkers produce. */
+/**
+ * Absolute POSIX path for a cwd-relative one, as the walkers produce.
+ * @param relativePath - Path relative to the invocation directory.
+ * @returns Absolute POSIX path.
+ */
 function under(relativePath: string): string {
 	return path.posix.join(CWD, relativePath);
 }
@@ -33,29 +25,48 @@ function under(relativePath: string): string {
 /**
  * The universe for a filter that is known to narrow, so the tests can call
  * `includes` without re-deciding whether one exists.
+ * @param fileSystem - Volume the universe walks.
+ * @param filter - Filter known to narrow.
+ * @returns Narrowed universe.
  */
-function universeFor(filter: CoverageUniverseFilter): InstrumentUniverse {
-	const universe = createInstrumentUniverse(filter);
+function universeFor(fileSystem: FileSystem, filter: CoverageUniverseFilter): InstrumentUniverse {
+	const universe = createInstrumentUniverse(filter, fileSystem);
 	assert(universe !== undefined, "expected the filter to narrow the universe");
 	return universe;
 }
 
-function writeSourceMap(luauPath: string, contents: string): void {
-	vol.mkdirSync(path.posix.dirname(luauPath), { recursive: true });
-	vol.writeFileSync(luauPath, "return nil\n");
-	vol.writeFileSync(`${luauPath}.map`, contents);
+function writeSourceMap(
+	volume: MemoryVolume,
+	{ contents, luauPath }: { contents: string; luauPath: string },
+): void {
+	volume.mkdirSync(path.posix.dirname(luauPath), { recursive: true });
+	volume.writeFileSync(luauPath, "return nil\n");
+	volume.writeFileSync(`${luauPath}.map`, contents);
 }
 
-/** Write a compiled Luau file, optionally with its source-map sidecar. */
-function writeCompiled(luauRelative: string, sources?: Array<string>): string {
+/**
+ * Write a compiled Luau file, optionally with its source-map sidecar.
+ *
+ * @param volume - Where the compiled file lands.
+ * @param options - Its path relative to the invocation directory, and the
+ *   sources its sidecar declares when it has one.
+ * @returns Absolute path of the compiled file.
+ */
+function writeCompiled(
+	volume: MemoryVolume,
+	{ luauRelative, sources }: { luauRelative: string; sources?: Array<string> | undefined },
+): string {
 	const luauPath = under(luauRelative);
 	if (sources === undefined) {
-		vol.mkdirSync(path.posix.dirname(luauPath), { recursive: true });
-		vol.writeFileSync(luauPath, "return nil\n");
+		volume.mkdirSync(path.posix.dirname(luauPath), { recursive: true });
+		volume.writeFileSync(luauPath, "return nil\n");
 		return luauPath;
 	}
 
-	writeSourceMap(luauPath, JSON.stringify({ mappings: "", sources, version: 3 }));
+	writeSourceMap(volume, {
+		contents: JSON.stringify({ mappings: "", sources, version: 3 }),
+		luauPath,
+	});
 	return luauPath;
 }
 
@@ -79,31 +90,43 @@ describe(createInstrumentUniverse, () => {
 	it("should instrument a file whose source map points at an included source", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = writeCompiled("out/ecs/systems/move.luau", [
-			under("src/ecs/systems/move.ts"),
-		]);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(universeFor({ include: ["src/ecs/**/*.ts"] }).includes(luauPath)).toBeTrue();
+		const luauPath = writeCompiled(volume, {
+			luauRelative: "out/ecs/systems/move.luau",
+			sources: [under("src/ecs/systems/move.ts")],
+		});
+
+		expect(
+			universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] }).includes(luauPath),
+		).toBeTrue();
 	});
 
 	it("should skip a file whose source map points outside the universe", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = writeCompiled("out/ui/button.luau", [under("src/ui/button.ts")]);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(universeFor({ include: ["src/ecs/**/*.ts"] }).includes(luauPath)).toBeFalse();
+		const luauPath = writeCompiled(volume, {
+			luauRelative: "out/ui/button.luau",
+			sources: [under("src/ui/button.ts")],
+		});
+
+		expect(
+			universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] }).includes(luauPath),
+		).toBeFalse();
 	});
 
 	it("should honor a negated include pattern", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = writeCompiled("out/ecs/components/health.luau", [
-			under("src/ecs/components/health.ts"),
-		]);
-		const universe = universeFor({
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const luauPath = writeCompiled(volume, {
+			luauRelative: "out/ecs/components/health.luau",
+			sources: [under("src/ecs/components/health.ts")],
+		});
+		const universe = universeFor(fileSystem, {
 			include: ["src/ecs/**/*.ts", "!src/ecs/components/**"],
 		});
 
@@ -113,9 +136,16 @@ describe(createInstrumentUniverse, () => {
 	it("should apply ignore patterns alongside the include globs", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = writeCompiled("out/ecs/index.luau", [under("src/ecs/index.ts")]);
-		const universe = universeFor({ ignore: ["index.ts"], include: ["src/ecs/**/*.ts"] });
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const luauPath = writeCompiled(volume, {
+			luauRelative: "out/ecs/index.luau",
+			sources: [under("src/ecs/index.ts")],
+		});
+		const universe = universeFor(fileSystem, {
+			ignore: ["index.ts"],
+			include: ["src/ecs/**/*.ts"],
+		});
 
 		expect(universe.includes(luauPath)).toBeFalse();
 	});
@@ -123,33 +153,65 @@ describe(createInstrumentUniverse, () => {
 	it("should resolve a relative source entry against the source map's directory", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = writeCompiled("out/ecs/systems/move.luau", [
-			"../../../src/ecs/systems/move.ts",
-		]);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(universeFor({ include: ["src/ecs/**/*.ts"] }).includes(luauPath)).toBeTrue();
+		const luauPath = writeCompiled(volume, {
+			luauRelative: "out/ecs/systems/move.luau",
+			sources: ["../../../src/ecs/systems/move.ts"],
+		});
+
+		expect(
+			universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] }).includes(luauPath),
+		).toBeTrue();
 	});
 
 	it("should keep a file when any of its sources is in the universe", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = writeCompiled("out/bundle.luau", [
-			under("src/ui/button.ts"),
-			under("src/ecs/systems/move.ts"),
-		]);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(universeFor({ include: ["src/ecs/**/*.ts"] }).includes(luauPath)).toBeTrue();
+		const luauPath = writeCompiled(volume, {
+			luauRelative: "out/bundle.luau",
+			sources: [under("src/ui/button.ts"), under("src/ecs/systems/move.ts")],
+		});
+
+		expect(
+			universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] }).includes(luauPath),
+		).toBeTrue();
+	});
+
+	it("should keep the first decision when a source map changes during a run", () => {
+		expect.assertions(2);
+
+		const { fileSystem, volume } = createMemoryFileSystem();
+		const luauPath = writeCompiled(volume, {
+			luauRelative: "out/ecs/systems/move.luau",
+			sources: [under("src/ecs/systems/move.ts")],
+		});
+		const universe = universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] });
+
+		expect(universe.includes(luauPath)).toBeTrue();
+
+		writeSourceMap(volume, {
+			contents: JSON.stringify({
+				mappings: "",
+				sources: [under("src/ui/button.ts")],
+				version: 3,
+			}),
+			luauPath,
+		});
+
+		expect(universe.includes(luauPath)).toBeTrue();
 	});
 
 	it("should match the Luau path itself when no source map exists", () => {
 		expect.assertions(2);
 
-		resetVolumeAfterTest();
-		const covered = writeCompiled("src/ecs/systems/move.luau");
-		const uncovered = writeCompiled("src/ui/button.luau");
-		const universe = universeFor({ include: ["src/ecs/**/*.luau"] });
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const covered = writeCompiled(volume, { luauRelative: "src/ecs/systems/move.luau" });
+		const uncovered = writeCompiled(volume, { luauRelative: "src/ui/button.luau" });
+		const universe = universeFor(fileSystem, { include: ["src/ecs/**/*.luau"] });
 
 		// A hand-written Luau project has no source map, and the mapper keys
 		// such a file on its own path — so the same path decides the gate.
@@ -160,34 +222,50 @@ describe(createInstrumentUniverse, () => {
 	it("should instrument a file whose source map cannot be read as JSON", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = under("out/ecs/systems/move.luau");
-		writeSourceMap(luauPath, "{ not json");
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(universeFor({ include: ["src/ecs/**/*.ts"] }).includes(luauPath)).toBeTrue();
+		const luauPath = under("out/ecs/systems/move.luau");
+		writeSourceMap(volume, { contents: "{ not json", luauPath });
+
+		expect(
+			universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] }).includes(luauPath),
+		).toBeTrue();
 	});
 
 	it("should instrument a file whose source map is not an object", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
-		const luauPath = under("out/ecs/systems/move.luau");
-		writeSourceMap(luauPath, "[]");
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(universeFor({ include: ["src/ecs/**/*.ts"] }).includes(luauPath)).toBeTrue();
+		const luauPath = under("out/ecs/systems/move.luau");
+		writeSourceMap(volume, { contents: "[]", luauPath });
+
+		expect(
+			universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] }).includes(luauPath),
+		).toBeTrue();
 	});
 
 	it("should instrument a file whose source map declares no usable sources", () => {
 		expect.assertions(3);
 
-		resetVolumeAfterTest();
+		const { fileSystem, volume } = createMemoryFileSystem();
+
 		const missing = under("out/ecs/a.luau");
 		const empty = under("out/ecs/b.luau");
 		const nonString = under("out/ecs/c.luau");
-		writeSourceMap(missing, JSON.stringify({ mappings: "", version: 3 }));
-		writeSourceMap(empty, JSON.stringify({ mappings: "", sources: [], version: 3 }));
-		writeSourceMap(nonString, JSON.stringify({ mappings: "", sources: [7], version: 3 }));
-		const universe = universeFor({ include: ["src/ecs/**/*.ts"] });
+		writeSourceMap(volume, {
+			contents: JSON.stringify({ mappings: "", version: 3 }),
+			luauPath: missing,
+		});
+		writeSourceMap(volume, {
+			contents: JSON.stringify({ mappings: "", sources: [], version: 3 }),
+			luauPath: empty,
+		});
+		writeSourceMap(volume, {
+			contents: JSON.stringify({ mappings: "", sources: [7], version: 3 }),
+			luauPath: nonString,
+		});
+		const universe = universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] });
 
 		expect(universe.includes(missing)).toBeTrue();
 		expect(universe.includes(empty)).toBeTrue();
@@ -197,45 +275,55 @@ describe(createInstrumentUniverse, () => {
 	it("should instrument a file whose source map exists but cannot be read", () => {
 		expect.assertions(1);
 
-		resetVolumeAfterTest();
+		const { fileSystem, volume } = createMemoryFileSystem();
+
 		const luauPath = under("out/ecs/systems/move.luau");
-		vol.mkdirSync(path.posix.dirname(luauPath), { recursive: true });
-		vol.writeFileSync(luauPath, "return nil\n");
+		volume.mkdirSync(path.posix.dirname(luauPath), { recursive: true });
+		volume.writeFileSync(luauPath, "return nil\n");
 		// A directory where the sidecar belongs stands in for any read that
 		// fails for a reason other than absence. Unlike an absent sidecar, this
 		// says nothing about the file's origin, so it must not be read as one.
-		vol.mkdirSync(`${luauPath}.map`);
+		volume.mkdirSync(`${luauPath}.map`);
 
-		expect(universeFor({ include: ["src/ecs/**/*.ts"] }).includes(luauPath)).toBeTrue();
+		expect(
+			universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] }).includes(luauPath),
+		).toBeTrue();
 	});
 
 	it("should match include globs against the given rootDir", () => {
 		expect.assertions(2);
 
-		resetVolumeAfterTest();
+		const { fileSystem, volume } = createMemoryFileSystem();
+
 		const luauPath = path.posix.join(PACKAGE_ROOT, "out/ecs/move.luau");
-		writeSourceMap(
-			luauPath,
-			JSON.stringify({
+		writeSourceMap(volume, {
+			contents: JSON.stringify({
 				mappings: "",
 				sources: [path.posix.join(PACKAGE_ROOT, "src/ecs/move.ts")],
 				version: 3,
 			}),
-		);
+			luauPath,
+		});
 
 		// The package's config writes `src/**/*.ts` for its own sources, and
 		// the package sits nowhere near the invocation directory.
 		expect(
-			universeFor({ include: ["src/**/*.ts"], rootDir: PACKAGE_ROOT }).includes(luauPath),
+			universeFor(fileSystem, { include: ["src/**/*.ts"], rootDir: PACKAGE_ROOT }).includes(
+				luauPath,
+			),
 		).toBeTrue();
-		expect(universeFor({ include: ["src/**/*.ts"] }).includes(luauPath)).toBeFalse();
+		expect(
+			universeFor(fileSystem, { include: ["src/**/*.ts"] }).includes(luauPath),
+		).toBeFalse();
 	});
 
 	it("should digest the same universe however the globs are ordered", () => {
 		expect.assertions(1);
 
-		const forward = universeFor({ include: ["a/**/*.ts", "b/**/*.ts"] });
-		const reversed = universeFor({ include: ["b/**/*.ts", "a/**/*.ts"] });
+		const { fileSystem } = createMemoryFileSystem();
+
+		const forward = universeFor(fileSystem, { include: ["a/**/*.ts", "b/**/*.ts"] });
+		const reversed = universeFor(fileSystem, { include: ["b/**/*.ts", "a/**/*.ts"] });
 
 		expect(forward.digest).toBe(reversed.digest);
 	});
@@ -243,9 +331,11 @@ describe(createInstrumentUniverse, () => {
 	it("should digest the patterns that define the universe", () => {
 		expect.assertions(2);
 
-		const first = universeFor({ include: ["src/ecs/**/*.ts"] });
-		const same = universeFor({ include: ["src/ecs/**/*.ts"] });
-		const other = universeFor({ include: ["src/ui/**/*.ts"] });
+		const { fileSystem } = createMemoryFileSystem();
+
+		const first = universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] });
+		const same = universeFor(fileSystem, { include: ["src/ecs/**/*.ts"] });
+		const other = universeFor(fileSystem, { include: ["src/ui/**/*.ts"] });
 
 		expect(first.digest).toBe(same.digest);
 		expect(first.digest).not.toBe(other.digest);
@@ -254,19 +344,42 @@ describe(createInstrumentUniverse, () => {
 	it("should digest the ignore patterns too", () => {
 		expect.assertions(1);
 
-		const withIgnore = universeFor({ ignore: ["index.ts"], include: ["src/**/*.ts"] });
-		const without = universeFor({ include: ["src/**/*.ts"] });
+		const { fileSystem } = createMemoryFileSystem();
+
+		const withIgnore = universeFor(fileSystem, {
+			ignore: ["index.ts"],
+			include: ["src/**/*.ts"],
+		});
+		const without = universeFor(fileSystem, { include: ["src/**/*.ts"] });
 
 		expect(withIgnore.digest).not.toBe(without.digest);
+	});
+
+	it("should give absent and empty ignore lists the same digest", () => {
+		expect.assertions(1);
+
+		const { fileSystem } = createMemoryFileSystem();
+		const withoutIgnore = universeFor(fileSystem, { include: ["src/**/*.ts"] });
+		const withEmptyIgnore = universeFor(fileSystem, {
+			ignore: [],
+			include: ["src/**/*.ts"],
+		});
+
+		expect(withoutIgnore.digest).toBe(withEmptyIgnore.digest);
 	});
 
 	it("should digest the rootDir the globs are anchored to", () => {
 		expect.assertions(1);
 
+		const { fileSystem } = createMemoryFileSystem();
+
 		// Re-anchoring the same globs selects a different set of files, and
 		// nothing else would invalidate the shadow copies left by the old one.
-		const here = universeFor({ include: ["src/**/*.ts"], rootDir: PACKAGE_ROOT });
-		const elsewhere = universeFor({ include: ["src/**/*.ts"], rootDir: `${PACKAGE_ROOT}-two` });
+		const here = universeFor(fileSystem, { include: ["src/**/*.ts"], rootDir: PACKAGE_ROOT });
+		const elsewhere = universeFor(fileSystem, {
+			include: ["src/**/*.ts"],
+			rootDir: `${PACKAGE_ROOT}-two`,
+		});
 
 		expect(here.digest).not.toBe(elsewhere.digest);
 	});

@@ -1,16 +1,34 @@
 import { fromAny } from "@total-typescript/shoehorn";
 
-import * as fs from "node:fs";
-import * as os from "node:os";
+import istanbulReports from "istanbul-reports";
 import * as path from "node:path";
 import process from "node:process";
 import { stripVTControlCharacters } from "node:util";
+import type { Mock } from "vitest";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { projectRootFilter, sourceTwinFilter } from "./agent-table-filter.ts";
-import type { MappedCoverageResult, MappedFileCoverage } from "./mapper.ts";
-import * as reporterRegistry from "./reporter-registry.ts";
+import { createMemoryReportEnvironment } from "#test/mocks/memory-report-context.ts";
+import { posixPath } from "#test/mocks/posix-path.ts";
+import type { MappedCoverageResult, MappedFileCoverage } from "./mapper-types.ts";
+import type { createReporter as registryReporter } from "./reporter-registry.ts";
 import { checkThresholds, generateReports, printCoverageHeader } from "./reporter.ts";
+
+function stubTerminalColumns(columns: number): void {
+	const original = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+	onTestFinished(() => {
+		if (original === undefined) {
+			Reflect.deleteProperty(process.stdout, "columns");
+			return;
+		}
+
+		Object.defineProperty(process.stdout, "columns", original);
+	});
+	Object.defineProperty(process.stdout, "columns", {
+		configurable: true,
+		value: columns,
+		writable: true,
+	});
+}
 
 function createMappedFile(overrides: Partial<MappedFileCoverage> = {}): MappedFileCoverage {
 	return {
@@ -38,15 +56,6 @@ function createResult(files: Record<string, MappedFileCoverage> = {}): MappedCov
 	return { files };
 }
 
-function createTemporaryDirectory(): string {
-	const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cov-report-"));
-	onTestFinished(() => {
-		fs.rmSync(temporaryDirectory, { force: true, recursive: true });
-	});
-
-	return temporaryDirectory;
-}
-
 function stdoutOutput(): string {
 	return stripVTControlCharacters(
 		vi
@@ -56,32 +65,66 @@ function stdoutOutput(): string {
 	);
 }
 
-/** One file at 100%, one below — for testing skipFull behavior. */
+function inventoryFile(counts: Pick<MappedFileCoverage, "f" | "s">): MappedFileCoverage {
+	return createMappedFile({
+		fnMap: {
+			"0": {
+				name: "addItem",
+				loc: { end: { column: 1, line: 5 }, start: { column: 0, line: 1 } },
+			},
+			"1": {
+				name: "removeItem",
+				loc: { end: { column: 1, line: 10 }, start: { column: 0, line: 6 } },
+			},
+		},
+		path: "src/shared/inventory.ts",
+		statementMap: {
+			"0": { end: { column: 20, line: 1 }, start: { column: 0, line: 1 } },
+			"1": { end: { column: 15, line: 2 }, start: { column: 0, line: 2 } },
+			"2": { end: { column: 10, line: 3 }, start: { column: 0, line: 3 } },
+			"3": { end: { column: 12, line: 4 }, start: { column: 0, line: 4 } },
+		},
+		...counts,
+	});
+}
+
+function textReportOutput(mapped: MappedCoverageResult): string {
+	const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+	const { createContext, directory } = createMemoryReportEnvironment();
+	generateReports({
+		coverageDirectory: directory,
+		createContext,
+		mapped,
+		reporters: ["text"],
+	});
+	return write.mock.calls.map((call) => String(call[0])).join("");
+}
+
+/**
+ * One file at 100%, one below — for testing skipFull behavior.
+ * @returns The two-file result.
+ */
 function createMixedCoverageResult(): MappedCoverageResult {
 	return createResult({
-		"src/shared/inventory.ts": createMappedFile({
+		"src/shared/inventory.ts": inventoryFile({
 			f: { "0": 5, "1": 3 },
-			fnMap: {
-				"0": {
-					name: "addItem",
-					loc: { end: { column: 1, line: 5 }, start: { column: 0, line: 1 } },
-				},
-				"1": {
-					name: "removeItem",
-					loc: { end: { column: 1, line: 10 }, start: { column: 0, line: 6 } },
-				},
-			},
-			path: "src/shared/inventory.ts",
 			s: { "0": 5, "1": 3, "2": 2, "3": 2 },
-			statementMap: {
-				"0": { end: { column: 20, line: 1 }, start: { column: 0, line: 1 } },
-				"1": { end: { column: 15, line: 2 }, start: { column: 0, line: 2 } },
-				"2": { end: { column: 10, line: 3 }, start: { column: 0, line: 3 } },
-				"3": { end: { column: 12, line: 4 }, start: { column: 0, line: 4 } },
-			},
 		}),
 		"src/shared/player.ts": createMappedFile(),
 	});
+}
+
+const LIB_AND_SRC = ["lib/utils.ts", "src/shared/player.ts"];
+const SPEC_AND_SRC = ["src/shared/player.spec.ts", "src/shared/player.ts"];
+
+function onlyFiles(files: Array<string>): (candidate: string) => boolean {
+	const absolute = new Set(files.map((file) => posixPath(path.resolve(process.cwd(), file))));
+	return (candidate) => absolute.has(candidate);
+}
+
+function underDirectory(directory: string): (candidate: string) => boolean {
+	const root = posixPath(directory);
+	return (candidate) => candidate === root || candidate.startsWith(`${root}/`);
 }
 
 describe(generateReports, () => {
@@ -89,20 +132,11 @@ describe(generateReports, () => {
 		it("should write coverage summary to stdout", () => {
 			expect.assertions(1);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"src/shared/player.ts": createMappedFile(),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = textReportOutput(
+				createResult({
+					"src/shared/player.ts": createMappedFile(),
+				}),
+			);
 
 			expect(output).toContain("player.ts");
 		});
@@ -137,13 +171,18 @@ describe(generateReports, () => {
 		it("should generate lcov.info file", () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = createTemporaryDirectory();
+			const {
+				createContext,
+				directory: temporaryDirectory,
+				fileSystem: fs,
+			} = createMemoryReportEnvironment();
 			const result = createResult({
 				"src/shared/player.ts": createMappedFile(),
 			});
 
 			generateReports({
 				coverageDirectory: temporaryDirectory,
+				createContext,
 				mapped: result,
 				reporters: ["lcov"],
 			});
@@ -158,13 +197,18 @@ describe(generateReports, () => {
 		it("should generate coverage-final.json file", () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = createTemporaryDirectory();
+			const {
+				createContext,
+				directory: temporaryDirectory,
+				fileSystem: fs,
+			} = createMemoryReportEnvironment();
 			const result = createResult({
 				"src/shared/player.ts": createMappedFile(),
 			});
 
 			generateReports({
 				coverageDirectory: temporaryDirectory,
+				createContext,
 				mapped: result,
 				reporters: ["json"],
 			});
@@ -173,47 +217,43 @@ describe(generateReports, () => {
 
 			expect(fs.existsSync(jsonPath)).toBeTrue();
 		});
+
+		it("should generate json when the agent text filter matches no file", () => {
+			expect.assertions(1);
+
+			const {
+				createContext,
+				directory: temporaryDirectory,
+				fileSystem: fs,
+			} = createMemoryReportEnvironment();
+			generateReports({
+				agentMode: true,
+				agentTextFilter: onlyFiles(["src/missing.ts"]),
+				coverageDirectory: temporaryDirectory,
+				createContext,
+				mapped: createResult({
+					"src/shared/player.ts": createMappedFile(),
+				}),
+				reporters: ["json"],
+			});
+
+			expect(fs.existsSync(path.join(temporaryDirectory, "coverage-final.json"))).toBeTrue();
+		});
 	});
 
 	describe("text reporter snapshot", () => {
 		it("should match coverage table output", () => {
 			expect.assertions(1);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"src/shared/inventory.ts": createMappedFile({
-					f: { "0": 5, "1": 0 },
-					fnMap: {
-						"0": {
-							name: "addItem",
-							loc: { end: { column: 1, line: 5 }, start: { column: 0, line: 1 } },
-						},
-						"1": {
-							name: "removeItem",
-							loc: { end: { column: 1, line: 10 }, start: { column: 0, line: 6 } },
-						},
-					},
-					path: "src/shared/inventory.ts",
-					s: { "0": 5, "1": 3, "2": 0, "3": 2 },
-					statementMap: {
-						"0": { end: { column: 20, line: 1 }, start: { column: 0, line: 1 } },
-						"1": { end: { column: 15, line: 2 }, start: { column: 0, line: 2 } },
-						"2": { end: { column: 10, line: 3 }, start: { column: 0, line: 3 } },
-						"3": { end: { column: 12, line: 4 }, start: { column: 0, line: 4 } },
-					},
+			const output = textReportOutput(
+				createResult({
+					"src/shared/inventory.ts": inventoryFile({
+						f: { "0": 5, "1": 0 },
+						s: { "0": 5, "1": 3, "2": 0, "3": 2 },
+					}),
+					"src/shared/player.ts": createMappedFile(),
 				}),
-				"src/shared/player.ts": createMappedFile(),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			);
 
 			expect(stripVTControlCharacters(output)).toMatchInlineSnapshot(`
 				"--------------|---------|----------|---------|---------|-------------------
@@ -454,12 +494,14 @@ describe(generateReports, () => {
 		it("should not print totals when no text reporter is present", () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = createTemporaryDirectory();
+			const { createContext, directory: temporaryDirectory } =
+				createMemoryReportEnvironment();
 			vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
 			generateReports({
 				agentMode: true,
 				coverageDirectory: temporaryDirectory,
+				createContext,
 				mapped: createResult({ "src/shared/player.ts": createMappedFile() }),
 				reporters: ["lcov"],
 			});
@@ -476,7 +518,9 @@ describe(generateReports, () => {
 				agentMode: true,
 				coverageDirectory: "/tmp/unused",
 				mapped: createResult({
-					"src/shared/player.ts": createMappedFile({ s: { "0": 3, "1": 2, "2": 5 } }),
+					"src/shared/player.ts": createMappedFile({
+						s: { "0": 3, "1": 2, "2": 5 },
+					}),
 				}),
 				reporters: ["text", "text-summary"],
 			});
@@ -487,14 +531,21 @@ describe(generateReports, () => {
 		it("should print the compact summary when text is mixed with a file reporter", () => {
 			expect.assertions(2);
 
-			const temporaryDirectory = createTemporaryDirectory();
+			const {
+				createContext,
+				directory: temporaryDirectory,
+				fileSystem: fs,
+			} = createMemoryReportEnvironment();
 			vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
 			generateReports({
 				agentMode: true,
 				coverageDirectory: temporaryDirectory,
+				createContext,
 				mapped: createResult({
-					"src/shared/player.ts": createMappedFile({ s: { "0": 3, "1": 2, "2": 5 } }),
+					"src/shared/player.ts": createMappedFile({
+						s: { "0": 3, "1": 2, "2": 5 },
+					}),
 				}),
 				reporters: ["text", "lcov"],
 			});
@@ -505,33 +556,33 @@ describe(generateReports, () => {
 	});
 
 	describe("terminal columns", () => {
-		it("should use stdout.columns when available", () => {
-			expect.assertions(2);
-
-			Object.defineProperty(process.stdout, "columns", { configurable: true, value: 200 });
+		function reportNestedPathsInAgentMode(): Mock<typeof registryReporter> {
 			vi.spyOn(process.stdout, "write").mockReturnValue(true);
-			const createReporter = vi.spyOn(reporterRegistry, "createReporter");
-
-			const result = createResult({
-				"src/deeply/nested/path/to/module/index.ts": createMappedFile({
-					path: "src/deeply/nested/path/to/module/index.ts",
-				}),
-				"src/other/location/index.ts": createMappedFile({
-					path: "src/other/location/index.ts",
-				}),
+			const createReporter = vi.fn<typeof registryReporter>((name, options) => {
+				return istanbulReports.create(name, options);
 			});
-
 			generateReports({
 				agentMode: true,
 				coverageDirectory: "/tmp/unused",
-				mapped: result,
+				createReporter,
+				mapped: createResult({
+					"src/deeply/nested/path/to/module/index.ts": createMappedFile({
+						path: "src/deeply/nested/path/to/module/index.ts",
+					}),
+					"src/other/location/index.ts": createMappedFile({
+						path: "src/other/location/index.ts",
+					}),
+				}),
 				reporters: ["text"],
 			});
+			return createReporter;
+		}
 
-			Object.defineProperty(process.stdout, "columns", {
-				configurable: true,
-				value: undefined,
-			});
+		it("should use stdout.columns when available", () => {
+			expect.assertions(2);
+
+			stubTerminalColumns(200);
+			const createReporter = reportNestedPathsInAgentMode();
 
 			expect(stdoutOutput()).toContain("deeply/nested/path/to/module/index.ts");
 			expect(createReporter).toHaveBeenCalledExactlyOnceWith("text", {
@@ -544,24 +595,7 @@ describe(generateReports, () => {
 			expect.assertions(3);
 
 			vi.stubEnv("COLUMNS", "200");
-			vi.spyOn(process.stdout, "write").mockReturnValue(true);
-			const createReporter = vi.spyOn(reporterRegistry, "createReporter");
-
-			const result = createResult({
-				"src/deeply/nested/path/to/module/index.ts": createMappedFile({
-					path: "src/deeply/nested/path/to/module/index.ts",
-				}),
-				"src/other/location/index.ts": createMappedFile({
-					path: "src/other/location/index.ts",
-				}),
-			});
-
-			generateReports({
-				agentMode: true,
-				coverageDirectory: "/tmp/unused",
-				mapped: result,
-				reporters: ["text"],
-			});
+			const createReporter = reportNestedPathsInAgentMode();
 
 			const output = stdoutOutput();
 
@@ -579,7 +613,9 @@ describe(generateReports, () => {
 				expect.assertions(2);
 
 				vi.spyOn(process.stdout, "write").mockReturnValue(true);
-				const createReporter = vi.spyOn(reporterRegistry, "createReporter");
+				const createReporter = vi.fn<typeof registryReporter>((name, options) => {
+					return istanbulReports.create(name, options);
+				});
 
 				const result = createResult({
 					"src/a/very/long/nested/directory/whose/name/exceeds/the/default/terminal/width/player.ts":
@@ -590,6 +626,7 @@ describe(generateReports, () => {
 
 				generateReports({
 					coverageDirectory: "/tmp/unused",
+					createReporter,
 					mapped: result,
 					reporters: ["text"],
 				});
@@ -599,6 +636,7 @@ describe(generateReports, () => {
 
 				generateReports({
 					coverageDirectory: "/tmp/unused",
+					createReporter,
 					mapped: result,
 					reporters: ["text"],
 				});
@@ -616,13 +654,20 @@ describe(generateReports, () => {
 		it("should generate report without throwing when file has branch coverage data", () => {
 			expect.assertions(1);
 
-			const temporaryDirectory = createTemporaryDirectory();
+			const {
+				createContext,
+				directory: temporaryDirectory,
+				fileSystem: fs,
+			} = createMemoryReportEnvironment();
 			const result = createResult({
 				"src/shared/player.ts": createMappedFile({
 					b: { "0": [3, 1] },
 					branchMap: {
 						"0": {
-							loc: { end: { column: 1, line: 5 }, start: { column: 0, line: 2 } },
+							loc: {
+								end: { column: 1, line: 5 },
+								start: { column: 0, line: 2 },
+							},
 							locations: [
 								{ end: { column: 10, line: 3 }, start: { column: 0, line: 2 } },
 								{ end: { column: 1, line: 5 }, start: { column: 0, line: 4 } },
@@ -635,6 +680,7 @@ describe(generateReports, () => {
 
 			generateReports({
 				coverageDirectory: temporaryDirectory,
+				createContext,
 				mapped: result,
 				reporters: ["json"],
 			});
@@ -646,25 +692,30 @@ describe(generateReports, () => {
 	});
 
 	describe("with collectCoverageFrom filtering", () => {
+		function filteredTextOutput(
+			paths: Array<string>,
+			collectCoverageFrom?: Array<string>,
+		): string {
+			vi.spyOn(process.stdout, "write").mockReturnValue(true);
+			const { createContext, directory } = createMemoryReportEnvironment();
+			generateReports({
+				...(collectCoverageFrom === undefined ? {} : { collectCoverageFrom }),
+				coverageDirectory: directory,
+				createContext,
+				mapped: createResult(
+					Object.fromEntries(
+						paths.map((file) => [file, createMappedFile({ path: file })]),
+					),
+				),
+				reporters: ["text"],
+			});
+			return stdoutOutput();
+		}
+
 		it("should include only files matching collectCoverageFrom globs", () => {
 			expect.assertions(2);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"lib/utils.ts": createMappedFile({ path: "lib/utils.ts" }),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: ["src/**/*.ts"],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(LIB_AND_SRC, ["src/**/*.ts"]);
 
 			expect(output).toContain("player.ts");
 			expect(output).not.toContain("utils.ts");
@@ -673,21 +724,7 @@ describe(generateReports, () => {
 		it("should include all files when collectCoverageFrom is undefined", () => {
 			expect.assertions(2);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"lib/utils.ts": createMappedFile({ path: "lib/utils.ts" }),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(LIB_AND_SRC);
 
 			expect(output).toContain("player.ts");
 			expect(output).toContain("utils.ts");
@@ -696,23 +733,10 @@ describe(generateReports, () => {
 		it("should support multiple glob patterns", () => {
 			expect.assertions(3);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"lib/utils.ts": createMappedFile({ path: "lib/utils.ts" }),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-				"vendor/external.ts": createMappedFile({ path: "vendor/external.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: ["src/**/*.ts", "lib/**/*.ts"],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(
+				[...LIB_AND_SRC, "vendor/external.ts"],
+				["src/**/*.ts", "lib/**/*.ts"],
+			);
 
 			expect(output).toContain("player.ts");
 			expect(output).toContain("utils.ts");
@@ -722,24 +746,7 @@ describe(generateReports, () => {
 		it("should support negated globs", () => {
 			expect.assertions(2);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"src/shared/player.spec.ts": createMappedFile({
-					path: "src/shared/player.spec.ts",
-				}),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: ["src/**/*.ts", "!**/*.spec.ts"],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(SPEC_AND_SRC, ["src/**/*.ts", "!**/*.spec.ts"]);
 
 			expect(output).toContain("player.ts");
 			expect(output).not.toContain("spec");
@@ -748,24 +755,7 @@ describe(generateReports, () => {
 		it("should support exclude-only patterns", () => {
 			expect.assertions(2);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"src/shared/player.spec.ts": createMappedFile({
-					path: "src/shared/player.spec.ts",
-				}),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: ["!**/*.spec.ts"],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(SPEC_AND_SRC, ["!**/*.spec.ts"]);
 
 			expect(output).toContain("player.ts");
 			expect(output).not.toContain("spec");
@@ -774,22 +764,7 @@ describe(generateReports, () => {
 		it("should include all files when collectCoverageFrom is empty array", () => {
 			expect.assertions(2);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"lib/utils.ts": createMappedFile({ path: "lib/utils.ts" }),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: [],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(LIB_AND_SRC, []);
 
 			expect(output).toContain("player.ts");
 			expect(output).toContain("utils.ts");
@@ -798,24 +773,7 @@ describe(generateReports, () => {
 		it("should match short globs with matchBase semantics", () => {
 			expect.assertions(2);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"src/shared/player.spec.ts": createMappedFile({
-					path: "src/shared/player.spec.ts",
-				}),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: ["*.ts", "!*.spec.ts"],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(SPEC_AND_SRC, ["*.ts", "!*.spec.ts"]);
 
 			expect(output).toContain("player.ts");
 			expect(output).not.toContain("spec");
@@ -824,25 +782,10 @@ describe(generateReports, () => {
 		it("should handle absolute file paths by normalizing to relative", () => {
 			expect.assertions(2);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const absolutePath = path.resolve("src/shared/player.ts");
-			const absoluteSpecPath = path.resolve("src/shared/player.spec.ts");
-
-			const result = createResult({
-				[absolutePath]: createMappedFile({ path: absolutePath }),
-				[absoluteSpecPath]: createMappedFile({ path: absoluteSpecPath }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: ["src/**/*.ts", "!**/*.spec.ts"],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(
+				[path.resolve("src/shared/player.ts"), path.resolve("src/shared/player.spec.ts")],
+				["src/**/*.ts", "!**/*.spec.ts"],
+			);
 
 			expect(output).toContain("player.ts");
 			expect(output).not.toContain("spec");
@@ -851,32 +794,25 @@ describe(generateReports, () => {
 		it("should produce empty report when all files are filtered out", () => {
 			expect.assertions(1);
 
-			const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-
-			const result = createResult({
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
-			});
-
-			const temporaryDirectory = createTemporaryDirectory();
-			generateReports({
-				collectCoverageFrom: ["nonexistent/**/*.ts"],
-				coverageDirectory: temporaryDirectory,
-				mapped: result,
-				reporters: ["text"],
-			});
-
-			const output = stdoutSpy.mock.calls.map((call) => String(call[0])).join("");
+			const output = filteredTextOutput(["src/shared/player.ts"], ["nonexistent/**/*.ts"]);
 
 			expect(output).not.toContain("player.ts");
 		});
 	});
 
 	describe("agent text-table filtering", () => {
-		// Two universe files, each 2/3 statements covered (the default fixture).
+		/**
+		 * Two universe files, each 2/3 statements covered (the default fixture).
+		 * @returns The two-file result.
+		 */
 		function twoFileUniverse(): MappedCoverageResult {
 			return createResult({
-				"src/shared/enemy.ts": createMappedFile({ path: "src/shared/enemy.ts" }),
-				"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
+				"src/shared/enemy.ts": createMappedFile({
+					path: "src/shared/enemy.ts",
+				}),
+				"src/shared/player.ts": createMappedFile({
+					path: "src/shared/player.ts",
+				}),
 			});
 		}
 
@@ -887,7 +823,7 @@ describe(generateReports, () => {
 
 			generateReports({
 				agentMode: true,
-				agentTextFilter: sourceTwinFilter(["src/shared/player.test.ts"], process.cwd()),
+				agentTextFilter: onlyFiles(["src/shared/player.ts"]),
 				coverageDirectory: "/tmp/unused",
 				mapped: twoFileUniverse(),
 				reporters: ["text"],
@@ -914,11 +850,15 @@ describe(generateReports, () => {
 
 			generateReports({
 				agentMode: true,
-				agentTextFilter: projectRootFilter([path.resolve(process.cwd(), "src/shared")]),
+				agentTextFilter: underDirectory(path.resolve(process.cwd(), "src/shared")),
 				coverageDirectory: "/tmp/unused",
 				mapped: createResult({
-					"src/server/boot.ts": createMappedFile({ path: "src/server/boot.ts" }),
-					"src/shared/player.ts": createMappedFile({ path: "src/shared/player.ts" }),
+					"src/server/boot.ts": createMappedFile({
+						path: "src/server/boot.ts",
+					}),
+					"src/shared/player.ts": createMappedFile({
+						path: "src/shared/player.ts",
+					}),
 				}),
 				reporters: ["text"],
 			});
@@ -943,7 +883,7 @@ describe(generateReports, () => {
 			vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
 			generateReports({
-				agentTextFilter: sourceTwinFilter(["src/shared/player.test.ts"], process.cwd()),
+				agentTextFilter: onlyFiles(["src/shared/player.ts"]),
 				coverageDirectory: "/tmp/unused",
 				mapped: twoFileUniverse(),
 				reporters: ["text"],
@@ -995,7 +935,7 @@ describe(generateReports, () => {
 
 			generateReports({
 				agentMode: true,
-				agentTextFilter: sourceTwinFilter(["src/shared/player.test.ts"], process.cwd()),
+				agentTextFilter: onlyFiles(["src/shared/player.ts"]),
 				coverageDirectory: "/tmp/unused",
 				mapped: twoFileUniverse(),
 				reporters: ["text-summary"],
@@ -1020,11 +960,16 @@ describe(generateReports, () => {
 
 			vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
-			const temporaryDirectory = createTemporaryDirectory();
+			const {
+				createContext,
+				directory: temporaryDirectory,
+				fileSystem: fs,
+			} = createMemoryReportEnvironment();
 			generateReports({
 				agentMode: true,
-				agentTextFilter: sourceTwinFilter(["src/shared/player.test.ts"], process.cwd()),
+				agentTextFilter: onlyFiles(["src/shared/player.ts"]),
 				coverageDirectory: temporaryDirectory,
+				createContext,
 				mapped: twoFileUniverse(),
 				reporters: ["lcov"],
 			});
@@ -1042,7 +987,7 @@ describe(generateReports, () => {
 
 			generateReports({
 				agentMode: true,
-				agentTextFilter: sourceTwinFilter(["src/shared/missing.test.ts"], process.cwd()),
+				agentTextFilter: onlyFiles(["src/shared/missing.ts"]),
 				coverageDirectory: "/tmp/unused",
 				mapped: twoFileUniverse(),
 				reporters: ["text"],
@@ -1078,7 +1023,7 @@ describe(generateReports, () => {
 
 describe(printCoverageHeader, () => {
 	it("should match header output", () => {
-		expect.assertions(1);
+		expect.assertions(2);
 
 		const stdoutSpy = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 
@@ -1091,6 +1036,7 @@ describe(printCoverageHeader, () => {
 			 % Coverage report from istanbul
 			"
 		`);
+		expect(output).not.toBe(stripVTControlCharacters(output));
 	});
 
 	it("should render the header without ANSI color in agent mode", () => {
@@ -1127,7 +1073,10 @@ describe(checkThresholds, () => {
 				"src/shared/player.ts": createMappedFile(),
 			});
 
-			const thresholdResult = checkThresholds(result, { statements: 50 });
+			const thresholdResult = checkThresholds({
+				mapped: result,
+				thresholds: { statements: 50 },
+			});
 
 			expect(thresholdResult.passed).toBeTrue();
 		});
@@ -1141,7 +1090,10 @@ describe(checkThresholds, () => {
 				"src/shared/player.ts": createMappedFile(),
 			});
 
-			const thresholdResult = checkThresholds(result, { statements: 80 });
+			const thresholdResult = checkThresholds({
+				mapped: result,
+				thresholds: { statements: 80 },
+			});
 
 			expect(thresholdResult.passed).toBeFalse();
 		});
@@ -1155,10 +1107,13 @@ describe(checkThresholds, () => {
 				"src/shared/player.ts": createMappedFile(),
 			});
 
-			const thresholdResult = checkThresholds(result, {
-				functions: 100,
-				lines: 90,
-				statements: 80,
+			const thresholdResult = checkThresholds({
+				mapped: result,
+				thresholds: {
+					functions: 100,
+					lines: 90,
+					statements: 80,
+				},
 			});
 
 			expect(thresholdResult.failures).toContainEqual(
@@ -1178,6 +1133,8 @@ describe(checkThresholds, () => {
 		/**
 		 * Every statement at zero hits — the shape a never-required file maps
 		 * to.
+		 * @param filePath - Source path of the file.
+		 * @returns The file's coverage.
 		 */
 		function untestedFile(filePath: string): MappedFileCoverage {
 			return createMappedFile({
@@ -1187,7 +1144,11 @@ describe(checkThresholds, () => {
 			});
 		}
 
-		/** Every statement hit — a fully covered file. */
+		/**
+		 * Every statement hit — a fully covered file.
+		 * @param filePath - Source path of the file.
+		 * @returns The file's coverage.
+		 */
 		function coveredFile(filePath: string): MappedFileCoverage {
 			return createMappedFile({
 				f: { "0": 2 },
@@ -1204,10 +1165,11 @@ describe(checkThresholds, () => {
 				"src/shared/player.ts": untestedFile("src/shared/player.ts"),
 			});
 
-			const thresholdResult = checkThresholds(result, { statements: 100 }, [
-				"src/**/*.ts",
-				"!**/*.spec.ts",
-			]);
+			const thresholdResult = checkThresholds({
+				collectCoverageFrom: ["src/**/*.ts", "!**/*.spec.ts"],
+				mapped: result,
+				thresholds: { statements: 100 },
+			});
 
 			expect(thresholdResult.passed).toBeFalse();
 		});
@@ -1222,10 +1184,11 @@ describe(checkThresholds, () => {
 				"src/shared/player.ts": coveredFile("src/shared/player.ts"),
 			});
 
-			const thresholdResult = checkThresholds(result, { statements: 100 }, [
-				"src/**/*.ts",
-				"!**/*.spec.ts",
-			]);
+			const thresholdResult = checkThresholds({
+				collectCoverageFrom: ["src/**/*.ts", "!**/*.spec.ts"],
+				mapped: result,
+				thresholds: { statements: 100 },
+			});
 
 			expect(thresholdResult.passed).toBeTrue();
 		});
@@ -1240,11 +1203,14 @@ describe(checkThresholds, () => {
 			// With no files, the summary will have 0 totals.
 			const emptyResult = createResult({});
 
-			const thresholdResult = checkThresholds(emptyResult, {
-				branches: 80,
-				functions: 80,
-				lines: 80,
-				statements: 80,
+			const thresholdResult = checkThresholds({
+				mapped: emptyResult,
+				thresholds: {
+					branches: 80,
+					functions: 80,
+					lines: 80,
+					statements: 80,
+				},
 			});
 
 			// Empty coverage map: 0 total for all metrics. Istanbul reports
@@ -1263,7 +1229,10 @@ describe(checkThresholds, () => {
 			// unexpected, checkThresholds handles it gracefully.
 			const result = createResult({});
 
-			const thresholdResult = checkThresholds(result, { statements: 80 });
+			const thresholdResult = checkThresholds({
+				mapped: result,
+				thresholds: { statements: 80 },
+			});
 
 			expect(thresholdResult.passed).toBeTrue();
 			expect(thresholdResult.failures).toBeEmpty();

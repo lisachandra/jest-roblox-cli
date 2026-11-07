@@ -1,7 +1,10 @@
+import type { PerTestCoverageEntry, RawCoverageData } from "./coverage-types.ts";
 import type { CoverageManifest, InstrumentedFileRecord, TestRecord } from "./manifest.ts";
 import type { TestSourceResolver } from "./test-source.ts";
-import type { PerTestCoverageEntry, RawCoverageData } from "./types.ts";
 
+/**
+ * Per-test attribution harvested from one run.
+ */
 export interface AttributionResult {
 	/** Per Luau file: statement id → ids of the tests that covered it. */
 	coveringTestIds: Record<string, Record<string, Array<string>>>;
@@ -11,6 +14,7 @@ export interface AttributionResult {
 	 * ADR-0003.
 	 */
 	staticStatementIds: Record<string, Array<string>>;
+	/** Tests that covered at least one statement. */
 	tests: Array<TestRecord>;
 }
 
@@ -21,12 +25,18 @@ export interface AttributionResult {
  * `resolveTestSource` answers what a test's source looks like — its file hash,
  * and its location and range hash when the run reported where it is — an
  * injected seam so the harvester stays pure and fs-free.
+ * @param options - Whole-run hits, per-test deltas and test source resolver.
+ * @returns Test records, per-statement covering ids and the static set.
  */
-export function harvestAttribution(
-	entries: ReadonlyArray<PerTestCoverageEntry>,
-	cumulative: RawCoverageData,
-	resolveTestSource: TestSourceResolver,
-): AttributionResult {
+export function harvestAttribution({
+	cumulative,
+	entries,
+	resolveTestSource,
+}: {
+	cumulative: RawCoverageData;
+	entries: ReadonlyArray<PerTestCoverageEntry>;
+	resolveTestSource: TestSourceResolver;
+}): AttributionResult {
 	const tests: Array<TestRecord> = [];
 	const coveringTestIds: AttributionResult["coveringTestIds"] = {};
 
@@ -67,7 +77,7 @@ export function harvestAttribution(
 /**
  * Write an attribution result into a coverage manifest: set `tests[]` and
  * place each file's per-statement `coveringTestIds` and `staticStatementIds`
- * on its record. Attribution for a file absent from the manifest (e.g. a
+ * on its record. Attribution for a file absent from the manifest (for example a
  * covered helper outside the report universe) is dropped — the manifest's file
  * set stays the source of truth.
  *
@@ -77,6 +87,9 @@ export function harvestAttribution(
  * separate maps, so a file this run has static ids for but no covering ids for
  * would otherwise keep the last run's covering ids — and consumers read the two
  * sets as one run's disjoint halves.
+ * @param manifest - Manifest to write into.
+ * @param attribution - Harvested attribution for this run.
+ * @returns Copy of the manifest with this run's attribution only.
  */
 export function applyAttribution(
 	manifest: CoverageManifest,
@@ -111,6 +124,9 @@ export function applyAttribution(
  * merged run, so the union drops any id credited in the merged
  * `coveringTestIds`. Used to combine per-project attribution from a
  * multi-project run.
+ * @param a - First attribution result.
+ * @param b - Second attribution result.
+ * @returns Combined attribution.
  */
 export function mergeAttribution(a: AttributionResult, b: AttributionResult): AttributionResult {
 	const coveringTestIds: AttributionResult["coveringTestIds"] = {};
@@ -123,19 +139,23 @@ export function mergeAttribution(a: AttributionResult, b: AttributionResult): At
 		}
 	}
 
-	const staticStatementIds = mergeStatic(
-		a.staticStatementIds,
-		b.staticStatementIds,
+	const staticStatementIds = mergeStatic({
+		a: a.staticStatementIds,
+		b: b.staticStatementIds,
 		coveringTestIds,
-	);
+	});
 
 	return { coveringTestIds, staticStatementIds, tests: [...a.tests, ...b.tests] };
 }
 
 /**
  * A statement is static iff it was hit in the run (`count > 0`) but never
- * credited to a per-test window — i.e. its id is not a key in `coveringTestIds`
- * for that file. Ids are sorted numerically so the manifest stays stable.
+ * credited to a per-test window, so its id is not a key in `coveringTestIds`
+ * for that file. Numeric object keys enumerate in ascending order, so the
+ * manifest stays stable without another sort.
+ * @param cumulative - Whole-run hit table.
+ * @param coveringTestIds - Per-file statement ids credited to a test.
+ * @returns Per-file static statement ids; files with none are omitted.
  */
 function deriveStatic(
 	cumulative: RawCoverageData,
@@ -148,8 +168,7 @@ function deriveStatic(
 			.filter(
 				([statementId, hitCount]) => hitCount > 0 && credited?.[statementId] === undefined,
 			)
-			.map(([statementId]) => statementId)
-			.sort((a, b) => Number(a) - Number(b));
+			.map(([statementId]) => statementId);
 		if (ids.length > 0) {
 			staticStatementIds[fileKey] = ids;
 		}
@@ -161,6 +180,8 @@ function deriveStatic(
 /**
  * A record with neither attribution field, ready to take this run's. Both go
  * together: leaving one behind is what pairs two runs' halves on one record.
+ * @param record - Record to copy.
+ * @returns Copy without `coveringTestIds` and `staticStatementIds`.
  */
 function clearAttribution(record: InstrumentedFileRecord): InstrumentedFileRecord {
 	const cleared = { ...record };
@@ -169,11 +190,15 @@ function clearAttribution(record: InstrumentedFileRecord): InstrumentedFileRecor
 	return cleared;
 }
 
-function mergeStatic(
-	a: AttributionResult["staticStatementIds"],
-	b: AttributionResult["staticStatementIds"],
-	coveringTestIds: AttributionResult["coveringTestIds"],
-): AttributionResult["staticStatementIds"] {
+function mergeStatic({
+	a,
+	b,
+	coveringTestIds,
+}: {
+	a: AttributionResult["staticStatementIds"];
+	b: AttributionResult["staticStatementIds"];
+	coveringTestIds: AttributionResult["coveringTestIds"];
+}): AttributionResult["staticStatementIds"] {
 	const merged: AttributionResult["staticStatementIds"] = {};
 	const fileKeys = new Set([...Object.keys(a), ...Object.keys(b)]);
 	for (const fileKey of fileKeys) {

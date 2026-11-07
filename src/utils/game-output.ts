@@ -1,13 +1,17 @@
 import { type } from "arktype";
-import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { GameOutputEntry, PackageGameOutput } from "../types/game-output.ts";
+import type { GameOutputEntry, PackageGameOutput } from "../types/game-output-types.ts";
+import type { FileSystem } from "./file-system.ts";
+import { nodeFileSystem } from "./file-system.ts";
 
 /** One contributor to an Aggregated Game Output file. */
 export interface GameOutputSource {
+	/** The workspace package the output belongs to. */
 	package?: string;
+	/** The project the output belongs to. */
 	project: string;
+	/** The captured output as JSON text, if any. */
 	raw: string | undefined;
 }
 
@@ -20,6 +24,32 @@ const gameOutputEntriesSchema = type({
 	timestamp: "number",
 }).array();
 
+/** Inputs for {@link writeGameOutput}. */
+export interface WriteGameOutputOptions {
+	/** The messages to write. */
+	readonly entries: Array<GameOutputEntry>;
+	/** Where the JSON file goes. */
+	readonly filePath: string;
+	/** Where the file is written. Defaults to the real filesystem. */
+	readonly fileSystem?: FileSystem;
+}
+
+/** Inputs for {@link writeGroupedGameOutput}. */
+export interface WriteGroupedGameOutputOptions {
+	/** Where the JSON file goes. */
+	readonly filePath: string;
+	/** Where the file is written. Defaults to the real filesystem. */
+	readonly fileSystem?: FileSystem;
+	/** The groups to write. */
+	readonly groups: Array<PackageGameOutput>;
+}
+
+/**
+ * The line telling the user where the game output was written.
+ * @param filePath - Where the output was written.
+ * @param entryCount - How many messages it holds.
+ * @returns The notice, or an empty string for no messages.
+ */
 export function formatGameOutputNotice(filePath: string, entryCount: number): string {
 	if (entryCount === 0) {
 		return "";
@@ -28,6 +58,11 @@ export function formatGameOutputNotice(filePath: string, entryCount: number): st
 	return `Game output (${String(entryCount)} entries) written to ${filePath}`;
 }
 
+/**
+ * Parse captured game output, treating anything malformed as empty.
+ * @param raw - The captured output as JSON text.
+ * @returns The messages, or an empty array.
+ */
 export function parseGameOutput(raw: string | undefined): Array<GameOutputEntry> {
 	if (raw === undefined) {
 		return [];
@@ -45,8 +80,16 @@ export function parseGameOutput(raw: string | undefined): Array<GameOutputEntry>
 	}
 }
 
-export function writeGameOutput(filePath: string, entries: Array<GameOutputEntry>): void {
-	writeJsonFile(filePath, entries);
+/**
+ * Write messages as a JSON file, creating its directory.
+ * @param options - The messages, the path and the filesystem.
+ */
+export function writeGameOutput({
+	entries,
+	filePath,
+	fileSystem = nodeFileSystem,
+}: WriteGameOutputOptions): void {
+	writeJsonFile({ filePath, fileSystem, value: entries });
 }
 
 /**
@@ -54,6 +97,8 @@ export function writeGameOutput(filePath: string, entries: Array<GameOutputEntry
  * source, in the order given (deterministic package/project order). Sources
  * with no captured output still produce a group with an empty `entries`
  * array, so the file is a complete manifest of what ran.
+ * @param sources - The contributors, in output order.
+ * @returns One group per source.
  */
 export function buildGroupedGameOutput(
 	sources: ReadonlyArray<GameOutputSource>,
@@ -79,29 +124,47 @@ export function buildGroupedGameOutput(
  * labelled group is the whole truth: splitting the same lines across
  * per-project groups would duplicate them and attribute each copy to a project
  * that may not have printed any of it.
+ * @param raw - The batch's captured output as JSON text.
+ * @returns The one batch group.
  */
 export function buildBatchGameOutput(raw: string | undefined): Array<PackageGameOutput> {
 	return [{ entries: parseGameOutput(raw), project: BATCH_PROJECT_LABEL, scope: "batch" }];
 }
 
-export function writeGroupedGameOutput(filePath: string, groups: Array<PackageGameOutput>): void {
-	writeJsonFile(filePath, groups);
+/**
+ * Write grouped game output as a JSON file, creating its directory.
+ * @param options - The groups, the path and the filesystem.
+ */
+export function writeGroupedGameOutput({
+	filePath,
+	fileSystem = nodeFileSystem,
+	groups,
+}: WriteGroupedGameOutputOptions): void {
+	writeJsonFile({ filePath, fileSystem, value: groups });
 }
 
+/**
+ * Count the messages across every group.
+ * @param groups - The groups to count.
+ * @returns The total message count.
+ */
 export function countGroupedEntries(groups: ReadonlyArray<PackageGameOutput>): number {
 	return groups.reduce((total, group) => total + group.entries.length, 0);
 }
 
-function writeJsonFile(
-	filePath: string,
-	value: Array<GameOutputEntry> | Array<PackageGameOutput>,
-): void {
+function writeJsonFile({
+	filePath,
+	fileSystem,
+	value,
+}: {
+	readonly filePath: string;
+	readonly fileSystem: FileSystem;
+	readonly value: Array<GameOutputEntry> | Array<PackageGameOutput>;
+}): void {
 	const absolutePath = path.resolve(filePath);
 	const directoryPath = path.dirname(absolutePath);
 
-	if (!fs.existsSync(directoryPath)) {
-		fs.mkdirSync(directoryPath, { recursive: true });
-	}
+	fileSystem.mkdirSync(directoryPath, { recursive: true });
 
-	fs.writeFileSync(absolutePath, JSON.stringify(value, null, 2));
+	fileSystem.writeFileSync(absolutePath, JSON.stringify(value, null, 2));
 }

@@ -1,39 +1,79 @@
 import path from "node:path";
 
-import {
-	hasExecError,
-	type JestResult,
-	type TestCaseResult,
-	type TestFileResult,
-} from "../types/jest-result.ts";
+import { hasExecError } from "../types/exec-error-file.ts";
+import type { JestResult, TestCaseResult, TestFileResult } from "../types/jest-result-types.ts";
 import { type FormatOptions, resolveDisplayPath } from "./shared.ts";
 import { formatDuration, type Styles } from "./styles.ts";
 import { countFileBuckets } from "./summary.ts";
 
+/**
+ * Totals for one project's header line.
+ */
 export interface ProjectStats {
+	/**
+	 * Summed duration of the files: each file's host time when it carries one,
+	 * else its timed tests' durations.
+	 */
 	durationMs: number;
+	/**
+	 * Files counted as failed.
+	 */
 	failedFiles: number;
+	/**
+	 * Files counted as passed.
+	 */
 	passedFiles: number;
+	/**
+	 * Files counted as skipped.
+	 */
 	skippedFiles: number;
+	/**
+	 * Tests in the run.
+	 */
 	totalTests: number;
 }
 
-/** The one-or-more lines that report a single test file's outcome. */
-export function formatFileSummary(
-	file: TestFileResult,
-	options: FormatOptions,
-	styles: Styles,
-): string {
-	const displayPath = resolveDisplayPath(file.testFilePath, options.sourceMapper);
+/**
+ * Inputs of `formatFileSummary`.
+ */
+export interface FormatFileSummaryOptions {
+	/**
+	 * File to report.
+	 */
+	file: TestFileResult;
+	/**
+	 * Format options.
+	 */
+	options: FormatOptions;
+	/**
+	 * Palette to render with.
+	 */
+	styles: Styles;
+}
+
+interface FormatFailedFileSummaryOptions {
+	displayPath: string;
+	file: TestFileResult;
+	styles: Styles;
+	testCount: number;
+}
+
+/**
+ * The one-or-more lines that report a single test file's outcome.
+ * @param options - File, format options and palette.
+ * @returns The file's summary lines joined by newlines.
+ */
+export function formatFileSummary({ file, options, styles }: FormatFileSummaryOptions): string {
+	const displayPath = resolveDisplayPath(file.testFilePath, options);
 	const formattedPath = formatFilePath(displayPath, styles);
 	const testCount = file.numPassingTests + file.numFailingTests + file.numPendingTests;
 
 	if (file.numFailingTests > 0) {
-		return formatFailedFileSummary(file, testCount, styles, displayPath).join("\n");
+		return formatFailedFileSummary({ displayPath, file, styles, testCount }).join("\n");
 	}
 
 	if (hasExecError(file)) {
-		return formatExecErrorFileSummary(file, formattedPath, styles).join("\n");
+		return formatExecErrorFileSummary({ file, formattedPath, styles });
 	}
 
 	if (file.numPassingTests === 0 && file.numPendingTests > 0) {
@@ -50,6 +90,11 @@ export function formatFileSummary(
 	}).join("\n");
 }
 
+/**
+ * Total a project's files by outcome and its test durations.
+ * @param result - Jest result of one project.
+ * @returns The project's totals.
+ */
 export function computeProjectStats(result: JestResult): ProjectStats {
 	// The file counts come from countFileBuckets rather than a second walk of
 	// the same list: the header and the trailing `Test Files` row report the
@@ -58,7 +103,7 @@ export function computeProjectStats(result: JestResult): ProjectStats {
 
 	let durationMs = 0;
 	for (const file of result.testResults) {
-		durationMs += sumFileDuration(file);
+		durationMs += fileDurationMs(file);
 	}
 
 	return {
@@ -98,12 +143,21 @@ function countsTowardDuration(test: TestCaseResult): boolean {
 	return test.status === "passed" || test.status === "failed";
 }
 
-// A group of tests that all skipped has no duration to report, which is not the
-// same as a duration of zero — hence the emptiness check rather than `> 0`.
+function testDurationMs(test: TestCaseResult): number | undefined {
+	return test.duration;
+}
+
+/**
+ * A group of tests that all skipped has no duration to report, which is not the
+ * same as a duration of zero — hence the emptiness check rather than `> 0`.
+ * @param tests - Tests of one describe group.
+ * @param styles - Palette to render with.
+ * @returns The styled duration, or empty when no test was timed.
+ */
 function formatGroupDuration(tests: Array<TestCaseResult>, styles: Styles): string {
 	const durations = tests
 		.filter((testCase) => countsTowardDuration(testCase))
-		.map((testCase) => testCase.duration)
+		.map((testCase) => testDurationMs(testCase))
 		.filter((duration) => duration !== undefined);
 	if (durations.length === 0) {
 		return "";
@@ -116,8 +170,8 @@ function formatGroupDuration(tests: Array<TestCaseResult>, styles: Styles): stri
 }
 
 function formatTestInGroup(testCase: TestCaseResult, styles: Styles): string {
-	const duration =
-		testCase.duration !== undefined ? formatDuration(testCase.duration, styles) : "";
+	const durationMs = testDurationMs(testCase);
+	const duration = durationMs !== undefined ? formatDuration(durationMs, styles) : "";
 	if (testCase.status === "passed") {
 		const marker = styles.status.pass("     ✓");
 		// Red title is intentional: this function only runs inside failed suites.
@@ -137,11 +191,15 @@ function formatTestInGroup(testCase: TestCaseResult, styles: Styles): string {
 	return styles.status.pending(`     ${symbol} ${testCase.title}`);
 }
 
-function formatDescribeGroup(
-	describeName: string,
-	tests: Array<TestCaseResult>,
-	styles: Styles,
-): Array<string> {
+function formatDescribeGroup({
+	describeName,
+	styles,
+	tests,
+}: {
+	describeName: string;
+	styles: Styles;
+	tests: Array<TestCaseResult>;
+}): Array<string> {
 	const groupTestCount = tests.length;
 	const groupDurationStr = formatGroupDuration(tests, styles);
 	const failedCount = tests.filter((testCase) => testCase.status === "failed").length;
@@ -165,12 +223,12 @@ function formatDescribeGroup(
 	];
 }
 
-function formatFailedFileSummary(
-	file: TestFileResult,
-	testCount: number,
-	styles: Styles,
-	displayPath: string,
-): Array<string> {
+function formatFailedFileSummary({
+	displayPath,
+	file,
+	styles,
+	testCount,
+}: FormatFailedFileSummaryOptions): Array<string> {
 	const failedMeta = styles.summary.failed(`${file.numFailingTests} failed`);
 	const metaPrefix = styles.dim(`(${testCount} tests | `);
 	const metaSuffix = styles.dim(")");
@@ -181,26 +239,25 @@ function formatFailedFileSummary(
 
 	const groups = groupByDescribe(file.testResults);
 	for (const [describeName, tests] of groups) {
-		lines.push(...formatDescribeGroup(describeName, tests, styles));
+		lines.push(...formatDescribeGroup({ describeName, styles, tests }));
 	}
 
 	return lines;
 }
 
-function formatExecErrorFileSummary(
-	file: TestFileResult,
-	formattedPath: string,
-	styles: Styles,
-): Array<string> {
+function formatExecErrorFileSummary({
+	file,
+	formattedPath,
+	styles,
+}: {
+	file: TestFileResult;
+	formattedPath: string;
+	styles: Styles;
+}): string {
 	// A clock rather than a cross: the file line is the first thing read, and a
 	// run that ran out of time is acted on differently from one that threw.
 	const symbol = file.timedOut === true ? styles.status.pending("⏱") : styles.status.fail("✗");
-	return [` ${symbol} ${formattedPath}`];
-}
-
-function formatPass(test: TestCaseResult, styles: Styles): string {
-	const duration = test.duration !== undefined ? formatDuration(test.duration, styles) : "";
-	return styles.status.pass(`  ✓ ${test.fullName}`) + duration;
+	return ` ${symbol} ${formattedPath}`;
 }
 
 function sumFileDuration(file: TestFileResult): number {
@@ -214,11 +271,21 @@ function sumFileDuration(file: TestFileResult): number {
 	return total;
 }
 
+function fileDurationMs(file: TestFileResult): number {
+	return sumFileDuration(file);
+}
+
+function formatPass(test: TestCaseResult, styles: Styles): string {
+	const durationMs = testDurationMs(test);
+	const duration = durationMs !== undefined ? formatDuration(durationMs, styles) : "";
+	return styles.status.pass(`  ✓ ${test.fullName}`) + duration;
+}
+
 function formatPassedFileSummary(
 	file: TestFileResult,
 	ctx: { formattedPath: string; styles: Styles; testCount: number; verbose: boolean },
 ): Array<string> {
-	const fileMs = sumFileDuration(file);
+	const fileMs = fileDurationMs(file);
 	const symbol = ctx.styles.status.pass("✓");
 	const testsLabel = ctx.styles.dim(`(${ctx.testCount} tests`);
 	const closeParen = ctx.styles.dim(")");

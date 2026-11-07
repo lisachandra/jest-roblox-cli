@@ -2,14 +2,22 @@ import { isDeepStrictEqual } from "node:util";
 
 import type { CliOptions, Config } from "./schema.ts";
 
-interface ConsensusGroup<T> {
-	packages: Array<string>;
-	value: T;
+/** Where a workspace-wide field value can come from. */
+export interface FieldSources {
+	/** CLI flags; they override every package. */
+	readonly cli: CliOptions;
+	/** Raw config of each selected package. */
+	readonly perPackageConfigs: ReadonlyArray<PackageConfigEntry>;
 }
 
 interface PackageConfigEntry {
 	name: string;
 	config: Config;
+}
+
+interface ConsensusGroup<T> {
+	packages: Array<string>;
+	value: T;
 }
 
 interface ConsensusSpec<T> {
@@ -26,24 +34,42 @@ interface OptionalFieldSpec<T> extends ConsensusSpec<T> {
 	readCli: (cli: CliOptions) => T | undefined;
 }
 
-export class WorkspaceConsensusError extends Error {
+/** Thrown when selected packages disagree on a field that must be uniform. */
+class WorkspaceConsensusError extends Error {
 	public readonly field: string;
 	public readonly groups: ReadonlyArray<ConsensusGroup<unknown>>;
 	public override readonly name = "WorkspaceConsensusError";
 	public readonly omittedBy: ReadonlyArray<string>;
 
+	/**
+	 * Record the disagreement and format its message.
+	 *
+	 * @param field - Name of the disputed field.
+	 * @param groups - Packages grouped by the value they declare.
+	 * @param omittedBy - Packages that do not declare the field.
+	 */
 	constructor(
 		field: string,
 		groups: ReadonlyArray<ConsensusGroup<unknown>>,
-		omittedBy: ReadonlyArray<string> = [],
+		omittedBy: ReadonlyArray<string>,
 	) {
-		super(formatMessage(field, groups, omittedBy));
+		super(formatMessage({ field, groups, omittedBy }));
 		this.field = field;
 		this.groups = groups;
 		this.omittedBy = omittedBy;
 	}
 }
 
+/**
+ * Read a field from every package and require one shared value.
+ *
+ * @template T - Field value type.
+ * @param perPackageConfigs - Raw config of each selected package.
+ * @param spec - Field name and how to read it from a config.
+ * @returns The shared value, or `undefined` when no package declares it.
+ * @throws {WorkspaceConsensusError} If packages declare different values, or
+ *   some declare it and others do not.
+ */
 export function computeConsensus<T>(
 	perPackageConfigs: ReadonlyArray<PackageConfigEntry>,
 	spec: ConsensusSpec<T>,
@@ -78,8 +104,14 @@ export function computeConsensus<T>(
 	throw new WorkspaceConsensusError(spec.name, groups, omittedBy);
 }
 
-// Consensus as a guard rather than a source: the field was already consumed
-// elsewhere, so only the disagreement is interesting here.
+/**
+ * Consensus as a guard rather than a source: the field was already consumed
+ * elsewhere, so only the disagreement is interesting here.
+ *
+ * @param perPackageConfigs - Raw config of each selected package.
+ * @param spec - Field name and how to read it from a config.
+ * @throws {WorkspaceConsensusError} If the packages do not agree.
+ */
 export function assertConsensus(
 	perPackageConfigs: ReadonlyArray<PackageConfigEntry>,
 	spec: ConsensusSpec<unknown>,
@@ -87,11 +119,23 @@ export function assertConsensus(
 	computeConsensus(perPackageConfigs, spec);
 }
 
-export function resolveField<T>(
-	cli: CliOptions,
-	perPackageConfigs: ReadonlyArray<PackageConfigEntry>,
-	spec: RequiredFieldSpec<T>,
-): T {
+/**
+ * Resolve a field from the CLI, else package consensus, else its default.
+ *
+ * @template T - Field value type.
+ * @param options - Field sources and the field spec.
+ * @returns The resolved value.
+ * @throws {WorkspaceConsensusError} If no CLI value is given and the packages
+ *   do not agree.
+ */
+export function resolveField<T>({
+	cli,
+	perPackageConfigs,
+	spec,
+}: FieldSources & {
+	/** Field name, readers and default. */
+	readonly spec: RequiredFieldSpec<T>;
+}): T {
 	const cliValue = spec.readCli(cli);
 	if (cliValue !== undefined) {
 		return cliValue;
@@ -101,11 +145,23 @@ export function resolveField<T>(
 	return consensus ?? spec.default;
 }
 
-export function resolveOptionalField<T>(
-	cli: CliOptions,
-	perPackageConfigs: ReadonlyArray<PackageConfigEntry>,
-	spec: OptionalFieldSpec<T>,
-): T | undefined {
+/**
+ * Resolve a field from the CLI, else package consensus.
+ *
+ * @template T - Field value type.
+ * @param options - Field sources and the field spec.
+ * @returns The resolved value, or `undefined` when no source sets it.
+ * @throws {WorkspaceConsensusError} If no CLI value is given and the packages
+ *   do not agree.
+ */
+export function resolveOptionalField<T>({
+	cli,
+	perPackageConfigs,
+	spec,
+}: FieldSources & {
+	/** Field name and readers. */
+	readonly spec: OptionalFieldSpec<T>;
+}): T | undefined {
 	const cliValue = spec.readCli(cli);
 	if (cliValue !== undefined) {
 		return cliValue;
@@ -114,11 +170,15 @@ export function resolveOptionalField<T>(
 	return computeConsensus(perPackageConfigs, spec);
 }
 
-function formatMessage(
-	field: string,
-	groups: ReadonlyArray<ConsensusGroup<unknown>>,
-	omittedBy: ReadonlyArray<string>,
-): string {
+function formatMessage({
+	field,
+	groups,
+	omittedBy,
+}: {
+	readonly field: string;
+	readonly groups: ReadonlyArray<ConsensusGroup<unknown>>;
+	readonly omittedBy: ReadonlyArray<string>;
+}): string {
 	const lines = [`workspace packages disagree on \`${field}\`.`, ""];
 
 	for (const group of groups) {
@@ -146,10 +206,4 @@ function formatMessage(
 	return lines.join("\n");
 }
 
-export type {
-	ConsensusGroup,
-	ConsensusSpec,
-	OptionalFieldSpec,
-	PackageConfigEntry,
-	RequiredFieldSpec,
-};
+export type { ConsensusSpec, OptionalFieldSpec, PackageConfigEntry, RequiredFieldSpec };

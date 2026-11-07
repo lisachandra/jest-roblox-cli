@@ -1,10 +1,11 @@
 import { type } from "arktype";
-import * as fs from "node:fs";
 import * as path from "node:path";
 
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { isAbsolutePath, normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import { PNPM_MARKER } from "./discovery.ts";
-import type { PackageInfo } from "./package-info.ts";
+import type { PackageInfo } from "./package-info-types.ts";
 
 const STATE_PATH = path.join("node_modules", ".pnpm-workspace-state-v1.json");
 
@@ -33,8 +34,8 @@ const workspaceStateSchema = type({
  * The workspace projects pnpm recorded during its last install, or `undefined`
  * when that record is absent, unreadable, or no longer trustworthy.
  *
- * pnpm enumerates the workspace itself on every install and writes the answer
- * to `node_modules/.pnpm-workspace-state-v1.json`. Reading it costs one
+ * The pnpm CLI enumerates the workspace itself on every install and writes the
+ * answer to `node_modules/.pnpm-workspace-state-v1.json`. Reading it costs one
  * `readFile` where the glob path it replaces costs a full walk of the repo, and
  * it is the authority on questions that walk gets wrong: dot-directory
  * packages, `!` exclusions, and the root project.
@@ -42,14 +43,23 @@ const workspaceStateSchema = type({
  * `undefined` means "ask the filesystem instead", never "no packages": every
  * guard here is a reason to distrust the snapshot, not evidence about the
  * workspace.
+ * @param workspaceRoot - Workspace root directory.
+ * @param fileSystem - File system to read through.
+ * @returns The recorded packages, or `undefined` when the snapshot is not trusted.
  */
-export function readPnpmWorkspaceProjects(workspaceRoot: string): Array<PackageInfo> | undefined {
-	const state = readState(path.join(workspaceRoot, STATE_PATH));
-	if (state === undefined) {
-		return undefined;
-	}
-
-	if (!manifestPredatesInstall(workspaceRoot, state.lastValidatedTimestamp)) {
+export function readPnpmWorkspaceProjects(
+	workspaceRoot: string,
+	fileSystem: FileSystem = nodeFileSystem,
+): Array<PackageInfo> | undefined {
+	const state = readState(fileSystem, path.join(workspaceRoot, STATE_PATH));
+	if (
+		state === undefined ||
+		!manifestPredatesInstall({
+			fileSystem,
+			lastValidatedTimestamp: state.lastValidatedTimestamp,
+			workspaceRoot,
+		})
+	) {
 		return undefined;
 	}
 
@@ -80,10 +90,13 @@ export function readPnpmWorkspaceProjects(workspaceRoot: string): Array<PackageI
 	return packages;
 }
 
-function readState(statePath: string): typeof workspaceStateSchema.infer | undefined {
+function readState(
+	fileSystem: FileSystem,
+	statePath: string,
+): typeof workspaceStateSchema.infer | undefined {
 	let parsed: JSONValue;
 	try {
-		parsed = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+		parsed = JSON.parse(fileSystem.readFileSync(statePath, "utf-8"));
 	} catch {
 		// Absent, unreadable, and malformed all earn the same answer: this run
 		// learns nothing from the snapshot and should ask the filesystem.
@@ -98,12 +111,25 @@ function readState(statePath: string): typeof workspaceStateSchema.infer | undef
  * Whether the manifest that drives package selection still says what it said
  * when pnpm wrote the snapshot.
  *
- * mtime is coarse -- an unrelated edit (a catalog entry, a setting) also
+ * The mtime is coarse -- an unrelated edit (a catalog entry, a setting) also
  * invalidates -- and deliberately so: the cost of a false stale is one walk,
  * while the cost of a false fresh is a package the CLI cannot find.
+ * @param options - Workspace root, snapshot time and file system.
+ * @param options.fileSystem - File system to stat through.
+ * @param options.lastValidatedTimestamp - Snapshot time, in epoch milliseconds.
+ * @param options.workspaceRoot - Workspace root directory.
+ * @returns Whether the manifest is no newer than the snapshot.
  */
-function manifestPredatesInstall(workspaceRoot: string, lastValidatedTimestamp: number): boolean {
-	const stat = fs.statSync(path.join(workspaceRoot, PNPM_MARKER), {
+function manifestPredatesInstall({
+	fileSystem,
+	lastValidatedTimestamp,
+	workspaceRoot,
+}: {
+	readonly fileSystem: FileSystem;
+	readonly lastValidatedTimestamp: number;
+	readonly workspaceRoot: string;
+}): boolean {
+	const stat = fileSystem.statSync(path.join(workspaceRoot, PNPM_MARKER), {
 		throwIfNoEntry: false,
 	});
 	return stat !== undefined && stat.mtimeMs <= lastValidatedTimestamp;
@@ -113,6 +139,9 @@ function manifestPredatesInstall(workspaceRoot: string, lastValidatedTimestamp: 
  * Both paths are already resolved absolutes. `isAbsolutePath` rather than
  * `path.isAbsolute` because a Windows path reads as relative on Linux, which
  * would let CI accept what a local run rejects.
+ * @param resolvedParent - Absolute parent directory.
+ * @param candidate - Absolute path to test.
+ * @returns Whether `candidate` is `resolvedParent` or below it.
  */
 function isInside(resolvedParent: string, candidate: string): boolean {
 	// The root relativizes to `""`, which satisfies both tests below, so it

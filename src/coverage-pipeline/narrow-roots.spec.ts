@@ -1,59 +1,74 @@
-import { fromAny } from "@total-typescript/shoehorn";
-
-import { vol } from "memfs";
 import * as path from "node:path";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import type { Except } from "type-fest";
+import { describe, expect, it } from "vitest";
 
-import { toPosixRoot } from "../utils/normalize-windows-path.ts";
-import { createCopyIgnoreMatcher } from "./discover-files.ts";
+import { copyIgnoreMatcher } from "#test/mocks/coverage-copy-ignore.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { posixRoot } from "#test/mocks/posix-path.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import type { PosixRoot } from "../utils/normalize-windows-path.ts";
 import type { InstrumentUniverse } from "./instrument-universe.ts";
-import { narrowLuauRoots, narrowRootToUniverse } from "./narrow-roots.ts";
+import { narrowLuauRoots } from "./narrow-roots.ts";
 
-vi.mock(import("node:fs"), async () => {
-	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, default: memfs.fs });
-});
+const MOUNT = posixRoot(path.resolve("/repo/out/server"));
 
-const MOUNT = toPosixRoot(path.resolve("/repo/out/server"));
+const NO_COPY_IGNORE = copyIgnoreMatcher([]);
 
-const NO_COPY_IGNORE = createCopyIgnoreMatcher([]);
-
-function resetVolumeAfterTest(): void {
-	onTestFinished(() => {
-		vol.reset();
-	});
+/**
+ * A volume holding prod `.luau` files under the mount, keyed by mount-relative
+ * path.
+ *
+ * @param relativePaths - The files the walk should find.
+ * @returns The memory filesystem holding the files.
+ */
+function seed(...relativePaths: Array<string>): FileSystem {
+	return createMemoryFileSystem(
+		Object.fromEntries(relativePaths.map((entry) => [entry, "return nil\n"])),
+		MOUNT,
+	).fileSystem;
 }
 
-/** Seeds prod `.luau` files under the mount, keyed by mount-relative path. */
-function seed(...relativePaths: Array<string>): void {
-	resetVolumeAfterTest();
-	vol.fromJSON(Object.fromEntries(relativePaths.map((entry) => [entry, "return nil\n"])), MOUNT);
-}
-
-/** A universe that probes exactly the listed mount-relative paths. */
+/**
+ * A universe that probes exactly the listed mount-relative paths.
+ * @param probed - Mount-relative paths the universe includes.
+ * @returns A universe that includes only those paths.
+ */
 function universeOf(...probed: Array<string>): InstrumentUniverse {
 	const absolute = new Set(probed.map((entry) => `${MOUNT}/${entry}`));
 	return { digest: "test", includes: (luauPath) => absolute.has(luauPath) };
 }
 
-describe(narrowRootToUniverse, () => {
+function narrowRootToUniverse(
+	luauRoot: PosixRoot,
+	options: Except<Parameters<typeof narrowLuauRoots>[1], "rojoMounts">,
+): Array<string> {
+	const answers = narrowLuauRoots([luauRoot], { ...options, rojoMounts: new Set([luauRoot]) });
+	return answers[0]!.roots.map((root) => path.posix.relative(luauRoot, root));
+}
+
+describe("narrowRootToUniverse", () => {
 	it("should keep the mount whole when the run narrows nothing", () => {
 		expect.assertions(1);
 
-		seed("modules/ecs/world.luau");
+		const fileSystem = seed("modules/ecs/world.luau");
 
 		expect(
-			narrowRootToUniverse(MOUNT, { isCopyIgnored: NO_COPY_IGNORE, universe: undefined }),
+			narrowRootToUniverse(MOUNT, {
+				fileSystem,
+				isCopyIgnored: NO_COPY_IGNORE,
+				universe: undefined,
+			}),
 		).toStrictEqual([""]);
 	});
 
 	it("should drop a mount the universe never reaches", () => {
 		expect.assertions(1);
 
-		seed("modules/ecs/world.luau");
+		const fileSystem = seed("modules/ecs/world.luau");
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf(),
 			}),
@@ -63,7 +78,7 @@ describe(narrowRootToUniverse, () => {
 	it("should keep the mount whole when the ignore list is what emptied it", () => {
 		expect.assertions(1);
 
-		seed("modules/ecs/world.luau");
+		const fileSystem = seed("modules/ecs/world.luau");
 
 		// The universe reaches `world.luau` and the list takes it, so nothing
 		// survives to narrow towards. Dropping the mount here would leave the
@@ -71,10 +86,30 @@ describe(narrowRootToUniverse, () => {
 		// excluded — the shadow is the only tree missing it.
 		expect(
 			narrowRootToUniverse(MOUNT, {
-				isCopyIgnored: createCopyIgnoreMatcher(["**/ecs/**"]),
+				fileSystem,
+				isCopyIgnored: copyIgnoreMatcher(["**/ecs/**"]),
 				universe: universeOf("modules/ecs/world.luau"),
 			}),
 		).toStrictEqual([""]);
+	});
+
+	it("should still narrow when ignored paths leave a probe elsewhere", () => {
+		expect.assertions(1);
+
+		const fileSystem = seed(
+			"modules/ecs/world.luau",
+			"modules/generated/init.luau",
+			"modules/ui/button.luau",
+			"server/init.luau",
+		);
+
+		expect(
+			narrowRootToUniverse(MOUNT, {
+				fileSystem,
+				isCopyIgnored: copyIgnoreMatcher(["**/generated/**"]),
+				universe: universeOf("modules/ecs/world.luau"),
+			}),
+		).toStrictEqual(["modules/ecs"]);
 	});
 
 	it("should read a mount written with a trailing separator", () => {
@@ -83,7 +118,7 @@ describe(narrowRootToUniverse, () => {
 		// Wide enough that narrowing pays: a mount whose probed directory holds
 		// nearly all of it is taken whole, which would answer `[""]` here for a
 		// reason that has nothing to do with the separator.
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"modules/other/a.luau",
 			"modules/other/b.luau",
@@ -94,7 +129,8 @@ describe(narrowRootToUniverse, () => {
 		// separator on the end lands each slice a character in and no probe
 		// matches the universe.
 		expect(
-			narrowRootToUniverse(toPosixRoot(`${MOUNT}/`), {
+			narrowRootToUniverse(posixRoot(`${MOUNT}/`), {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf("modules/ecs/world.luau"),
 			}),
@@ -104,7 +140,7 @@ describe(narrowRootToUniverse, () => {
 	it("should narrow to the directory the probed files live in", () => {
 		expect.assertions(1);
 
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"modules/ecs/query.luau",
 			"modules/other/a.luau",
@@ -115,6 +151,7 @@ describe(narrowRootToUniverse, () => {
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf("modules/ecs/world.luau", "modules/ecs/query.luau"),
 			}),
@@ -124,7 +161,7 @@ describe(narrowRootToUniverse, () => {
 	it("should collapse a probed directory nested inside another", () => {
 		expect.assertions(1);
 
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"modules/ecs/plugins/delta-time/init.luau",
 			"client/a.luau",
@@ -137,6 +174,7 @@ describe(narrowRootToUniverse, () => {
 		// directory as a root of its own would copy and mount it twice.
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf(
 					"modules/ecs/world.luau",
@@ -149,7 +187,7 @@ describe(narrowRootToUniverse, () => {
 	it("should keep one root per probed branch", () => {
 		expect.assertions(1);
 
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"react/hooks/ecs/use-world.luau",
 			"client/a.luau",
@@ -160,6 +198,7 @@ describe(narrowRootToUniverse, () => {
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf("modules/ecs/world.luau", "react/hooks/ecs/use-world.luau"),
 			}),
@@ -172,7 +211,7 @@ describe(narrowRootToUniverse, () => {
 		// A second probe two directories down, so the answer cannot come from
 		// there being only one place to narrow to: the mount holding a probe of
 		// its own is what settles it.
-		seed(
+		const fileSystem = seed(
 			"world.luau",
 			"modules/ecs/query.luau",
 			"client/a.luau",
@@ -183,6 +222,7 @@ describe(narrowRootToUniverse, () => {
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf("world.luau", "modules/ecs/query.luau"),
 			}),
@@ -194,7 +234,7 @@ describe(narrowRootToUniverse, () => {
 
 		// Ten of eleven files stay, so the roots buy a project node per sibling
 		// and almost no copying.
-		seed(
+		const fileSystem = seed(
 			"a/one.luau",
 			"a/two.luau",
 			"a/three.luau",
@@ -210,6 +250,7 @@ describe(narrowRootToUniverse, () => {
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf("a/one.luau"),
 			}),
@@ -221,7 +262,7 @@ describe(narrowRootToUniverse, () => {
 
 		// Nine of ten files stay, which is the share itself rather than more
 		// than it, so the roots are worth their nodes.
-		seed(
+		const fileSystem = seed(
 			"a/one.luau",
 			"a/two.luau",
 			"a/three.luau",
@@ -236,6 +277,7 @@ describe(narrowRootToUniverse, () => {
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf("a/one.luau"),
 			}),
@@ -247,7 +289,7 @@ describe(narrowRootToUniverse, () => {
 
 		// Ten of eleven files stay, split across two roots. Counting only the
 		// files every root holds would read as nothing kept, and narrow.
-		seed(
+		const fileSystem = seed(
 			"a/one.luau",
 			"a/two.luau",
 			"a/three.luau",
@@ -263,6 +305,7 @@ describe(narrowRootToUniverse, () => {
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				universe: universeOf("a/one.luau", "b/six.luau"),
 			}),
@@ -275,11 +318,12 @@ describe(narrowRootToUniverse, () => {
 		// The copy-ignored siblings never reach the shadow either way, so
 		// counting them would make narrowing look like a win when the mount is
 		// already down to the one directory that holds a probe.
-		seed("a/one.luau", "b/two.luau", "b/three.luau", "b/four.luau");
+		const fileSystem = seed("a/one.luau", "b/two.luau", "b/three.luau", "b/four.luau");
 
 		expect(
 			narrowRootToUniverse(MOUNT, {
-				isCopyIgnored: createCopyIgnoreMatcher(["b/**"]),
+				fileSystem,
+				isCopyIgnored: copyIgnoreMatcher(["b/**"]),
 				universe: universeOf("a/one.luau"),
 			}),
 		).toStrictEqual([""]);
@@ -290,10 +334,11 @@ describe(narrowLuauRoots, () => {
 	it("should carry a mount through whole when nothing narrows it", () => {
 		expect.assertions(1);
 
-		seed("world.luau");
+		const fileSystem = seed("world.luau");
 
 		expect(
 			narrowLuauRoots([MOUNT], {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				rojoMounts: new Set([MOUNT]),
 				universe: undefined,
@@ -304,7 +349,7 @@ describe(narrowLuauRoots, () => {
 	it("should name the roots and the way down to them", () => {
 		expect.assertions(1);
 
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"client/a.luau",
 			"client/b.luau",
@@ -314,6 +359,7 @@ describe(narrowLuauRoots, () => {
 
 		expect(
 			narrowLuauRoots([MOUNT], {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				rojoMounts: new Set([MOUNT]),
 				universe: universeOf("modules/ecs/world.luau"),
@@ -321,8 +367,8 @@ describe(narrowLuauRoots, () => {
 		).toStrictEqual([
 			{
 				luauRoot: MOUNT,
-				roots: [toPosixRoot(`${MOUNT}/modules/ecs`)],
-				spine: [MOUNT, toPosixRoot(`${MOUNT}/modules`)],
+				roots: [posixRoot(`${MOUNT}/modules/ecs`)],
+				spine: [MOUNT, posixRoot(`${MOUNT}/modules`)],
 			},
 		]);
 	});
@@ -330,10 +376,11 @@ describe(narrowLuauRoots, () => {
 	it("should keep a mount the universe never reaches out of the shadow", () => {
 		expect.assertions(1);
 
-		seed("client/a.luau");
+		const fileSystem = seed("client/a.luau");
 
 		expect(
 			narrowLuauRoots([MOUNT], {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				rojoMounts: new Set([MOUNT]),
 				universe: universeOf(),
@@ -344,10 +391,8 @@ describe(narrowLuauRoots, () => {
 	it("should read a mount written with a trailing slash as the same directory", () => {
 		expect.assertions(1);
 
-		seed("modules/ecs/world.luau", "client/a.luau", "client/b.luau", "client/c.luau");
-
 		expect(
-			narrowLuauRoots([toPosixRoot(`${MOUNT}/`)], {
+			narrowLuauRoots([posixRoot(`${MOUNT}/`)], {
 				isCopyIgnored: NO_COPY_IGNORE,
 				rojoMounts: new Set([MOUNT]),
 				universe: undefined,
@@ -358,7 +403,7 @@ describe(narrowLuauRoots, () => {
 	it("should keep the mount whole when the mounts reach past the narrowed roots", () => {
 		expect.assertions(1);
 
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"client/a.luau",
 			"client/b.luau",
@@ -370,6 +415,7 @@ describe(narrowLuauRoots, () => {
 		// nothing to demote, so the narrowed root would load from source.
 		expect(
 			narrowLuauRoots([MOUNT], {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				rojoMounts: new Set([`${path.posix.dirname(MOUNT)}/client`]),
 				universe: universeOf("modules/ecs/world.luau"),
@@ -380,7 +426,7 @@ describe(narrowLuauRoots, () => {
 	it("should keep the mount whole when no rojo mount can reach the narrowed roots", () => {
 		expect.assertions(1);
 
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"client/a.luau",
 			"client/b.luau",
@@ -393,6 +439,7 @@ describe(narrowLuauRoots, () => {
 		// set this run could not read is the live way to get here.
 		expect(
 			narrowLuauRoots([MOUNT], {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
 				rojoMounts: new Set(),
 				universe: universeOf("modules/ecs/world.luau"),
@@ -403,7 +450,7 @@ describe(narrowLuauRoots, () => {
 	it("should hang the spine off the rojo mount, not the luauRoot above it", () => {
 		expect.assertions(1);
 
-		seed(
+		const fileSystem = seed(
 			"modules/ecs/world.luau",
 			"client/a.luau",
 			"client/b.luau",
@@ -416,15 +463,16 @@ describe(narrowLuauRoots, () => {
 		// mounts is one a demote can rewrite.
 		expect(
 			narrowLuauRoots([MOUNT], {
+				fileSystem,
 				isCopyIgnored: NO_COPY_IGNORE,
-				rojoMounts: new Set([toPosixRoot(`${MOUNT}/modules`)]),
+				rojoMounts: new Set([posixRoot(`${MOUNT}/modules`)]),
 				universe: universeOf("modules/ecs/world.luau"),
 			}),
 		).toStrictEqual([
 			{
 				luauRoot: MOUNT,
-				roots: [toPosixRoot(`${MOUNT}/modules/ecs`)],
-				spine: [toPosixRoot(`${MOUNT}/modules`)],
+				roots: [posixRoot(`${MOUNT}/modules/ecs`)],
+				spine: [posixRoot(`${MOUNT}/modules`)],
 			},
 		]);
 	});

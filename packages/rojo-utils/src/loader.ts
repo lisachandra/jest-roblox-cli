@@ -1,16 +1,28 @@
-import type { ArkErrors } from "arktype";
-import { type, type Type } from "arktype";
-import { readFileSync } from "node:fs";
+import { type ArkErrors, type, type Type } from "arktype";
 import { dirname } from "node:path";
 
+import type { FileSystem } from "./file-system.ts";
+import { nodeFileSystem } from "./file-system.ts";
+import { getTreeSchema } from "./project-schema.ts";
 import { resolveNestedProjects } from "./rojo-tree.ts";
-import type { LoadedRojoProject, RojoProject } from "./types.ts";
+import type { LoadedRojoProject, RojoProject } from "./rojo-types.ts";
 
 let objectSchema: Type<JSONObject> | undefined;
 let fieldsSchema: Type<RojoProject> | undefined;
 
-export function loadRojoProject(projectPath: string): LoadedRojoProject {
-	const raw = readProjectJson(projectPath);
+/**
+ * Read and validate a Rojo project file, inlining every nested project it
+ * names.
+ *
+ * @param projectPath - The project file to read.
+ * @param fileSystem - Where it and its nested projects are read from.
+ * @returns Validated fields, original JSON and expanded mounts; throws on read or parse failure.
+ */
+export function loadRojoProject(
+	projectPath: string,
+	fileSystem: FileSystem = nodeFileSystem,
+): LoadedRojoProject {
+	const raw = readProjectJson(fileSystem, projectPath);
 	const fields = orThrow(getFieldsSchema()(raw), projectPath);
 
 	// Named field by field, not spread: arktype applies no morph here, so
@@ -21,28 +33,11 @@ export function loadRojoProject(projectPath: string): LoadedRojoProject {
 		name: fields.name,
 		raw,
 		servePort: fields.servePort,
-		tree: resolveNestedProjects(fields.tree, dirname(projectPath)),
+		tree: resolveNestedProjects(
+			{ rootDirectory: dirname(projectPath), tree: fields.tree },
+			fileSystem,
+		),
 	};
-}
-
-/**
- * An array sits in arktype's `object` domain, so it satisfies a schema whose
- * keys are all optional. Reject it, and name it "an array" so the reader does
- * not have to work out why their array is not an object.
- *
- * @param value - The candidate object.
- * @param ctx - Arktype's narrow context.
- * @returns True when the value is not an array.
- */
-function rejectArray(
-	value: object,
-	ctx: { reject: (reason: { actual: string; expected: string }) => false },
-): boolean {
-	if (!Array.isArray(value)) {
-		return true;
-	}
-
-	return ctx.reject({ actual: "an array", expected: "an object" });
 }
 
 /**
@@ -62,12 +57,7 @@ function getFieldsSchema(): Type<RojoProject> {
 	fieldsSchema ??= type({
 		"name": "string > 0",
 		"servePort?": "number",
-		"tree": type({
-			"$className?": "string",
-			"$ignoreUnknownInstances?": "boolean",
-			"$path?": ["string", "|", { optional: "string" }],
-			"$properties?": "object",
-		}).narrow(rejectArray),
+		"tree": getTreeSchema(),
 	}).as<RojoProject>();
 
 	return fieldsSchema;
@@ -91,6 +81,26 @@ function orThrow<T>(result: ArkErrors | T, projectPath: string): T {
 }
 
 /**
+ * An array sits in arktype's `object` domain, so it satisfies a schema whose
+ * keys are all optional. Reject it, and name it "an array" so the reader does
+ * not have to work out why their array is not an object.
+ *
+ * @param value - The candidate object.
+ * @param ctx - Arktype's narrow context.
+ * @returns True when the value is not an array.
+ */
+function rejectArray(
+	value: unknown,
+	ctx: { reject: (reason: { actual: string; expected: string }) => false },
+): boolean {
+	if (!Array.isArray(value)) {
+		return true;
+	}
+
+	return ctx.reject({ actual: "an array", expected: "an object" });
+}
+
+/**
  * Schema for "the file holds a JSON object". Separate from
  * {@link getFieldsSchema} because its output is what callers read as `raw`.
  *
@@ -101,10 +111,10 @@ function getObjectSchema(): Type<JSONObject> {
 	return objectSchema;
 }
 
-function readProjectJson(projectPath: string): JSONObject {
+function readProjectJson(fileSystem: FileSystem, projectPath: string): JSONObject {
 	let content: string;
 	try {
-		content = readFileSync(projectPath, "utf-8");
+		content = fileSystem.readFileSync(projectPath, "utf-8");
 	} catch (err) {
 		throw new Error(`Could not read Rojo project: ${projectPath}`, { cause: err });
 	}

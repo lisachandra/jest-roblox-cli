@@ -1,6 +1,8 @@
 import * as path from "node:path";
 import process from "node:process";
 
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import type { CoverageManifest, ReadManifestResult } from "./manifest.ts";
 import { readManifest } from "./manifest.ts";
 
@@ -13,15 +15,21 @@ type ManifestFailure = Exclude<ReadManifestResult, { kind: "ok" }>;
  * that is recoverable by re-instrumenting says so on stderr first. A missing
  * manifest is silent: that is the ordinary "coverage was never instrumented"
  * case, not a fault.
+ * @param rootDirectory - Project root holding `.jest-roblox/`.
+ * @param fileSystem - File system to read through.
+ * @returns The manifest, or `undefined` when it cannot be used.
  */
-export function loadCoverageManifest(rootDirectory: string): CoverageManifest | undefined {
+export function loadCoverageManifest(
+	rootDirectory: string,
+	fileSystem: FileSystem = nodeFileSystem,
+): CoverageManifest | undefined {
 	const manifestPath = path.join(
 		rootDirectory,
 		".jest-roblox",
 		"coverage",
 		"coverage-manifest.json",
 	);
-	const result = readManifest(manifestPath);
+	const result = readManifest(manifestPath, fileSystem);
 	if (result.kind === "ok") {
 		return result.manifest;
 	}

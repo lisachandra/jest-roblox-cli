@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
-
 import type { SourceMapper } from "../source-mapper/index.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { hashFile } from "../utils/hash.ts";
 
 /**
@@ -8,11 +8,20 @@ import { hashFile } from "../utils/hash.ts";
  * to a disk file via the source mapper, then hash that file's bytes. Returns
  * undefined when there is no mapper, the path doesn't resolve, or the file is
  * absent — the harvester records an empty hash in that case.
+ * @param options - File system, source mapper and DataModel test path.
+ * @returns File hash, or undefined when it cannot be resolved.
  */
-export function resolveTestFileHash(
-	sourceMapper: Pick<SourceMapper, "resolveTestFilePath"> | undefined,
-	testFilePath: string,
-): string | undefined {
+export function resolveTestFileHash({
+	fileSystem = nodeFileSystem,
+	sourceMapper,
+	testFilePath,
+}: {
+	fileSystem?: FileSystem;
+	sourceMapper: Pick<SourceMapper, "resolveTestFilePath"> | undefined;
+	testFilePath: string;
+}): string | undefined {
 	const diskPath = sourceMapper?.resolveTestFilePath(testFilePath);
-	return diskPath !== undefined && existsSync(diskPath) ? hashFile(diskPath) : undefined;
+	return diskPath !== undefined && fileSystem.existsSync(diskPath)
+		? hashFile(diskPath, fileSystem)
+		: undefined;
 }

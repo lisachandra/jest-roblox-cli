@@ -1,40 +1,81 @@
-import { assert, describe, expect, it, vi } from "vitest";
+import { fromAny } from "@total-typescript/shoehorn";
 
+import * as path from "node:path";
+import process from "node:process";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
+
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
 import type { CliOptions, WorkspaceRunOptions } from "../config/schema.ts";
-import { DEFAULT_CONFIG } from "../config/schema.ts";
+import type { ChildProcessRunner } from "../utils/child-process.ts";
 import {
-	assertWorkspaceRunOptions,
 	buildWorkspaceCredentials,
 	resolveWorkspacePackages,
 	validateBasicWorkspaceFlags,
 } from "./workspace-validation.ts";
 
-vi.mock(import("../workspace/affected"));
-vi.mock(import("../workspace/package-resolver"));
-vi.mock(import("@isentinel/roblox-runner"), async (importOriginal) => {
-	const actual = await importOriginal();
-	return {
-		...actual,
-		resolveCredentials: vi.fn<() => { apiKey: string; placeId: string; universeId: string }>(
-			() => {
-				return { apiKey: "test-key", placeId: "p", universeId: "u" };
-			},
-		),
-	};
-});
+const ROOT = path.resolve("/workspace");
 
 function makeCli(overrides: Partial<CliOptions> = {}): CliOptions {
 	return { ...overrides };
 }
 
+function createRunner(): ChildProcessRunner {
+	return fromAny({ execFileSync: vi.fn<ChildProcessRunner["execFileSync"]>() });
+}
+
+function packageDirectoryFor(name: string): string {
+	return `packages/${name.replace(/^@[^/]+\//, "")}`;
+}
+
+function packageInfoFor(name: string, relativePath: string = packageDirectoryFor(name)) {
+	return { name, packageDirectory: path.join(ROOT, relativePath) };
+}
+
+function seedWorkspace(names: Array<string>): Record<string, string> {
+	const entries: Record<string, string> = {
+		[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+	};
+	for (const name of names) {
+		const directory = packageDirectoryFor(name);
+		entries[path.join(ROOT, directory, "package.json")] = `{"name":${JSON.stringify(name)}}`;
+		entries[path.join(ROOT, directory, "jest.config.ts")] = "export default {};";
+	}
+
+	return entries;
+}
+
+function seedTurboWorkspace(names: Array<string>): Record<string, string> {
+	return { [path.join(ROOT, "turbo.json")]: "{}", ...seedWorkspace(names) };
+}
+
+function stubLinux(): void {
+	const original = process.platform;
+	Object.defineProperty(process, "platform", { value: "linux" });
+	onTestFinished(() => {
+		Object.defineProperty(process, "platform", { value: original });
+	});
+}
+
+function turboReturns(childProcess: ChildProcessRunner, names: Array<string>): void {
+	vi.mocked(childProcess.execFileSync).mockReturnValue(
+		JSON.stringify({
+			packages: {
+				items: names.map((name) => ({ name, path: packageDirectoryFor(name) })),
+			},
+		}),
+	);
+}
+
 function makeRunOptions(overrides: Partial<WorkspaceRunOptions> = {}): WorkspaceRunOptions {
+	const defaults = createResolvedConfig();
 	return {
-		backend: DEFAULT_CONFIG.backend,
+		backend: defaults.backend,
 		bail: false,
-		color: DEFAULT_CONFIG.color,
+		color: defaults.color,
 		formatters: [],
-		port: DEFAULT_CONFIG.port,
-		silent: DEFAULT_CONFIG.silent,
+		port: defaults.port,
+		silent: defaults.silent,
 		workspaceGameOutput: false,
 		workspaceOutputFile: false,
 		...overrides,
@@ -56,20 +97,14 @@ describe(validateBasicWorkspaceFlags, () => {
 		});
 	});
 
-	it("should reject --experimental-vm-parallel in workspace mode", () => {
+	it("should accept --experimental-vm-parallel in workspace mode", () => {
 		expect.assertions(1);
 
 		const result = validateBasicWorkspaceFlags(
 			makeCli({ experimentalVmParallel: 2, packages: "a", workspace: true }),
 		);
 
-		expect(result).toStrictEqual({
-			exitCode: 2,
-			message:
-				"Error: --experimental-vm-parallel is not supported in workspace mode; " +
-				"it splits the configs of a single multi-project run.\n",
-			ok: false,
-		});
+		expect(result).toStrictEqual({ ok: true });
 	});
 
 	it("should reject --packages without --workspace", () => {
@@ -166,265 +201,164 @@ describe(validateBasicWorkspaceFlags, () => {
 	});
 });
 
-describe(assertWorkspaceRunOptions, () => {
-	it("should accept the studio backend (workspace debug via an open Studio)", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(makeRunOptions({ backend: "studio" }));
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	it("should accept the studio-cli backend", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(makeRunOptions({ backend: "studio-cli" }));
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	it("should reject studio-cli with --parallel > 1 (it is serial)", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(
-			makeRunOptions({ backend: "studio-cli", parallel: 2 }),
-		);
-		assert(!result.ok);
-
-		expect(result).toStrictEqual({
-			exitCode: 2,
-			message:
-				"Error: studio-cli backend is serial (one Studio instance) and cannot " +
-				'shard; set parallel to 1 or "auto" for a --workspace run.\n',
-			ok: false,
-		});
-	});
-
-	it("should accept studio-cli with --parallel auto", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(
-			makeRunOptions({ backend: "studio-cli", parallel: "auto" }),
-		);
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	it("should accept studio-cli with --parallel 1", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(
-			makeRunOptions({ backend: "studio-cli", parallel: 1 }),
-		);
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	// The bail rides the Open Cloud task envelope and a MemoryStore signal map,
-	// neither of which the Studio transports have — better to say so than to run
-	// the whole batch while the user believes it will stop early.
-	it("should reject --bail on a Studio backend", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(makeRunOptions({ backend: "studio", bail: true }));
-		assert(!result.ok);
-
-		expect(result).toStrictEqual({
-			exitCode: 2,
-			message:
-				"Error: --bail is Open Cloud only; a Studio backend runs every " +
-				"package in the workspace regardless.\n",
-			ok: false,
-		});
-	});
-
-	it("should accept --bail on the open-cloud backend", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(
-			makeRunOptions({ backend: "open-cloud", bail: true }),
-		);
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	// "auto" is the default, and workspace mode resolves it to Open Cloud
-	// without probing — so this is the invocation the README documents.
-	it("should accept --bail on the default auto backend", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(makeRunOptions({ backend: "auto", bail: true }));
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	it("should reject --bail on studio-cli", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(
-			makeRunOptions({ backend: "studio-cli", bail: true }),
-		);
-		assert(!result.ok);
-
-		expect(result).toStrictEqual({
-			exitCode: 2,
-			message:
-				"Error: --bail is Open Cloud only; a Studio backend runs every " +
-				"package in the workspace regardless.\n",
-			ok: false,
-		});
-	});
-
-	it("should accept a Studio backend without --bail", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(makeRunOptions({ backend: "studio-cli" }));
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	it("should accept open-cloud backend", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(makeRunOptions({ backend: "open-cloud" }));
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-
-	it("should accept auto backend", () => {
-		expect.assertions(1);
-
-		const result = assertWorkspaceRunOptions(makeRunOptions({ backend: "auto" }));
-
-		expect(result).toStrictEqual({ ok: true });
-	});
-});
-
 describe(resolveWorkspacePackages, () => {
-	it("should return getAffectedPackages output directly when --affected-since is set", async () => {
+	it("should return the affected set directly when --affected-since is set", () => {
 		expect.assertions(2);
 
-		const { getAffectedPackages } = await import("../workspace/affected");
-		const { excludePackages } = await import("../workspace/package-resolver");
-		const affected = [
-			{ name: "@org/pkg-a", packageDirectory: "/workspace/packages/a" },
-			{ name: "@org/pkg-b", packageDirectory: "/workspace/packages/b" },
-		];
-		vi.mocked(getAffectedPackages).mockReturnValue(affected);
-		vi.mocked(excludePackages).mockImplementation((packages) => packages);
-		const result = resolveWorkspacePackages(makeCli({ affectedSince: "HEAD~1" }), "/workspace");
+		stubLinux();
+		const childProcess = createRunner();
+		const { fileSystem } = createMemoryFileSystem(seedTurboWorkspace(["@org/a", "@org/b"]));
+		turboReturns(childProcess, ["@org/a", "@org/b"]);
+
+		const result = resolveWorkspacePackages({
+			childProcess,
+			cli: makeCli({ affectedSince: "HEAD~1" }),
+			fileSystem,
+			workspaceRoot: ROOT,
+		});
 
 		// The affected branch carries name + directory from turbo/nx, so it
-		// must NOT round-trip through resolvePackage.
-		expect(result).toStrictEqual(affected);
-		expect(getAffectedPackages).toHaveBeenCalledWith("/workspace", "HEAD~1");
+		// must NOT round-trip through enumeration.
+		expect(result).toStrictEqual([packageInfoFor("@org/a"), packageInfoFor("@org/b")]);
+		expect(vi.mocked(childProcess.execFileSync)).toHaveBeenCalledExactlyOnceWith(
+			"turbo",
+			["ls", "--filter=...[HEAD~1]", "--output=json"],
+			expect.objectContaining({ cwd: ROOT }),
+		);
 	});
 
-	it("should drop an excluded package from the affected set", async () => {
+	it("should drop an excluded package from the affected set", () => {
 		expect.assertions(1);
 
-		const { getAffectedPackages } = await import("../workspace/affected");
-		const { excludePackages } = await import("../workspace/package-resolver");
-		const affected = [{ name: "@org/pkg-a", packageDirectory: "/workspace/packages/a" }];
-		vi.mocked(getAffectedPackages).mockReturnValue(affected);
-		vi.mocked(excludePackages).mockReturnValue([]);
+		stubLinux();
+		const childProcess = createRunner();
+		const { fileSystem } = createMemoryFileSystem(seedTurboWorkspace(["@org/a"]));
+		turboReturns(childProcess, ["@org/a"]);
 
-		const result = resolveWorkspacePackages(
-			makeCli({ affectedSince: "HEAD~1" }),
-			"/workspace",
-			{
-				exclude: ["packages/**"],
-			},
-		);
+		const result = resolveWorkspacePackages({
+			childProcess,
+			cli: makeCli({ affectedSince: "HEAD~1" }),
+			exclude: ["packages/**"],
+			fileSystem,
+			workspaceRoot: ROOT,
+		});
 
 		expect(result).toBeEmpty();
 	});
 
-	it("should enumerate every package when neither flag narrows the run", async () => {
-		expect.assertions(2);
+	it("should enumerate every package when neither flag narrows the run", () => {
+		expect.assertions(1);
 
-		const { enumerateWorkspacePackages } = await import("../workspace/package-resolver");
-		const all = [
-			{ name: "a", packageDirectory: "/workspace/packages/a" },
-			{ name: "b", packageDirectory: "/workspace/packages/b" },
-		];
-		vi.mocked(enumerateWorkspacePackages).mockReturnValue(all);
+		const { fileSystem } = createMemoryFileSystem(seedWorkspace(["a", "b"]));
 
-		const result = resolveWorkspacePackages(makeCli({ workspace: true }), "/workspace", {
-			exclude: ["fixtures/**"],
+		const result = resolveWorkspacePackages({
+			childProcess: createRunner(),
+			cli: makeCli({ workspace: true }),
+			fileSystem,
 			patterns: ["packages/*"],
+			workspaceRoot: ROOT,
 		});
 
-		expect(result).toStrictEqual(all);
-		expect(enumerateWorkspacePackages).toHaveBeenCalledWith("/workspace", {
-			exclude: ["fixtures/**"],
-			patterns: ["packages/*"],
-		});
+		expect(result).toStrictEqual([packageInfoFor("a"), packageInfoFor("b")]);
 	});
 
-	it("should enumerate once for every comma-separated --packages name", async () => {
-		expect.assertions(2);
+	it("should drop an excluded package from a bare --workspace run", () => {
+		expect.assertions(1);
 
-		const { resolvePackages } = await import("../workspace/package-resolver");
-		vi.mocked(resolvePackages).mockImplementation((root, names) => {
-			return names.map((name) => ({ name, packageDirectory: `${root}/packages/${name}` }));
+		const { fileSystem } = createMemoryFileSystem(seedWorkspace(["a", "b"]));
+
+		const result = resolveWorkspacePackages({
+			childProcess: createRunner(),
+			cli: makeCli({ workspace: true }),
+			exclude: ["packages/b"],
+			fileSystem,
+			patterns: ["packages/*"],
+			workspaceRoot: ROOT,
 		});
 
-		const result = resolveWorkspacePackages(makeCli({ packages: "a,b,c" }), "/workspace", {
+		expect(result).toStrictEqual([packageInfoFor("a")]);
+	});
+
+	it("should resolve every comma-separated --packages name", () => {
+		expect.assertions(1);
+
+		const { fileSystem } = createMemoryFileSystem(seedWorkspace(["a", "b", "c"]));
+
+		const result = resolveWorkspacePackages({
+			childProcess: createRunner(),
+			cli: makeCli({ packages: "a,b,c" }),
+			fileSystem,
 			patterns: ["packages/*"],
+			workspaceRoot: ROOT,
 		});
 
 		expect(result.map((info) => info.name)).toStrictEqual(["a", "b", "c"]);
-		// One enumeration of the workspace for the flag, not one per name.
-		expect(resolvePackages).toHaveBeenCalledExactlyOnceWith("/workspace", ["a", "b", "c"], {
-			patterns: ["packages/*"],
-		});
 	});
 
-	it("should trim whitespace and drop empty entries before resolving", async () => {
+	it("should trim whitespace and drop empty entries before resolving", () => {
 		expect.assertions(1);
 
-		const { resolvePackages } = await import("../workspace/package-resolver");
-		vi.mocked(resolvePackages).mockImplementation((root, names) => {
-			return names.map((name) => ({ name, packageDirectory: `${root}/packages/${name}` }));
-		});
+		const { fileSystem } = createMemoryFileSystem(seedWorkspace(["a", "b"]));
 
-		const result = resolveWorkspacePackages(makeCli({ packages: " a , , b " }), "/workspace");
+		const result = resolveWorkspacePackages({
+			childProcess: createRunner(),
+			cli: makeCli({ packages: " a , , b " }),
+			fileSystem,
+			patterns: ["packages/*"],
+			workspaceRoot: ROOT,
+		});
 
 		expect(result.map((info) => info.name)).toStrictEqual(["a", "b"]);
 	});
 
-	it("should keep a named package an exclude glob would have dropped", async () => {
-		expect.assertions(2);
+	it("should keep a named package an exclude glob would have dropped", () => {
+		expect.assertions(1);
 
-		const { excludePackages, resolvePackages } = await import("../workspace/package-resolver");
-		vi.mocked(resolvePackages).mockReturnValue([
-			{ name: "a", packageDirectory: "/workspace/fixtures/a" },
-		]);
+		const { fileSystem } = createMemoryFileSystem(seedWorkspace(["a"]));
 
-		const result = resolveWorkspacePackages(makeCli({ packages: "a" }), "/workspace", {
-			exclude: ["fixtures/**"],
+		const result = resolveWorkspacePackages({
+			childProcess: createRunner(),
+			cli: makeCli({ packages: "a" }),
+			exclude: ["packages/**"],
+			fileSystem,
+			patterns: ["packages/*"],
+			workspaceRoot: ROOT,
 		});
 
 		expect(result.map((info) => info.name)).toStrictEqual(["a"]);
-		expect(excludePackages).not.toHaveBeenCalled();
 	});
 });
 
 describe(buildWorkspaceCredentials, () => {
-	it("should forward CLI overrides and run-option defaults to resolveCredentials", async () => {
-		expect.assertions(2);
+	it("should prefer CLI overrides over run-option defaults", () => {
+		expect.assertions(1);
 
-		const { resolveCredentials } = await import("@isentinel/roblox-runner");
-		const cli = makeCli({ apiKey: "k", placeId: "pp", universeId: "uu" });
-		const runOptions = makeRunOptions({ placeId: "configP", universeId: "configU" });
-		const result = buildWorkspaceCredentials(cli, runOptions);
+		const result = buildWorkspaceCredentials(
+			makeCli({ apiKey: "k", placeId: "pp", universeId: "uu" }),
+			makeRunOptions({ placeId: "configP", universeId: "configU" }),
+		);
 
-		expect(result).toStrictEqual({ apiKey: "test-key", placeId: "p", universeId: "u" });
-		expect(resolveCredentials).toHaveBeenCalledWith({
-			defaults: { placeId: "configP", universeId: "configU" },
-			envPrefix: "JEST_",
-			overrides: { apiKey: "k", placeId: "pp", universeId: "uu" },
+		expect(result).toStrictEqual({ apiKey: "k", placeId: "pp", universeId: "uu" });
+	});
+
+	it("should fall back to the run options for a place the CLI did not name", () => {
+		expect.assertions(1);
+
+		vi.stubEnv("JEST_ROBLOX_OPEN_CLOUD_API_KEY", "env-key");
+		for (const suffix of ["PLACE_ID", "UNIVERSE_ID"]) {
+			vi.stubEnv(`JEST_ROBLOX_${suffix}`, "");
+			vi.stubEnv(`ROBLOX_${suffix}`, "");
+		}
+
+		const result = buildWorkspaceCredentials(
+			makeCli(),
+			makeRunOptions({ placeId: "configP", universeId: "configU" }),
+		);
+
+		expect(result).toStrictEqual({
+			apiKey: "env-key",
+			placeId: "configP",
+			universeId: "configU",
 		});
 	});
 });

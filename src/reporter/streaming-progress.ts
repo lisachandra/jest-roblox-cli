@@ -3,8 +3,17 @@ import color from "tinyrainbow";
 import type { StreamingResultEntry } from "../memory-store/sorted-map-client.ts";
 import { composeEntryDisplayName } from "../utils/display-name.ts";
 
+/** Options of {@link formatStreamingProgressLine}. */
 export interface ProgressLineOptions {
+	/** Whether to colorize the line. */
 	color: boolean;
+}
+
+interface PushPartOptions {
+	colorize: (text: string) => string;
+	count: number;
+	label: string;
+	parts: Array<string>;
 }
 
 /**
@@ -14,6 +23,10 @@ export interface ProgressLineOptions {
  * The line is intentionally narrow — it lands mid-task while siblings are
  * still running; the full project section (failures, snippets, summary)
  * still renders at task end through the existing batched output path.
+ *
+ * @param entry - Streamed result entry of one package.
+ * @param options - Whether to colorize.
+ * @returns The status line.
  */
 export function formatStreamingProgressLine(
 	entry: StreamingResultEntry,
@@ -33,12 +46,7 @@ function identity(text: string): string {
 	return text;
 }
 
-function pushPart(
-	parts: Array<string>,
-	count: number,
-	label: string,
-	colorize: (text: string) => string,
-): void {
+function pushPart({ colorize, count, label, parts }: PushPartOptions): void {
 	if (count > 0) {
 		parts.push(colorize(`${count.toString()} ${label}`));
 	}
@@ -46,9 +54,24 @@ function pushPart(
 
 function formatBreakdown(entry: StreamingResultEntry, isColorEnabled: boolean): string {
 	const parts: Array<string> = [];
-	pushPart(parts, entry.numFailedTests, "failed", isColorEnabled ? color.red : identity);
-	pushPart(parts, entry.numPassedTests, "passed", isColorEnabled ? color.green : identity);
-	pushPart(parts, entry.numPendingTests, "skipped", isColorEnabled ? color.yellow : identity);
+	pushPart({
+		colorize: isColorEnabled ? color.red : identity,
+		count: entry.numFailedTests,
+		label: "failed",
+		parts,
+	});
+	pushPart({
+		colorize: isColorEnabled ? color.green : identity,
+		count: entry.numPassedTests,
+		label: "passed",
+		parts,
+	});
+	pushPart({
+		colorize: isColorEnabled ? color.yellow : identity,
+		count: entry.numPendingTests,
+		label: "skipped",
+		parts,
+	});
 	return parts.length > 0 ? parts.join(" | ") : "0 tests";
 }
 

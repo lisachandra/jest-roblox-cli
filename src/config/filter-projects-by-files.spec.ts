@@ -18,6 +18,23 @@ function makeProject(overrides: Partial<ResolvedProjectConfig> = {}): ResolvedPr
 	};
 }
 
+function filterClientServerAcrossFiles(): ReturnType<typeof filterProjectsByFiles> {
+	const client = makeProject({
+		displayName: "client",
+		include: ["src/client/**/*.spec.ts"],
+	});
+	const server = makeProject({
+		displayName: "server",
+		include: ["src/server/**/*.spec.ts"],
+	});
+
+	return filterProjectsByFiles({
+		files: ["src/client/a.spec.ts", "src/server/b.spec.ts"],
+		projects: [client, server],
+		rootDirectory: "/repo",
+	});
+}
+
 describe(filterProjectsByFiles, () => {
 	it("should return only the project whose include root contains the file", () => {
 		expect.assertions(2);
@@ -31,7 +48,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/server/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles([client, server], ["src/client/foo.spec.ts"], "/repo");
+		const result = filterProjectsByFiles({
+			files: ["src/client/foo.spec.ts"],
+			projects: [client, server],
+			rootDirectory: "/repo",
+		});
 
 		expect(result).toHaveLength(1);
 		expect(result[0]!.project.displayName).toBe("client");
@@ -40,20 +61,7 @@ describe(filterProjectsByFiles, () => {
 	it("should return projects matching across multiple positional files", () => {
 		expect.assertions(2);
 
-		const client = makeProject({
-			displayName: "client",
-			include: ["src/client/**/*.spec.ts"],
-		});
-		const server = makeProject({
-			displayName: "server",
-			include: ["src/server/**/*.spec.ts"],
-		});
-
-		const result = filterProjectsByFiles(
-			[client, server],
-			["src/client/a.spec.ts", "src/server/b.spec.ts"],
-			"/repo",
-		);
+		const result = filterClientServerAcrossFiles();
 
 		expect(result).toHaveLength(2);
 		expect(result.map((match) => match.project.displayName)).toStrictEqual([
@@ -65,20 +73,7 @@ describe(filterProjectsByFiles, () => {
 	it("should pair each project with only the cli files its roots contain", () => {
 		expect.assertions(2);
 
-		const client = makeProject({
-			displayName: "client",
-			include: ["src/client/**/*.spec.ts"],
-		});
-		const server = makeProject({
-			displayName: "server",
-			include: ["src/server/**/*.spec.ts"],
-		});
-
-		const result = filterProjectsByFiles(
-			[client, server],
-			["src/client/a.spec.ts", "src/server/b.spec.ts"],
-			"/repo",
-		);
+		const result = filterClientServerAcrossFiles();
 
 		expect(result[0]!.matchingFiles).toStrictEqual(["src/client/a.spec.ts"]);
 		expect(result[1]!.matchingFiles).toStrictEqual(["src/server/b.spec.ts"]);
@@ -96,11 +91,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/client/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles(
-			[wide, narrow],
-			["src/client/a.spec.ts", "src/server/b.spec.ts"],
-			"/repo",
-		);
+		const result = filterProjectsByFiles({
+			files: ["src/client/a.spec.ts", "src/server/b.spec.ts"],
+			projects: [wide, narrow],
+			rootDirectory: "/repo",
+		});
 
 		// Wide root `src` contains both files; narrow root `src/client` contains
 		// only `a`.
@@ -123,11 +118,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/server/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles(
-			[client, server],
-			["src/server/b.spec.ts", "src/client/a.spec.ts"],
-			"/repo",
-		);
+		const result = filterProjectsByFiles({
+			files: ["src/server/b.spec.ts", "src/client/a.spec.ts"],
+			projects: [client, server],
+			rootDirectory: "/repo",
+		});
 
 		expect(result.map((match) => match.project.displayName)).toStrictEqual([
 			"client",
@@ -143,11 +138,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/client/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles(
-			[client],
-			["src/client/a.spec.ts", "src/client/b.spec.ts"],
-			"/repo",
-		);
+		const result = filterProjectsByFiles({
+			files: ["src/client/a.spec.ts", "src/client/b.spec.ts"],
+			projects: [client],
+			rootDirectory: "/repo",
+		});
 
 		expect(result).toHaveLength(1);
 		expect(result[0]!.matchingFiles).toStrictEqual([
@@ -164,7 +159,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/shared/**/*.spec.ts", "src/util/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles([shared], ["src/util/x.spec.ts"], "/repo");
+		const result = filterProjectsByFiles({
+			files: ["src/util/x.spec.ts"],
+			projects: [shared],
+			rootDirectory: "/repo",
+		});
 
 		expect(result).toHaveLength(1);
 	});
@@ -181,7 +180,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/client/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles([wide, narrow], ["src/client/foo.spec.ts"], "/repo");
+		const result = filterProjectsByFiles({
+			files: ["src/client/foo.spec.ts"],
+			projects: [wide, narrow],
+			rootDirectory: "/repo",
+		});
 
 		expect(result.map((match) => match.project.displayName)).toStrictEqual(["wide", "narrow"]);
 	});
@@ -194,7 +197,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/client/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles([client], ["src\\client\\foo.spec.ts"], "/repo");
+		const result = filterProjectsByFiles({
+			files: ["src\\client\\foo.spec.ts"],
+			projects: [client],
+			rootDirectory: "/repo",
+		});
 
 		expect(result).toHaveLength(1);
 	});
@@ -207,7 +214,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src\\client\\**\\*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles([client], ["src/client/foo.spec.ts"], "/repo");
+		const result = filterProjectsByFiles({
+			files: ["src/client/foo.spec.ts"],
+			projects: [client],
+			rootDirectory: "/repo",
+		});
 
 		expect(result).toHaveLength(1);
 	});
@@ -222,7 +233,28 @@ describe(filterProjectsByFiles, () => {
 
 		// Relative path — must be resolved under `/repo` to match the project
 		// root.
-		const result = filterProjectsByFiles([client], ["src/client/foo.spec.ts"], "/repo");
+		const result = filterProjectsByFiles({
+			files: ["src/client/foo.spec.ts"],
+			projects: [client],
+			rootDirectory: "/repo",
+		});
+
+		expect(result).toHaveLength(1);
+	});
+
+	it("should select a project when the requested path is its include root", () => {
+		expect.assertions(1);
+
+		const client = makeProject({
+			displayName: "client",
+			include: ["src/client/**/*.spec.ts"],
+		});
+
+		const result = filterProjectsByFiles({
+			files: ["src/client"],
+			projects: [client],
+			rootDirectory: "/repo",
+		});
 
 		expect(result).toHaveLength(1);
 	});
@@ -235,7 +267,11 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/client/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles([client], ["/repo/src/client/foo.spec.ts"], "/repo");
+		const result = filterProjectsByFiles({
+			files: ["/repo/src/client/foo.spec.ts"],
+			projects: [client],
+			rootDirectory: "/repo",
+		});
 
 		expect(result).toHaveLength(1);
 	});
@@ -248,16 +284,16 @@ describe(filterProjectsByFiles, () => {
 			include: ["src/client/**/*.spec.ts"],
 		});
 
-		const result = filterProjectsByFiles(
-			[client],
-			["D:\\repo\\src\\client\\foo.spec.ts"],
-			"D:\\repo",
-		);
+		const result = filterProjectsByFiles({
+			files: ["D:\\repo\\src\\client\\foo.spec.ts"],
+			projects: [client],
+			rootDirectory: "D:\\repo",
+		});
 
 		expect(result).toHaveLength(1);
 	});
 
-	it("should throw with a clear message listing files and roots when nothing matches", () => {
+	it("should throw with a clear message listing every file and root when nothing matches", () => {
 		expect.assertions(1);
 
 		const client = makeProject({
@@ -270,8 +306,22 @@ describe(filterProjectsByFiles, () => {
 		});
 
 		expect(() => {
-			return filterProjectsByFiles([client, server], ["src/shared/foo.spec.ts"], "/repo");
-		}).toThrow(/src\/shared\/foo\.spec\.ts[\s\S]*src\/client[\s\S]*src\/server/);
+			return filterProjectsByFiles({
+				files: ["src/shared/foo.spec.ts", "src/common/bar.spec.ts"],
+				projects: [client, server],
+				rootDirectory: "/repo",
+			});
+		}).toThrow(
+			[
+				"No project contains the requested file(s):",
+				"  - src/shared/foo.spec.ts",
+				"  - src/common/bar.spec.ts",
+				"",
+				"Project roots searched:",
+				"  - /repo/src/client",
+				"  - /repo/src/server",
+			].join("\n"),
+		);
 	});
 
 	it("should skip projects whose includes have no static root and still throw on overall no-match", () => {
@@ -282,7 +332,13 @@ describe(filterProjectsByFiles, () => {
 			include: ["**/*.spec.ts"],
 		});
 
-		expect(() => filterProjectsByFiles([wildcard], ["src/foo.spec.ts"], "/repo")).toThrow(
+		expect(() => {
+			return filterProjectsByFiles({
+				files: ["src/foo.spec.ts"],
+				projects: [wildcard],
+				rootDirectory: "/repo",
+			});
+		}).toThrow(
 			[
 				"No project contains the requested file(s):",
 				"  - src/foo.spec.ts",

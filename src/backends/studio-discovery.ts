@@ -1,16 +1,24 @@
 // cspell:ignore LOCALAPPDATA mtimes
-import * as fs from "node:fs";
+import { type } from "arktype";
+import * as os from "node:os";
 import * as path from "node:path";
 import process from "node:process";
 
+import { absolutePathSchema } from "../config/config-validation.ts";
+import type { Dirent, FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 
+/** Inputs for finding the Studio executable. */
 export interface StudioDiscoveryOptions {
 	/**
-	 * Environment to read discovery hints from (Windows `LOCALAPPDATA`).
+	 * Environment to read discovery hints from (Windows `LOCALAPPDATA`,
+	 * `JEST_ROBLOX_STUDIO_DISCOVERY`).
 	 * Defaults to `process.env`; injectable so tests stub it.
 	 */
 	environment?: NodeJS.ProcessEnv | undefined;
+	/** Where the executable is probed. Defaults to the real filesystem. */
+	fileSystem?: FileSystem;
 	/**
 	 * Explicit Studio executable path (from `studioPath` config key, the
 	 * `--studioPath` CLI flag, or `JEST_ROBLOX_STUDIO_PATH`). Takes precedence
@@ -24,27 +32,94 @@ export interface StudioDiscoveryOptions {
 	platform?: NodeJS.Platform | undefined;
 }
 
+const STUDIO_PATH_ENV = "JEST_ROBLOX_STUDIO_PATH";
+const PLUGINS_DIRECTORY_ENV = "JEST_ROBLOX_PLUGINS_DIR";
+const DISCOVERY_ENV = "JEST_ROBLOX_STUDIO_DISCOVERY";
+
 const WINDOWS_STUDIO_EXECUTABLE = "RobloxStudioBeta.exe";
-const MACOS_STUDIO_EXECUTABLE = "/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudioBeta";
+const MACOS_STUDIO_EXECUTABLES = [
+	"/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio",
+	"/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudioBeta",
+];
 
 const NOT_FOUND_HINT =
 	"Install Roblox Studio, or set studioPath (config key, --studioPath, or " +
 	"JEST_ROBLOX_STUDIO_PATH).";
 
+/** Inputs for finding the per-user Studio folders. */
+export interface UserDirectoryOptions {
+	/** Defaults to `process.env`. */
+	environment?: NodeJS.ProcessEnv | undefined;
+	/** Defaults to `os.homedir()`. */
+	homeDirectory?: string | undefined;
+	/** Defaults to `process.platform`. */
+	platform?: NodeJS.Platform | undefined;
+	/** Configured plugins folder; overrides the environment and the default. */
+	pluginsDirectory?: string | undefined;
+}
+
+/** Per-user folders the CLI uses. */
+export interface UserDirectories {
+	/** The folder Studio loads local plugins from. */
+	readonly plugins: string;
+	/** The CLI's own per-user state, outside anything Studio watches. */
+	readonly state: string;
+}
+
+/**
+ * The Studio path the user named: the `studioPath` setting, else
+ * `JEST_ROBLOX_STUDIO_PATH`. An empty variable names nothing.
+ *
+ * @param studioPath - The `studioPath` setting.
+ * @param environment - Environment to read the variable from.
+ * @returns The named path, or undefined when none is named.
+ */
+export function configuredStudioPath(
+	studioPath: string | undefined,
+	environment: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+	return studioPath ?? fromEnvironment(environment, STUDIO_PATH_ENV);
+}
+
+/**
+ * Reads whether Studio discovery is on from `JEST_ROBLOX_STUDIO_DISCOVERY`.
+ *
+ * @param environment - Environment to read the variable from.
+ * @returns False only when the variable is `off`.
+ * @throws Error when the variable is set to a value other than `on` or `off`.
+ */
+export function isStudioDiscoveryOn(environment: NodeJS.ProcessEnv = process.env): boolean {
+	const value = fromEnvironment(environment, DISCOVERY_ENV);
+	if (value === undefined || value === "on") {
+		return true;
+	}
+
+	if (value === "off") {
+		return false;
+	}
+
+	throw new Error(`${DISCOVERY_ENV} must be "on" or "off" (was "${value}")`);
+}
+
 /**
  * Resolve the Roblox Studio executable studio-cli should launch. An explicit
  * `override` wins; otherwise probe the known per-OS install locations and pick
- * the newest `RobloxStudioBeta.exe`. Throws a clear, actionable error when no
- * executable can be found so the CLI surfaces "install Studio or set
- * studioPath" rather than a downstream spawn failure.
+ * the newest `RobloxStudioBeta.exe` on Windows. Throws a clear, actionable
+ * error when no executable can be found so the CLI surfaces "install Studio or
+ * set studioPath" rather than a downstream spawn failure.
+ *
+ * @param options - Override, environment, file system, and platform.
+ * @returns The normalized Studio executable path.
+ * @throws Error when no Studio executable is found or discovery is off.
  */
 export function discoverStudioPath({
 	environment = process.env,
+	fileSystem = nodeFileSystem,
 	override,
 	platform = process.platform,
 }: StudioDiscoveryOptions = {}): string {
 	if (override !== undefined) {
-		const stat = fs.statSync(override, { throwIfNoEntry: false });
+		const stat = fileSystem.statSync(override, { throwIfNoEntry: false });
 		if (stat === undefined) {
 			throw new Error(`Roblox Studio not found at studioPath override: ${override}`);
 		}
@@ -58,18 +133,55 @@ export function discoverStudioPath({
 		return normalizeWindowsPath(override);
 	}
 
+	if (!isStudioDiscoveryOn(environment)) {
+		throw new Error(
+			`Roblox Studio discovery is off (${DISCOVERY_ENV}=off). Unset ${DISCOVERY_ENV}, ` +
+				"or set studioPath (config key, --studioPath, or JEST_ROBLOX_STUDIO_PATH).",
+		);
+	}
+
 	if (platform === "win32") {
-		return discoverWindows(environment);
+		return discoverWindows(fileSystem, environment);
 	}
 
 	if (platform === "darwin") {
-		return discoverMacOs();
+		return discoverMacOs(fileSystem);
 	}
 
 	throw new Error(
 		`studio-cli backend has no Studio auto-discovery for platform "${platform}". ` +
 			"Set studioPath to point at your Roblox Studio executable.",
 	);
+}
+
+/**
+ * The per-user folders the Managed Plugin lives in and is tracked from, or
+ * undefined where this OS has no known plugins folder.
+ *
+ * @param options - Environment, home folder, platform, and plugins folder.
+ * @returns The plugins and state folders, or undefined.
+ */
+export function discoverUserDirectories({
+	environment = process.env,
+	homeDirectory = os.homedir(),
+	platform = process.platform,
+	pluginsDirectory,
+}: UserDirectoryOptions = {}): undefined | UserDirectories {
+	const configured = pluginsDirectory ?? environmentPluginsDirectory(environment);
+	const defaults = defaultUserDirectories({ environment, homeDirectory, platform });
+	if (defaults === undefined || configured === undefined) {
+		return defaults;
+	}
+
+	return {
+		...defaults,
+		plugins: platform === "win32" ? normalizeWindowsPath(configured) : configured,
+	};
+}
+
+function fromEnvironment(environment: NodeJS.ProcessEnv, name: string): string | undefined {
+	const value = environment[name];
+	return value === "" ? undefined : value;
 }
 
 function notFound(): Error {
@@ -80,11 +192,19 @@ function notFound(): Error {
  * The most recently modified `RobloxStudioBeta.exe` across the version
  * directories, normalized. Undefined when no version directory holds one —
  * `Versions` exists but every entry is a stale/partial install.
+ *
+ * @param options - Version folder entries, their parent, and the file system.
+ * @returns The newest executable path, or undefined.
  */
-function findNewestStudioExecutable(
-	versionsDirectory: string,
-	entries: Array<fs.Dirent>,
-): string | undefined {
+function findNewestStudioExecutable({
+	entries,
+	fileSystem,
+	versionsDirectory,
+}: {
+	readonly entries: Array<Dirent>;
+	readonly fileSystem: FileSystem;
+	readonly versionsDirectory: string;
+}): string | undefined {
 	let newest: undefined | { mtimeMs: number; path: string };
 	for (const entry of entries) {
 		if (!entry.isDirectory()) {
@@ -92,7 +212,7 @@ function findNewestStudioExecutable(
 		}
 
 		const executable = path.join(versionsDirectory, entry.name, WINDOWS_STUDIO_EXECUTABLE);
-		const stat = fs.statSync(executable, { throwIfNoEntry: false });
+		const stat = fileSystem.statSync(executable, { throwIfNoEntry: false });
 		if (stat === undefined) {
 			continue;
 		}
@@ -105,21 +225,21 @@ function findNewestStudioExecutable(
 	return newest?.path;
 }
 
-function discoverWindows(environment: NodeJS.ProcessEnv): string {
+function discoverWindows(fileSystem: FileSystem, environment: NodeJS.ProcessEnv): string {
 	const localAppData = environment["LOCALAPPDATA"];
 	if (localAppData === undefined || localAppData === "") {
 		throw new Error(`Cannot locate Roblox Studio: LOCALAPPDATA is not set. ${NOT_FOUND_HINT}`);
 	}
 
 	const versionsDirectory = path.join(localAppData, "Roblox", "Versions");
-	let entries: Array<fs.Dirent>;
+	let entries: Array<Dirent>;
 	try {
-		entries = fs.readdirSync(versionsDirectory, { withFileTypes: true });
+		entries = fileSystem.readdirSync(versionsDirectory, { withFileTypes: true });
 	} catch {
 		throw notFound();
 	}
 
-	const newest = findNewestStudioExecutable(versionsDirectory, entries);
+	const newest = findNewestStudioExecutable({ entries, fileSystem, versionsDirectory });
 	if (newest === undefined) {
 		throw notFound();
 	}
@@ -127,10 +247,54 @@ function discoverWindows(environment: NodeJS.ProcessEnv): string {
 	return newest;
 }
 
-function discoverMacOs(): string {
-	if (!fs.existsSync(MACOS_STUDIO_EXECUTABLE)) {
+function discoverMacOs(fileSystem: FileSystem): string {
+	const executable = MACOS_STUDIO_EXECUTABLES.find((candidate) => {
+		return fileSystem.existsSync(candidate);
+	});
+	if (executable === undefined) {
 		throw notFound();
 	}
 
-	return MACOS_STUDIO_EXECUTABLE;
+	return executable;
+}
+
+function environmentPluginsDirectory(environment: NodeJS.ProcessEnv): string | undefined {
+	const value = fromEnvironment(environment, PLUGINS_DIRECTORY_ENV);
+	if (value === undefined) {
+		return undefined;
+	}
+
+	const result = absolutePathSchema(value);
+	if (result instanceof type.errors) {
+		throw new Error(`${PLUGINS_DIRECTORY_ENV} ${result.summary}`);
+	}
+
+	return result;
+}
+
+function defaultUserDirectories({
+	environment,
+	homeDirectory,
+	platform,
+}: {
+	environment: NodeJS.ProcessEnv;
+	homeDirectory: string;
+	platform: NodeJS.Platform;
+}): undefined | UserDirectories {
+	const localAppData = environment["LOCALAPPDATA"];
+	if (platform === "win32" && localAppData !== undefined && localAppData !== "") {
+		return {
+			plugins: normalizeWindowsPath(path.join(localAppData, "Roblox", "Plugins")),
+			state: normalizeWindowsPath(path.join(localAppData, "jest-roblox")),
+		};
+	}
+
+	if (platform === "darwin") {
+		return {
+			plugins: path.posix.join(homeDirectory, "Documents", "Roblox", "Plugins"),
+			state: path.posix.join(homeDirectory, "Library", "Caches", "jest-roblox"),
+		};
+	}
+
+	return undefined;
 }

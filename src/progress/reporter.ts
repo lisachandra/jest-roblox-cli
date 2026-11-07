@@ -1,4 +1,3 @@
-import assert from "node:assert";
 import process from "node:process";
 
 import { getTerminalWidth } from "../formatters/shared.ts";
@@ -52,7 +51,19 @@ export interface RunProgress {
 	reveal: (options: { color: boolean }) => void;
 }
 
-export interface RunProgressOptions {
+type StreamWrite = (...args: Array<never>) => boolean;
+
+/**
+ * A stream sharing the terminal with the block, written to by code that knows
+ * nothing about it. Narrower than `NodeJS.WriteStream` on purpose: the guard
+ * only ever swaps `write` out and back.
+ */
+interface GuardedStream {
+	write: StreamWrite;
+}
+
+/** Output sink, clock and terminal shape for a run progress reporter. */
+interface RunProgressOptions {
 	/** Repaint cadence of the animated block. Ignored when `live` is false. */
 	frameMs: number;
 	/**
@@ -70,20 +81,12 @@ export interface RunProgressOptions {
 	 * it started and later says what it took.
 	 */
 	live: boolean;
+	/** Clock in milliseconds. */
 	now: () => number;
+	/** Receives every byte the reporter writes. */
 	sink: (text: string) => void;
+	/** Terminal width in columns; details are clamped to fit. */
 	width: number;
-}
-
-type StreamWrite = (...args: Array<never>) => boolean;
-
-/**
- * A stream sharing the terminal with the block, written to by code that knows
- * nothing about it. Narrower than `NodeJS.WriteStream` on purpose: the guard
- * only ever swaps `write` out and back.
- */
-interface GuardedStream {
-	write: StreamWrite;
 }
 
 interface StageRecord {
@@ -211,15 +214,7 @@ class RunProgressReporter implements RunProgress {
 	}
 
 	public interleave(write: () => void): void {
-		if (this.paintedRows === 0) {
-			write();
-			return;
-		}
-
-		this.options.sink(this.eraseBlock());
-		this.paintedRows = 0;
-		write();
-		this.repaint();
+		this.interleaveValue(write);
 	}
 
 	public note(id: StageId, detail: string): void {
@@ -260,7 +255,11 @@ class RunProgressReporter implements RunProgress {
 		this.settleIfComplete();
 	}
 
-	/** Keeps a row inside the terminal, so a repaint's cursor maths holds. */
+	/**
+	 * Keeps a row inside the terminal, so a repaint's cursor maths holds.
+	 * @param detail - Stage detail text.
+	 * @returns The detail, truncated with an ellipsis when too wide.
+	 */
 	private clampDetail(detail: string): string {
 		if (detail.length <= this.maxDetailWidth) {
 			return detail;
@@ -273,6 +272,7 @@ class RunProgressReporter implements RunProgress {
 	 * The move back over the drawn block. Every row is one line — details are
 	 * clamped to the terminal width so none can wrap — so the height is the row
 	 * count the last repaint emitted.
+	 * @returns The ANSI erase sequence, or an empty string when nothing is drawn.
 	 */
 	private eraseBlock(): string {
 		if (this.paintedRows === 0) {
@@ -282,7 +282,10 @@ class RunProgressReporter implements RunProgress {
 		return `${CSI}${this.paintedRows.toString()}A${CSI}0J`;
 	}
 
-	/** The one place a state change reaches the terminal, in either shape. */
+	/**
+	 * The one place a state change reaches the terminal, in either shape.
+	 * @param changed - Stage that just changed.
+	 */
 	private flush(changed: StageRecord): void {
 		if (this.isSettled || !this.isRevealed) {
 			return;
@@ -310,11 +313,7 @@ class RunProgressReporter implements RunProgress {
 			const own = stream.write;
 			const invoke = own.bind(stream);
 			stream.write = (...args: Array<never>): boolean => {
-				let wasAccepted = true;
-				this.interleave(() => {
-					wasAccepted = invoke(...args);
-				});
-				return wasAccepted;
+				return this.interleaveValue(() => invoke(...args));
 			};
 
 			this.released.push(() => {
@@ -327,9 +326,24 @@ class RunProgressReporter implements RunProgress {
 		return this.records.values().some((record) => record.state === "active");
 	}
 
+	private interleaveValue<T>(write: () => T): T {
+		if (this.paintedRows === 0) {
+			return write();
+		}
+
+		this.options.sink(this.eraseBlock());
+		this.paintedRows = 0;
+		const result = write();
+		this.repaint();
+		return result;
+	}
+
 	/**
 	 * Reopens a stage that already ran, so a repeat accumulates rather than
 	 * stacks.
+	 * @param id - Stage to open.
+	 * @param detail - New detail, or `undefined` to keep the previous one.
+	 * @returns The opened record.
 	 */
 	private openRecord(id: StageId, detail: string | undefined): StageRecord {
 		const record = this.records.get(id) ?? {
@@ -347,13 +361,12 @@ class RunProgressReporter implements RunProgress {
 	}
 
 	private repaint(): void {
-		const erase = this.eraseBlock();
-		if (erase === "" && this.records.size === 0) {
+		if (this.records.size === 0) {
 			return;
 		}
 
+		const erase = this.eraseBlock();
 		const frame = SPINNER_FRAMES[this.frameIndex % SPINNER_FRAMES.length];
-		assert(frame !== undefined, "frame index is taken modulo the frame count");
 		const rows = Array.from(this.records.values(), (record) => {
 			return `${formatStage(this.toView(record), { frame, styles: this.styles })}\n`;
 		});
@@ -383,10 +396,8 @@ class RunProgressReporter implements RunProgress {
 
 	/** Drops the timer and the stream guards, so nothing repaints unasked. */
 	private stopAnimating(): void {
-		if (this.timer !== undefined) {
-			clearInterval(this.timer);
-			this.timer = undefined;
-		}
+		clearInterval(this.timer);
+		this.timer = undefined;
 
 		for (const release of this.released.splice(0)) {
 			release();
@@ -409,17 +420,15 @@ class RunProgressReporter implements RunProgress {
 	}
 }
 
-export function createRunProgress(options: RunProgressOptions): RunProgress {
-	return new RunProgressReporter(options);
-}
-
 /**
  * The reporter a real run uses: stdout, the wall clock, and the repainting
  * shape whenever stdout is a terminal. A pipe, a redirect and a CI log all
  * report `isTTY` undefined and get the append-only shape instead.
+ * @param overrides - Sink, clock or terminal shape to use in place of the process's.
+ * @returns The reporter bound to the process streams.
  */
-export function createStdoutRunProgress(): RunProgress {
-	return createRunProgress({
+export function createStdoutRunProgress(overrides: Partial<RunProgressOptions> = {}): RunProgress {
+	return new RunProgressReporter({
 		frameMs: DEFAULT_FRAME_MS,
 		// Only while stderr shares the terminal: redirected to a file it cannot
 		// move the cursor, and the erase codes would land in the file.
@@ -428,5 +437,6 @@ export function createStdoutRunProgress(): RunProgress {
 		now: () => Date.now(),
 		sink: (text) => void process.stdout.write(text),
 		width: getTerminalWidth(),
+		...overrides,
 	});
 }

@@ -1,11 +1,5 @@
-import {
-	validDequeueBody,
-	validInProgressTaskBody,
-	validPublishResponseBody,
-	validQueueItemBody,
-} from "@bedrock-rbx/ocale/testing";
+import { validBinaryInputBody, validPublishResponseBody } from "@bedrock-rbx/ocale/testing";
 
-import { type } from "arktype";
 import { Buffer } from "node:buffer";
 import {
 	createServer,
@@ -14,14 +8,39 @@ import {
 	type Server,
 	type ServerResponse,
 } from "node:http";
-import { onTestFinished } from "vitest";
+import { assert, onTestFinished } from "vitest";
 
-import { BOOT_PROBE_SCRIPT } from "../../../src/backends/open-cloud.ts";
+import { handleQueueRequest, parseQueuePath } from "#test/e2e/cli/fake-open-cloud-queues.ts";
+import {
+	type BootProbeAnswer,
+	createState,
+	type FakeOpenCloudServer,
+	type FakeOpenCloudState,
+	JSON_CONTENT_TYPE,
+} from "#test/e2e/cli/fake-open-cloud-state.ts";
+import {
+	handleCreateTask,
+	handleListLogs,
+	handlePoll,
+} from "#test/e2e/cli/fake-open-cloud-tasks.ts";
 
-const createTaskRequestSchema = type({ script: "string", timeout: "string" });
-const JSON_CONTENT_TYPE = "application/json";
-const QUEUE_PATH_PATTERN = /\/memory-store\/queues\/([^/]+)(\/items(?::read|:discard)?)?$/;
-const LOGS_SUFFIX_PATTERN = /\/logs$/;
+const EXECUTION_CLAIM_PATH_PATTERN =
+	/\/memory-store\/sorted-maps\/jest-roblox-execution-v1\/items\/([^/]+)$/;
+const BINARY_INPUT_SUFFIX = "/luau-execution-session-task-binary-inputs";
+/** Where a task is created, on head or under `/versions/{v}`. */
+export const TASK_CREATE_SUFFIX = "/luau-execution-session-tasks";
+
+export function isTaskCreatePost(call: { method: string; url: string }): boolean {
+	return call.method === "POST" && call.url.endsWith(TASK_CREATE_SUFFIX);
+}
+
+/**
+ * Where the fake serves the presigned PUT it hands out. Live Open Cloud names
+ * a storage host the API does not own, and the client PUTs there over a plain
+ * `fetch` rather than through its own transport — so the fake has to answer at
+ * a real URL of its own for a spec to see the bytes at all.
+ */
+const BINARY_INPUT_UPLOAD_PATH = "/fake-binary-input-upload/";
 
 export interface FakeOpenCloudTask {
 	elapsedMs?: number;
@@ -55,7 +74,7 @@ export interface FakeOpenCloudTask {
 	project?: string;
 	/**
 	 * Verbatim `output.results[0]` for this task, bypassing the envelope
-	 * wrap — for outputs that are not Jest envelopes, e.g. the version-guard
+	 * wrap — for outputs that are not Jest envelopes, such as the version-guard
 	 * race sentinel.
 	 */
 	rawOutput?: string;
@@ -83,74 +102,34 @@ export interface FakeOpenCloudTask {
  */
 export interface FakeOpenCloudOptions {
 	/**
-	 * `"complete"` (the default) says the place version boots. `"stall"`
-	 * leaves the task PROCESSING for good, which is everything Roblox reports
-	 * for a place version it cannot start.
+	 * Answers each probe in turn; every probe past the end completes.
+	 * `"complete"` returns the uploaded version. `"stall"` leaves only that
+	 * probe PROCESSING indefinitely; queued test tasks answer independently.
 	 */
-	bootProbe?: "complete" | "stall";
-}
-
-interface FakeOpenCloudCall {
-	apiKey: string | undefined;
-	method: string;
-	url: string;
-}
-
-interface QueuedItem {
-	id: string;
-	value: Exclude<JSONValue, null>;
-}
-
-interface FakeOpenCloudServer {
-	baseUrl: string;
-	calls: Array<FakeOpenCloudCall>;
-	queueAdds: Array<{ queue: string; value: Exclude<JSONValue, null> }>;
-	queueDiscards: Array<{ id: string; queue: string }>;
-	requests: Array<typeof createTaskRequestSchema.infer>;
-	uploadCount: number;
-}
-
-/**
- * Mutable per-server state, threaded through every route handler. The
- * `counters` are read back by the returned server's `uploadCount` getter, so
- * they must stay one shared object rather than copied numbers.
- */
-interface FakeOpenCloudState {
-	bootProbe: NonNullable<FakeOpenCloudOptions["bootProbe"]>;
-	calls: FakeOpenCloudServer["calls"];
-	counters: { itemSeq: number; taskIndex: number; uploadCount: number };
-	pollCounts: Map<string, number>;
-	queueAdds: FakeOpenCloudServer["queueAdds"];
-	queueDiscards: FakeOpenCloudServer["queueDiscards"];
-	queues: Map<string, Array<QueuedItem>>;
-	requests: FakeOpenCloudServer["requests"];
-	taskQueue: Array<FakeOpenCloudTask>;
-	taskResults: Map<string, FakeOpenCloudTask>;
+	bootProbes?: Array<BootProbeAnswer>;
+	executionClaim?: "missing" | { claimedAt: number; owner: string };
+	/** Ordered failures returned before queued test tasks are accepted. */
+	submitFailures?: Array<{
+		body: JSONValue;
+		headers?: Record<string, string>;
+		status: number;
+	}>;
+	uploadConnectionResets?: number;
 }
 
 export async function startFakeOpenCloudServerAsync(
 	tasks: Array<FakeOpenCloudTask>,
 	options: FakeOpenCloudOptions = {},
 ): Promise<FakeOpenCloudServer> {
-	const state: FakeOpenCloudState = {
-		bootProbe: options.bootProbe ?? "complete",
-		calls: [],
-		counters: { itemSeq: 0, taskIndex: 0, uploadCount: 0 },
-		pollCounts: new Map(),
-		queueAdds: [],
-		queueDiscards: [],
-		queues: new Map(),
-		requests: [],
-		taskQueue: [...tasks],
-		taskResults: new Map(),
-	};
-
+	const state = createState(tasks, options);
 	const server = createServer(createRequestListener(state));
 	await listenOnEphemeralPortAsync(server);
 	closeServerWhenTestFinishes(server);
+	state.baseUrl = resolveBaseUrl(server);
 
 	return {
-		baseUrl: resolveBaseUrl(server),
+		baseUrl: state.baseUrl,
+		binaryInputs: state.binaryInputs,
 		calls: state.calls,
 		queueAdds: state.queueAdds,
 		queueDiscards: state.queueDiscards,
@@ -170,263 +149,6 @@ async function readBodyAsync(request: IncomingMessage): Promise<string> {
 	return Buffer.concat(chunks).toString("utf-8");
 }
 
-/**
- * Serve a task's structured log page. Live Open Cloud writes these only once a
- * task is terminal, so a task the fake never completes has nothing to return —
- * the same empty page the live endpoint gives while a task is still running.
- */
-function handleListLogs({
-	response,
-	state,
-	url,
-}: {
-	response: ServerResponse;
-	state: FakeOpenCloudState;
-	url: URL;
-}): void {
-	const taskPath = url.pathname.replace("/cloud/v2/", "").replace(LOGS_SUFFIX_PATTERN, "");
-	const queuedTask = state.taskResults.get(taskPath);
-	const messages = queuedTask?.logs ?? [];
-
-	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
-	response.end(
-		JSON.stringify({
-			luauExecutionSessionTaskLogs: [
-				{
-					path: `${taskPath}/logs/1`,
-					structuredMessages: messages.map((entry) => {
-						return { ...entry, createTime: "2026-01-01T00:00:00Z" };
-					}),
-				},
-			],
-		}),
-	);
-}
-
-/** The auto-wrapped envelope entry returned when no `rawOutput` is supplied. */
-function buildJestEnvelope(queuedTask: FakeOpenCloudTask): string {
-	return JSON.stringify({
-		entries: [
-			{
-				elapsedMs: queuedTask.elapsedMs ?? 25,
-				gameOutput: queuedTask.gameOutput,
-				jestOutput: queuedTask.jestOutput ?? "",
-				pkg: queuedTask.pkg,
-				project: queuedTask.project,
-				snapshotWrites: queuedTask.snapshotWrites,
-			},
-		],
-	});
-}
-
-function buildCompletedTaskBody({
-	queuedTask,
-	taskPath,
-}: {
-	queuedTask: FakeOpenCloudTask;
-	taskPath: string;
-}): ReturnType<typeof validInProgressTaskBody> {
-	if (queuedTask.state === "FAILED") {
-		return validInProgressTaskBody({
-			error: {
-				code: "SCRIPT_ERROR",
-				message: queuedTask.errorMessage ?? "Execution failed",
-			},
-			path: taskPath,
-			state: "FAILED",
-		});
-	}
-
-	if (queuedTask.rawOutput !== undefined) {
-		return validInProgressTaskBody({
-			output: { results: [queuedTask.rawOutput] },
-			path: taskPath,
-			state: "COMPLETE",
-		});
-	}
-
-	return validInProgressTaskBody({
-		output: { results: [buildJestEnvelope(queuedTask)] },
-		path: taskPath,
-		state: "COMPLETE",
-	});
-}
-
-function handlePoll({
-	response,
-	state,
-	url,
-}: {
-	response: ServerResponse;
-	state: FakeOpenCloudState;
-	url: URL;
-}): void {
-	const taskPath = url.pathname.replace("/cloud/v2/", "");
-	const remainingPolls = state.pollCounts.get(taskPath);
-	const queuedTask = state.taskResults.get(taskPath);
-
-	if (queuedTask === undefined || remainingPolls === undefined) {
-		response.writeHead(404, { "content-type": JSON_CONTENT_TYPE });
-		response.end(JSON.stringify({ error: { message: "Unknown fake task" } }));
-		return;
-	}
-
-	if (remainingPolls > 0) {
-		state.pollCounts.set(taskPath, remainingPolls - 1);
-		response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
-		response.end(
-			JSON.stringify(validInProgressTaskBody({ path: taskPath, state: "PROCESSING" })),
-		);
-		return;
-	}
-
-	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
-	response.end(JSON.stringify(buildCompletedTaskBody({ queuedTask, taskPath })));
-}
-
-function parseQueuePath(pathname: string): undefined | { queue: string; suffix: string } {
-	// /cloud/v2/universes/{universe}/memory-store/queues/{queue}{suffix}
-	const match = QUEUE_PATH_PATTERN.exec(pathname);
-	if (match === null) {
-		return undefined;
-	}
-
-	return { queue: match[1] ?? "", suffix: match[2] ?? "" };
-}
-
-function isJsonObject(value: JSONValue): value is JSONObject {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * The queue-add body's `data` field. Open Cloud rejects an absent or null
- * value, so a fake handed one is being driven wrongly — fail loudly rather than
- * enqueue a bogus item.
- */
-function readItemData(parsed: JSONValue): Exclude<JSONValue, null> {
-	const data = isJsonObject(parsed) ? parsed["data"] : undefined;
-	if (data === undefined || data === null) {
-		throw new Error("Queue add request body must carry a non-null `data` value");
-	}
-
-	return data;
-}
-
-function handleQueueAdd({
-	parsed,
-	queue,
-	response,
-	state,
-}: {
-	parsed: JSONValue;
-	queue: string;
-	response: ServerResponse;
-	state: FakeOpenCloudState;
-}): void {
-	const itemValue = readItemData(parsed);
-	state.queueAdds.push({ queue, value: itemValue });
-	state.counters.itemSeq += 1;
-	const itemId = `item-${state.counters.itemSeq.toString()}`;
-	const items = state.queues.get(queue) ?? [];
-	items.push({ id: itemId, value: itemValue });
-	state.queues.set(queue, items);
-	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
-	response.end(
-		JSON.stringify(
-			validQueueItemBody({
-				data: itemValue,
-				path: `cloud/v2/universes/123/memory-store/queues/${queue}/items/${itemId}`,
-				priority: 0,
-			}),
-		),
-	);
-}
-
-function handleQueueRead({
-	queue,
-	response,
-	state,
-}: {
-	queue: string;
-	response: ServerResponse;
-	state: FakeOpenCloudState;
-}): void {
-	const queued = state.queues.get(queue) ?? [];
-	const next = queued.shift();
-	state.queues.set(queue, queued);
-	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
-	if (next === undefined) {
-		response.end(JSON.stringify(validDequeueBody({ id: "read-empty", queueItems: [] })));
-		return;
-	}
-
-	response.end(
-		JSON.stringify(
-			validDequeueBody({
-				id: `read-${next.id}`,
-				queueItems: [
-					validQueueItemBody({
-						data: next.value,
-						path: `cloud/v2/universes/123/memory-store/queues/${queue}/items/${next.id}`,
-						priority: 0,
-					}),
-				],
-			}),
-		),
-	);
-}
-
-function handleQueueDiscard({
-	parsed,
-	queue,
-	response,
-	state,
-}: {
-	parsed: JSONValue;
-	queue: string;
-	response: ServerResponse;
-	state: FakeOpenCloudState;
-}): void {
-	const rawReadId = isJsonObject(parsed) ? parsed["readId"] : undefined;
-	const id = typeof rawReadId === "string" ? rawReadId : "";
-	state.queueDiscards.push({ id, queue });
-	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
-	response.end("{}");
-}
-
-function handleQueueRequest({
-	body,
-	queuePath,
-	response,
-	state,
-}: {
-	body: string;
-	queuePath: { queue: string; suffix: string };
-	response: ServerResponse;
-	state: FakeOpenCloudState;
-}): void {
-	const { queue, suffix } = queuePath;
-	const parsed = body === "" ? {} : JSON.parse(body);
-
-	switch (suffix) {
-		case "/items": {
-			handleQueueAdd({ parsed, queue, response, state });
-			return;
-		}
-		case "/items:discard": {
-			handleQueueDiscard({ parsed, queue, response, state });
-			return;
-		}
-		case "/items:read": {
-			handleQueueRead({ queue, response, state });
-			return;
-		}
-	}
-
-	response.writeHead(404, { "content-type": JSON_CONTENT_TYPE });
-	response.end(JSON.stringify({ error: { message: `Unknown queue suffix: ${suffix}` } }));
-}
-
 function handlePublishVersion({
 	response,
 	state,
@@ -434,6 +156,12 @@ function handlePublishVersion({
 	response: ServerResponse;
 	state: FakeOpenCloudState;
 }): void {
+	if (state.uploadConnectionResets > 0) {
+		state.uploadConnectionResets -= 1;
+		response.socket?.destroy();
+		return;
+	}
+
 	state.counters.uploadCount += 1;
 	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
 	response.end(
@@ -441,67 +169,126 @@ function handlePublishVersion({
 	);
 }
 
-/** Register a task under a fresh path and answer the submit with it. */
-function acceptTask({
-	queuedTask,
+/**
+ * Allocate a binary-input slot and hand back a presigned PUT the fake serves
+ * itself, so the bytes a run sends are observable without a second fake.
+ * @param options - Response and fake state.
+ */
+function handleCreateBinaryInput({
 	response,
 	state,
 }: {
-	queuedTask: FakeOpenCloudTask;
 	response: ServerResponse;
 	state: FakeOpenCloudState;
 }): void {
-	state.counters.taskIndex += 1;
-	const taskIndex = String(state.counters.taskIndex);
-	const taskPath = `universes/123/places/456/versions/1/luau-execution-sessions/session-${taskIndex}/tasks/task-${taskIndex}`;
-	state.taskResults.set(taskPath, queuedTask);
-	state.pollCounts.set(taskPath, queuedTask.pollsBeforeComplete ?? 0);
+	const index = String(state.binaryInputs.length + 1);
+	const inputPath = `universes/123/luau-execution-session-task-binary-inputs/input-${index}`;
+	state.binaryInputs.push({ path: inputPath });
 	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
-	response.end(JSON.stringify(validInProgressTaskBody({ path: taskPath })));
+	response.end(
+		JSON.stringify(
+			validBinaryInputBody({
+				path: inputPath,
+				uploadUri: `${state.baseUrl}${BINARY_INPUT_UPLOAD_PATH}${index}`,
+			}),
+		),
+	);
 }
 
-function handleCreateTask({
+/**
+ * Record what the run PUT at a slot this server handed out.
+ * @param options - Request body, response, fake state and request URL.
+ */
+function handleUploadBinaryInput({
 	body,
 	response,
 	state,
+	url,
 }: {
 	body: string;
 	response: ServerResponse;
 	state: FakeOpenCloudState;
+	url: URL;
 }): void {
-	let parsed;
-	try {
-		parsed = createTaskRequestSchema.assert(JSON.parse(body));
-	} catch {
-		response.writeHead(400, { "content-type": JSON_CONTENT_TYPE });
-		response.end(JSON.stringify({ error: { message: "Invalid request body" } }));
+	const index = Number(url.pathname.slice(BINARY_INPUT_UPLOAD_PATH.length));
+	const input = state.binaryInputs[index - 1];
+	if (input === undefined) {
+		response.writeHead(404, { "content-type": JSON_CONTENT_TYPE });
+		response.end(JSON.stringify({ error: { message: "Unknown binary input slot" } }));
 		return;
 	}
 
-	if (parsed.script === BOOT_PROBE_SCRIPT) {
-		acceptTask({
-			queuedTask: {
-				// A place version that will not start leaves its task
-				// PROCESSING for good, so the stall never runs out of polls.
-				pollsBeforeComplete: state.bootProbe === "stall" ? Number.MAX_SAFE_INTEGER : 0,
-				rawOutput: "1",
-			},
-			response,
-			state,
-		});
+	input.body = body;
+	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
+	response.end("{}");
+}
+
+function handleExecutionClaimRead({
+	response,
+	state,
+	url,
+}: {
+	response: ServerResponse;
+	state: FakeOpenCloudState;
+	url: URL;
+}): boolean {
+	const claimMatch = EXECUTION_CLAIM_PATH_PATTERN.exec(url.pathname);
+	if (claimMatch === null) {
+		return false;
+	}
+
+	if (state.executionClaim === "missing") {
+		response.writeHead(404, { "content-type": JSON_CONTENT_TYPE });
+		response.end(JSON.stringify({ error: { message: "Claim not found" } }));
+		return true;
+	}
+
+	const encodedItemId = claimMatch[1];
+	assert(encodedItemId !== undefined, "execution claim route must capture an item ID");
+	const itemId = decodeURIComponent(encodedItemId);
+	response.writeHead(200, { "content-type": JSON_CONTENT_TYPE });
+	response.end(
+		JSON.stringify({
+			etag: "claim-etag",
+			expireTime: "2026-09-11T20:00:00Z",
+			path: `cloud/v2/universes/123/memory-store/sorted-maps/jest-roblox-execution-v1/items/${itemId}`,
+			value: state.executionClaim,
+		}),
+	);
+	return true;
+}
+
+/**
+ * The routes a run only ever reads from, plus the unhandled-route answer.
+ * @param options - Request method, response, fake state and request URL.
+ */
+function handleReadRequest({
+	method,
+	response,
+	state,
+	url,
+}: {
+	method: string;
+	response: ServerResponse;
+	state: FakeOpenCloudState;
+	url: URL;
+}): void {
+	if (method === "GET" && handleExecutionClaimRead({ response, state, url })) {
 		return;
 	}
 
-	state.requests.push(parsed);
-
-	const nextTask = state.taskQueue.shift();
-	if (nextTask === undefined) {
-		response.writeHead(500, { "content-type": JSON_CONTENT_TYPE });
-		response.end(JSON.stringify({ error: { message: "No fake task queued" } }));
+	if (method === "GET" && url.pathname.endsWith("/logs")) {
+		handleListLogs({ response, state, url });
 		return;
 	}
 
-	acceptTask({ queuedTask: nextTask, response, state });
+	if (method === "GET" && url.pathname.startsWith("/cloud/v2/universes/")) {
+		handlePoll({ response, state, url });
+		return;
+	}
+
+	response.writeHead(404, { "content-type": JSON_CONTENT_TYPE });
+	response.end(JSON.stringify({ error: { message: `Unhandled route: ${url.pathname}` } }));
 }
 
 async function handleRequestAsync({
@@ -516,6 +303,7 @@ async function handleRequestAsync({
 	const url = new URL(request.url ?? "/", "http://127.0.0.1");
 
 	if (request.method === "POST" && url.pathname.endsWith("/versions")) {
+		await readBodyAsync(request);
 		handlePublishVersion({ response, state });
 		return;
 	}
@@ -526,27 +314,27 @@ async function handleRequestAsync({
 		return;
 	}
 
-	if (request.method === "POST" && url.pathname.endsWith("/luau-execution-session-tasks")) {
+	if (request.method === "POST" && url.pathname.endsWith(BINARY_INPUT_SUFFIX)) {
+		handleCreateBinaryInput({ response, state });
+		return;
+	}
+
+	if (request.method === "PUT" && url.pathname.startsWith(BINARY_INPUT_UPLOAD_PATH)) {
+		handleUploadBinaryInput({ body: await readBodyAsync(request), response, state, url });
+		return;
+	}
+
+	if (request.method === "POST" && url.pathname.endsWith(TASK_CREATE_SUFFIX)) {
 		handleCreateTask({ body: await readBodyAsync(request), response, state });
 		return;
 	}
 
-	if (request.method === "GET" && url.pathname.endsWith("/logs")) {
-		handleListLogs({ response, state, url });
-		return;
-	}
-
-	if (request.method === "GET" && url.pathname.startsWith("/cloud/v2/universes/")) {
-		handlePoll({ response, state, url });
-		return;
-	}
-
-	response.writeHead(404, { "content-type": JSON_CONTENT_TYPE });
-	response.end(JSON.stringify({ error: { message: `Unhandled route: ${url.pathname}` } }));
+	handleReadRequest({ method: request.method ?? "", response, state, url });
 }
 
 function createRequestListener(state: FakeOpenCloudState): RequestListener {
 	return (request, response) => {
+		response.shouldKeepAlive = false;
 		const apiKeyHeader = request.headers["x-api-key"];
 		state.calls.push({
 			apiKey: typeof apiKeyHeader === "string" ? apiKeyHeader : undefined,

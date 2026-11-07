@@ -2,7 +2,7 @@ import { ApiError, RateLimitError } from "@bedrock-rbx/ocale";
 
 import { setTimeout as delay } from "node:timers/promises";
 
-import type { ScriptResult } from "./types.ts";
+import type { ScriptResult } from "./runner-types.ts";
 
 /**
  * Measured Open Cloud per-place active-task ceiling — a platform constant, not
@@ -49,13 +49,20 @@ export interface TaskPoolBackoff {
 	waitMs: number;
 }
 
+/**
+ * A destination that launches tasks in stable pool slots.
+ */
 export interface TaskPoolPlace {
 	/**
-	 * Launch one task on this place; resolves with the task's return envelope.
+	 * Launch one task on this place in pool slot `slot`; resolves with the
+	 * task's return envelope.
 	 */
-	runTask: () => Promise<ScriptResult>;
+	runTask: (slot: number) => Promise<ScriptResult>;
 }
 
+/**
+ * Pool completion, backpressure and result collection policy.
+ */
 export interface TaskPoolOptions {
 	/**
 	 * Total task-slots across every place. Distributed as evenly as possible
@@ -67,10 +74,16 @@ export interface TaskPoolOptions {
 	/**
 	 * True once every enqueued unit has a terminal result. The pool stops
 	 * launching new tasks once this returns true and resolves after the
-	 * in-flight tasks settle. Owned by the consumer (e.g. the mutation runner
-	 * tracks which global indices have a verdict).
+	 * in-flight tasks settle. Owned by the consumer; the mutation runner, for
+	 * example, tracks which global indices have a verdict.
 	 */
 	isDone: () => boolean;
+	/**
+	 * Whether the `liveTasks` cover the remaining work. While true, a free slot
+	 * waits for a live task to return before it launches. Never asked with no
+	 * task live.
+	 */
+	isWorkCovered?: (liveTasks: number) => boolean;
 	/**
 	 * Wall clock in milliseconds; injected for tests. Defaults to `Date.now`.
 	 */
@@ -98,8 +111,13 @@ export interface TaskPoolOptions {
 	 * is the unchanged single-place behaviour. At least one is required.
 	 */
 	places: ReadonlyArray<TaskPoolPlace>;
-	/** Backoff sleep; injected for tests. Defaults to a real timer. */
-	sleep?: (ms: number) => Promise<void>;
+	/** Ends every backoff wait once aborted. */
+	signal?: AbortSignal;
+	/**
+	 * Backoff sleep; injected for tests. Must settle once `signal` aborts.
+	 * Defaults to a real timer.
+	 */
+	sleep?: (ms: number, signal: AbortSignal | undefined) => Promise<void>;
 	/**
 	 * One-line warning sink for an over-capacity total. Defaults to
 	 * `console.warn`.
@@ -125,6 +143,11 @@ interface PlaceState {
 	placeIndex: number;
 }
 
+interface LiveTasks {
+	count: number;
+	waiters: Array<() => void>;
+}
+
 /**
  * The pool's resolved dependencies, built once per run so the slot workers can
  * live at module scope instead of closing over {@link runTaskPoolAsync}'s
@@ -132,22 +155,26 @@ interface PlaceState {
  */
 interface PoolRuntime {
 	isDone: () => boolean;
+	isWorkCovered: ((liveTasks: number) => boolean) | undefined;
+	live: LiveTasks;
 	now: () => number;
 	onBackoff?: ((event: TaskPoolBackoff) => void) | undefined;
 	onError?: ((error: Error, slot: number) => void) | undefined;
 	onResult: (result: ScriptResult, slot: number) => void;
-	sleep: (ms: number) => Promise<void>;
+	signal: AbortSignal | undefined;
+	sleep: (ms: number, signal: AbortSignal | undefined) => Promise<void>;
 }
 
 /**
  * Drive a replenishing pool of long-lived tasks across a configurable list of
  * places: spread `concurrency` slots across the places (capped at {@link
- * MAX_TASKS_PER_PLACE} each), keep every slot full, relaunch a slot when its
- * task returns while work remains (`!isDone()`), and resolve once every slot
- * has drained and the done-signal has fired. All places drain the consumer's
- * one shared queue, so a slot that frees on a fast place transparently re-runs
- * a sibling's lost work. The pool is jest/mutation-agnostic — chunk sizing,
- * result de-duplication, and bail live in the consumer.
+ * MAX_TASKS_PER_PLACE} each), keep every slot full that work is not already
+ * covered for, relaunch a slot when its task returns while work remains
+ * (`!isDone()`), and resolve once every slot has drained and the done-signal
+ * has fired. All places drain the consumer's one shared queue, so a slot that
+ * frees on a fast place transparently re-runs a sibling's lost work. The pool
+ * is jest/mutation-agnostic — chunk sizing, result de-duplication, and bail
+ * live in the consumer.
  *
  * A task that throws a recognised platform backoff signal (a genuinely-full
  * place's `RESOURCE_EXHAUSTED`, the ~10s slot-recycle lag, or a rate-limit 429)
@@ -156,6 +183,8 @@ interface PoolRuntime {
  * window), reports through `onError`, and is relaunched while work remains — so
  * neither a transient failure nor platform backoff aborts the run or corrupts
  * results.
+ * @param options - Places, concurrency, completion callbacks and timing adapters.
+ * @rejects When allocation is invalid or a worker callback or wait fails.
  */
 export async function runTaskPoolAsync(options: TaskPoolOptions): Promise<void> {
 	const { concurrency, isDone, onBackoff, onError, onResult, places } = options;
@@ -170,11 +199,14 @@ export async function runTaskPoolAsync(options: TaskPoolOptions): Promise<void> 
 
 	const runtime: PoolRuntime = {
 		isDone,
+		isWorkCovered: options.isWorkCovered,
+		live: { count: 0, waiters: [] },
 		now: options.now ?? Date.now,
 		onBackoff,
 		onError,
 		onResult,
-		sleep: options.sleep ?? delay,
+		signal: options.signal,
+		sleep: options.sleep ?? (async (ms, signal) => delay(ms, undefined, { signal })),
 	};
 	const warn =
 		options.warn ??
@@ -182,7 +214,7 @@ export async function runTaskPoolAsync(options: TaskPoolOptions): Promise<void> 
 			console.warn(message);
 		});
 
-	const allocations = distributeSlots(places, concurrency, warn);
+	const allocations = distributeSlots({ concurrency, places, warn });
 
 	await Promise.all(spawnWorkers(runtime, allocations));
 }
@@ -191,13 +223,20 @@ export async function runTaskPoolAsync(options: TaskPoolOptions): Promise<void> 
  * Wait out a backoff signal on `state`'s place: the remainder of the
  * recycle-lag window when the signal landed within it of a completion,
  * otherwise the genuine place-full delay.
+ * @param options - Place state, worker slot and server backoff policy.
+ * @rejects When the injected wait fails for a reason other than cancellation.
  */
-async function backoffAsync(
-	runtime: PoolRuntime,
-	state: PlaceState,
-	slot: number,
-	retryAfterMs: number | undefined,
-): Promise<void> {
+async function backoffAsync({
+	retryAfterMs,
+	runtime,
+	slot,
+	state,
+}: {
+	retryAfterMs: number | undefined;
+	runtime: PoolRuntime;
+	slot: number;
+	state: PlaceState;
+}): Promise<void> {
 	// A non-positive server retry-after (e.g. a 429 carrying `retry-after: 0`)
 	// would spin into a tight retry loop, so fall back to the default delay.
 	const genuineMs =
@@ -212,7 +251,31 @@ async function backoffAsync(
 	// place, the other to the whole key.
 	const kind = retryAfterMs === undefined ? "place-full" : "rate-limit";
 	runtime.onBackoff?.({ kind, placeIndex: state.placeIndex, slot, waitMs });
-	await runtime.sleep(waitMs);
+	try {
+		await runtime.sleep(waitMs, runtime.signal);
+	} catch (err) {
+		if (runtime.signal?.aborted !== true) {
+			throw err;
+		}
+	}
+}
+
+function isCovered(runtime: PoolRuntime): boolean {
+	const { count } = runtime.live;
+	return count > 0 && runtime.isWorkCovered?.(count) === true;
+}
+
+async function awaitTaskReturnAsync(live: LiveTasks): Promise<void> {
+	return new Promise((resolve) => {
+		live.waiters.push(resolve);
+	});
+}
+
+function releaseTask(live: LiveTasks): void {
+	live.count -= 1;
+	for (const wake of live.waiters.splice(0)) {
+		wake();
+	}
 }
 
 /**
@@ -220,8 +283,10 @@ async function backoffAsync(
  * a rate-limit 429 ({@link RateLimitError}, carrying the server retry delay)
  * or a genuinely-full place ({@link ApiError} with the `RESOURCE_EXHAUSTED`
  * code). Walks the `cause` chain because
- * {@link RemoteRunner.executeScriptAsync} wraps the transport error in a plain
+ * `executeScriptAsync` wraps the transport error in a plain
  * `Error`. Any other error is not a backoff signal.
+ * @param error - Failure to classify.
+ * @returns Retry delay for a platform capacity refusal, otherwise undefined.
  */
 function classifyBackoff(error: unknown): BackoffSignal | undefined {
 	for (let current = error; current instanceof Error; current = current.cause) {
@@ -237,16 +302,34 @@ function classifyBackoff(error: unknown): BackoffSignal | undefined {
 	return undefined;
 }
 
-/** Drive one slot on `state`'s place until the consumer signals done. */
-async function workerAsync(runtime: PoolRuntime, state: PlaceState, slot: number): Promise<void> {
+/**
+ * Drive one slot on `state`'s place until the consumer signals done.
+ * @param options - Pool runtime, place-local state and stable slot identity.
+ */
+async function workerAsync({
+	runtime,
+	slot,
+	state,
+}: {
+	runtime: PoolRuntime;
+	slot: number;
+	state: PlaceState;
+}): Promise<void> {
 	while (!runtime.isDone()) {
+		if (isCovered(runtime)) {
+			await awaitTaskReturnAsync(runtime.live);
+			continue;
+		}
+
 		let result: ScriptResult;
+		runtime.live.count += 1;
 		try {
-			result = await state.place.runTask();
+			result = await state.place.runTask(slot);
 		} catch (err) {
+			releaseTask(runtime.live);
 			const signal = classifyBackoff(err);
 			if (signal !== undefined) {
-				await backoffAsync(runtime, state, slot, signal.retryAfterMs);
+				await backoffAsync({ retryAfterMs: signal.retryAfterMs, runtime, slot, state });
 				continue;
 			}
 
@@ -258,6 +341,7 @@ async function workerAsync(runtime: PoolRuntime, state: PlaceState, slot: number
 			continue;
 		}
 
+		releaseTask(runtime.live);
 		// Tracks slot-recycle lag (a backoff signal right after a completion)
 		// versus a genuinely-full place, per place across its slots.
 		state.lastCompletionMs = runtime.now();
@@ -269,6 +353,9 @@ async function workerAsync(runtime: PoolRuntime, state: PlaceState, slot: number
  * Start one worker per allocated slot. Slots are numbered across the whole
  * pool, not per place, so the index a settled task is reported under identifies
  * one slot for the length of the run.
+ * @param runtime - Resolved pool callbacks and timing adapters.
+ * @param allocations - Per-place slot counts.
+ * @returns One worker promise for each allocated slot.
  */
 function spawnWorkers(
 	runtime: PoolRuntime,
@@ -280,7 +367,7 @@ function spawnWorkers(
 		// clock is a property of the place, not of an individual slot.
 		const state: PlaceState = { lastCompletionMs: -Infinity, place, placeIndex };
 		for (let slot = 0; slot < slots; slot += 1) {
-			workers.push(workerAsync(runtime, state, workers.length));
+			workers.push(workerAsync({ runtime, slot: workers.length, state }));
 		}
 	}
 
@@ -292,12 +379,18 @@ function spawnWorkers(
  * capped at {@link MAX_TASKS_PER_PLACE} per place. A total above the aggregate
  * ceiling is clamped and reported once through `warn` so the run still
  * proceeds at the real capacity instead of silently over-subscribing.
+ * @param options - Requested concurrency, destinations and warning sink.
+ * @returns Per-place slot counts capped at the aggregate platform capacity.
  */
-function distributeSlots(
-	places: ReadonlyArray<TaskPoolPlace>,
-	concurrency: number,
-	warn: (message: string) => void,
-): Array<{ place: TaskPoolPlace; slots: number }> {
+function distributeSlots({
+	concurrency,
+	places,
+	warn,
+}: {
+	concurrency: number;
+	places: ReadonlyArray<TaskPoolPlace>;
+	warn: (message: string) => void;
+}): Array<{ place: TaskPoolPlace; slots: number }> {
 	const placeCount = places.length;
 	const capacity = placeCount * MAX_TASKS_PER_PLACE;
 	if (concurrency > capacity) {

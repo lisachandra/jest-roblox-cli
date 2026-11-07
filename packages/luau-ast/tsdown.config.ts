@@ -4,10 +4,18 @@ export default defineConfig({
 	clean: true,
 	dts: {
 		build: true,
-		oxc: true,
+		generator: "oxc",
 		tsconfig: "tsconfig.lib.json",
 	},
-	entry: ["src/index.ts", "src/ast.ts", "src/parser.ts", "src/visit.ts", "!src/**/*.spec.ts"],
+	entry: {
+		ast: "src/ast-types.ts",
+		compiler: "src/compiler.ts",
+
+		cst: "src/cst.ts",
+		index: "src/index.ts",
+		parser: "src/parser.ts",
+		visit: "src/visit.ts",
+	},
 	fixedExtension: true,
 	format: ["esm"],
 	publint: true,

@@ -1,9 +1,45 @@
 import { describe, expect, it } from "vitest";
 
 import { collectTestDefinitions } from "./collect.ts";
-import type { TestDefinition } from "./types.ts";
+import type { TestDefinition } from "./typecheck-types.ts";
 
 describe(collectTestDefinitions, () => {
+	it("should ignore indirect calls returned by another function", () => {
+		expect.assertions(1);
+
+		const definitions = collectTestDefinitions('makeTest()("indirect", () => {});');
+
+		expect(definitions).toStrictEqual([]);
+	});
+
+	it("should normalize carriage returns in a template literal name", () => {
+		expect.assertions(1);
+
+		expect(collectTestDefinitions("it(`first\r\nsecond`, () => {});")[0]!.name).toBe(
+			"first\nsecond",
+		);
+	});
+
+	it("should name a test with a non-string literal by its source text", () => {
+		expect.assertions(1);
+
+		expect(collectTestDefinitions("it(42, () => {});")[0]!.name).toBe("42");
+	});
+
+	it("should only credit suites as ancestors of nested calls", () => {
+		expect.assertions(1);
+
+		const definitions = collectTestDefinitions(
+			'describe("suite", () => { it("outer", () => { it("inner", () => {}); }); });',
+		);
+
+		expect(definitions.map(({ ancestorNames }) => ancestorNames)).toStrictEqual([
+			[],
+			["suite"],
+			["suite"],
+		]);
+	});
+
 	it("should collect a single it block", () => {
 		expect.assertions(2);
 
@@ -122,11 +158,11 @@ describe("second", () => { it("should b", () => {}); });`;
 	it("should handle template literal with interpolation", () => {
 		expect.assertions(1);
 
-		// eslint-disable-next-line no-template-curly-in-string -- testing template literal parsing
+		// oxlint-disable-next-line no-template-curly-in-string -- testing template literal parsing
 		const source = "const x = 'y'; it(`should handle ${x}`, () => {});";
 		const definitions = collectTestDefinitions(source);
 
-		// eslint-disable-next-line no-template-curly-in-string -- expected source text
+		// oxlint-disable-next-line no-template-curly-in-string -- expected source text
 		expect(definitions[0]!.name).toBe("should handle ${x}");
 	});
 

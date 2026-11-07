@@ -1,5 +1,11 @@
 export { resolveCredentials } from "./credentials.ts";
 export type { ResolveCredentialsInput } from "./credentials.ts";
+export { ExecutionTimeoutError } from "./execution-timeout.ts";
+export type {
+	CreateQuotaEvidence,
+	InfrastructureEvidence,
+	TaskStallEvidence,
+} from "./infrastructure-evidence.ts";
 export { flushMemoryStoreAsync } from "./memory-store-flush.ts";
 export type { FlushMemoryStoreOptions } from "./memory-store-flush.ts";
 export { createMemoryStoreJanitor } from "./memory-store-janitor.ts";
@@ -17,21 +23,37 @@ export {
 export type { ExpectedPlaceIdentity } from "./place-identity-guard.ts";
 export { ProgressMap } from "./progress-map.ts";
 export type { ProgressMapOptions } from "./progress-map.ts";
-export { runTaskPoolAsync as runTaskPool } from "./task-pool.ts";
-export type { TaskPoolBackoff, TaskPoolOptions, TaskPoolPlace } from "./task-pool.ts";
 export type {
+	BinaryInputUploader,
 	ExecuteScriptOptions,
 	RemoteRunner,
 	RunnerCredentials,
 	ScriptResult,
+	TerminalTaskEvidence,
+	UploadBinaryInputOptions,
+	UploadBinaryInputResult,
 	UploadPlaceOptions,
 	UploadPlaceResult,
-} from "./types.ts";
+} from "./runner-types.ts";
+export { SortedMapInbox } from "./sorted-map-inbox.ts";
+export type { SortedMapEntry, SortedMapInboxOptions } from "./sorted-map-inbox.ts";
+export { maximumSubmitDuration } from "./submit-budget.ts";
+export type { SubmitDurationOptions } from "./submit-budget.ts";
+export { runTaskPoolAsync as runTaskPool } from "./task-pool.ts";
+export type { TaskPoolBackoff, TaskPoolOptions, TaskPoolPlace } from "./task-pool.ts";
+export { TaskQuotaError } from "./task-quota-error.ts";
+export { TaskStallError } from "./task-stall-error.ts";
+export { TaskSubmitError } from "./task-submit-error.ts";
 export { createWorkQueueReader } from "./work-queue-reader.ts";
 export type { ClaimedBatch, WorkQueueReader, WorkQueueReaderOptions } from "./work-queue-reader.ts";
-export { createJsonWorkQueueWriter, createWorkQueueWriter } from "./work-queue-writer.ts";
+export {
+	createJsonWorkQueueWriter,
+	createWorkQueueHost,
+	createWorkQueueWriter,
+} from "./work-queue-writer.ts";
 export type {
 	JsonWorkQueueWriterOptions,
+	WorkQueueHost,
 	WorkQueueWriter,
 	WorkQueueWriterOptions,
 } from "./work-queue-writer.ts";

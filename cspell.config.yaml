@@ -2,6 +2,9 @@ version: "0.2"
 language: en
 
 words:
+  - IMAGENAME
+  - NSURL
+  - NSUTF
   - absolutize
   - absolutized
   - absolutizes
@@ -14,6 +17,7 @@ words:
   - debugname
   - defu
   - difftime
+  - dmaas
   - dndebug
   - doublestar
   - elseBlock
@@ -29,6 +33,7 @@ words:
   - foreachi
   - frexp
   - fwasm
+  - getenv
   - getmetatable
   - getn
   - gmatch
@@ -36,6 +41,7 @@ words:
   - highlightjs
   - indexexpr
   - injective
+  - inlines
   - instrumentability
   - instrumentable
   - instrumenter
@@ -43,9 +49,11 @@ words:
   - interpolatedstring
   - interpstring
   - ipairs
+  - languagemode
   - ldexp
   - lhsOperand
   - localfunction
+  - luaurc
   - materializer
   - maxn
   - misresolution
@@ -54,6 +62,7 @@ words:
   - newproxy
   - normalised
   - ocale
+  - osascript
   - oxlint
   - pcall
   - pnpmfile
@@ -73,6 +82,7 @@ words:
   - setmetatable
   - statfunction
   - statlocalfunction
+  - taskkill
   - thenBlock
   - thenExpr
   - thenbody

@@ -1,21 +1,15 @@
-import { fromAny } from "@total-typescript/shoehorn";
+import { describe, expect, it, vi } from "vitest";
 
-import { vol } from "memfs";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
-
+import type { MemoryVolume } from "#test/mocks/memory-file-system.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import type { FileSystem } from "../utils/file-system.ts";
 import {
 	hashPlaceFile,
 	invalidateCachedVersion,
-	invalidateIfBehindHead,
 	readCachedVersion,
 	type UploadCacheTarget,
 	writeCachedVersion,
 } from "./upload-cache.ts";
-
-vi.mock(import("node:fs"), async () => {
-	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, default: memfs.fs });
-});
 
 const ROOT = "/repo";
 const CACHE_PATH = "/repo/.jest-roblox/upload-cache.json";
@@ -26,28 +20,56 @@ const TARGET: UploadCacheTarget = {
 	universeId: "111",
 };
 
-/** Seeds the place file and returns its hash, resetting the volume after. */
-function seedPlaceFile(contents = "place-bytes"): string {
-	onTestFinished(() => {
-		vol.reset();
-	});
-	vol.fromJSON({ "/repo/game.rbxl": contents });
+/**
+ * Seed the place file on `volume` and report the hash the cache keys on.
+ *
+ * @param root0 - Seed input.
+ * @param root0.volume - Where the place file lands.
+ * @param root0.fileSystem - The same volume, as the code under test reads it.
+ * @param root0.contents - The place bytes.
+ * @returns The SHA-256 hash of the place file.
+ */
+function seedPlaceFile({
+	contents = "place-bytes",
+	fileSystem,
+	volume,
+}: {
+	readonly contents?: string;
+	readonly fileSystem: FileSystem;
+	readonly volume: MemoryVolume;
+}): string {
+	volume.fromJSON({ "/repo/game.rbxl": contents });
+	return hashPlaceFile(TARGET.placeFilePath, fileSystem)!;
+}
 
-	return hashPlaceFile(TARGET.placeFilePath)!;
+function seedCachedVersion(contents = "place-bytes") {
+	const { fileSystem, volume } = createMemoryFileSystem();
+	const hash = seedPlaceFile({ contents, fileSystem, volume });
+	writeCachedVersion({
+		entry: { hash, versionNumber: 42 },
+		fileSystem,
+		rootDirectory: ROOT,
+		target: TARGET,
+	});
+	return { fileSystem, hash, volume };
 }
 
 describe(hashPlaceFile, () => {
 	it("should return undefined when the place file cannot be read", () => {
 		expect.assertions(1);
 
-		expect(hashPlaceFile("/repo/missing.rbxl")).toBeUndefined();
+		const { fileSystem } = createMemoryFileSystem();
+
+		expect(hashPlaceFile("/repo/missing.rbxl", fileSystem)).toBeUndefined();
 	});
 
 	it("should return a different hash when the bytes change", () => {
 		expect.assertions(1);
 
-		const first = seedPlaceFile("one");
-		const second = seedPlaceFile("two");
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const first = seedPlaceFile({ contents: "one", fileSystem, volume });
+		const second = seedPlaceFile({ contents: "two", fileSystem, volume });
 
 		expect(first).not.toBe(second);
 	});
@@ -57,19 +79,24 @@ describe("upload cache", () => {
 	it("should return undefined when nothing was ever cached", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile();
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
+		const hash = seedPlaceFile({ fileSystem, volume });
+
+		expect(
+			readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
 	});
 
 	it("should return the recorded version for the same bytes", () => {
 		expect.assertions(2);
 
-		const hash = seedPlaceFile();
-		writeCachedVersion(ROOT, TARGET, hash, 42);
+		const { fileSystem, hash, volume } = seedCachedVersion();
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBe(42);
-		expect(vol.readFileSync(CACHE_PATH, "utf8")).toBe(
+		expect(readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET })).toBe(
+			42,
+		);
+		expect(volume.readFileSync(CACHE_PATH, "utf8")).toBe(
 			JSON.stringify(
 				{
 					entries: {
@@ -86,90 +113,120 @@ describe("upload cache", () => {
 	it("should miss when the bytes changed", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile("one");
-		writeCachedVersion(ROOT, TARGET, hash, 42);
+		const { fileSystem, volume } = seedCachedVersion("one");
 
-		expect(readCachedVersion(ROOT, TARGET, seedPlaceFile("two"))).toBeUndefined();
+		expect(
+			readCachedVersion({
+				fileSystem,
+				hash: seedPlaceFile({ contents: "two", fileSystem, volume }),
+				rootDirectory: ROOT,
+				target: TARGET,
+			}),
+		).toBeUndefined();
 	});
 
 	it("should miss when the same bytes target a different place", () => {
 		expect.assertions(2);
 
-		const hash = seedPlaceFile();
-		writeCachedVersion(ROOT, TARGET, hash, 42);
+		const { fileSystem, hash } = seedCachedVersion();
 
-		expect(readCachedVersion(ROOT, { ...TARGET, placeId: "999" }, hash)).toBeUndefined();
-		expect(readCachedVersion(ROOT, { ...TARGET, universeId: "999" }, hash)).toBeUndefined();
+		expect(
+			readCachedVersion({
+				fileSystem,
+				hash,
+				rootDirectory: ROOT,
+				target: { ...TARGET, placeId: "999" },
+			}),
+		).toBeUndefined();
+		expect(
+			readCachedVersion({
+				fileSystem,
+				hash,
+				rootDirectory: ROOT,
+				target: { ...TARGET, universeId: "999" },
+			}),
+		).toBeUndefined();
 	});
 
 	it("should replace the entry for a place file rather than adding one", () => {
 		expect.assertions(2);
 
-		const stale = seedPlaceFile("one");
-		writeCachedVersion(ROOT, TARGET, stale, 42);
-		writeCachedVersion(ROOT, TARGET, seedPlaceFile("two"), 43);
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const stale = seedPlaceFile({ contents: "one", fileSystem, volume });
+		writeCachedVersion({
+			entry: { hash: stale, versionNumber: 42 },
+			fileSystem,
+			rootDirectory: ROOT,
+			target: TARGET,
+		});
+		writeCachedVersion({
+			entry: {
+				hash: seedPlaceFile({ contents: "two", fileSystem, volume }),
+				versionNumber: 43,
+			},
+			fileSystem,
+			rootDirectory: ROOT,
+			target: TARGET,
+		});
 
 		// The superseded hash must not still resolve — otherwise the file grows
 		// without bound and old bytes keep a version alive.
-		expect(readCachedVersion(ROOT, TARGET, stale)).toBeUndefined();
-		expect(readCachedVersion(ROOT, TARGET, seedPlaceFile("two"))).toBe(43);
+		expect(
+			readCachedVersion({ fileSystem, hash: stale, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
+		expect(
+			readCachedVersion({
+				fileSystem,
+				hash: seedPlaceFile({ contents: "two", fileSystem, volume }),
+				rootDirectory: ROOT,
+				target: TARGET,
+			}),
+		).toBe(43);
 	});
 
 	it("should keep entries for different place files side by side", () => {
 		expect.assertions(2);
 
-		const hash = seedPlaceFile();
-		const other: UploadCacheTarget = { ...TARGET, placeFilePath: "/repo/other.rbxl" };
-		writeCachedVersion(ROOT, TARGET, hash, 42);
-		writeCachedVersion(ROOT, other, hash, 43);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBe(42);
-		expect(readCachedVersion(ROOT, other, hash)).toBe(43);
+		const hash = seedPlaceFile({ fileSystem, volume });
+		const other: UploadCacheTarget = { ...TARGET, placeFilePath: "/repo/other.rbxl" };
+		writeCachedVersion({
+			entry: { hash, versionNumber: 42 },
+			fileSystem,
+			rootDirectory: ROOT,
+			target: TARGET,
+		});
+		writeCachedVersion({
+			entry: { hash, versionNumber: 43 },
+			fileSystem,
+			rootDirectory: ROOT,
+			target: other,
+		});
+
+		expect(readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET })).toBe(
+			42,
+		);
+		expect(readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: other })).toBe(
+			43,
+		);
 	});
 
 	it("should drop the entry on invalidate", () => {
 		expect.assertions(3);
 
-		const hash = seedPlaceFile();
-		writeCachedVersion(ROOT, TARGET, hash, 42);
+		const { fileSystem, hash, volume } = seedCachedVersion();
 
-		expect(invalidateCachedVersion(ROOT, TARGET)).toBeTrue();
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
-		expect(vol.readFileSync(CACHE_PATH, "utf8")).toBe(
+		expect(
+			invalidateCachedVersion({ fileSystem, rootDirectory: ROOT, target: TARGET }),
+		).toBeTrue();
+		expect(
+			readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
+		expect(volume.readFileSync(CACHE_PATH, "utf8")).toBe(
 			JSON.stringify({ entries: {}, version: 2 }, undefined, "\t"),
 		);
-	});
-
-	/**
-	 * The one rule that decides whether a reused version is still valid. Open
-	 * Cloud will not say which version is head, so a task that booted past the
-	 * reused one is the whole of the evidence.
-	 */
-	it("should drop the entry when a task booted past the reused version", () => {
-		expect.assertions(2);
-
-		const hash = seedPlaceFile();
-		writeCachedVersion(ROOT, TARGET, hash, 42);
-
-		expect(
-			invalidateIfBehindHead(ROOT, TARGET, { bootedVersion: 43, reusedVersion: 42 }),
-		).toBeTrue();
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
-	});
-
-	it("should keep the entry when a task booted the reused version or older", () => {
-		expect.assertions(3);
-
-		const hash = seedPlaceFile();
-		writeCachedVersion(ROOT, TARGET, hash, 42);
-
-		expect(
-			invalidateIfBehindHead(ROOT, TARGET, { bootedVersion: 41, reusedVersion: 42 }),
-		).toBeFalse();
-		expect(
-			invalidateIfBehindHead(ROOT, TARGET, { bootedVersion: 42, reusedVersion: 42 }),
-		).toBeFalse();
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBe(42);
 	});
 
 	/**
@@ -180,42 +237,55 @@ describe("upload cache", () => {
 	it("should report a stale entry as surviving when the cache cannot be written", async () => {
 		expect.assertions(2);
 
-		const hash = seedPlaceFile();
-		writeCachedVersion(ROOT, TARGET, hash, 42);
-		const fs = await import("node:fs");
-		vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+		const { fileSystem, hash } = seedCachedVersion();
+		vi.spyOn(fileSystem, "writeFileSync").mockImplementation(() => {
 			throw new Error("EROFS: read-only file system");
 		});
 
 		expect(
-			invalidateIfBehindHead(ROOT, TARGET, { bootedVersion: 43, reusedVersion: 42 }),
+			invalidateCachedVersion({ fileSystem, rootDirectory: ROOT, target: TARGET }),
 		).toBeFalse();
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBe(42);
+		expect(readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET })).toBe(
+			42,
+		);
 	});
 
 	it("should tolerate invalidating when no cache file exists", () => {
 		expect.assertions(2);
 
-		seedPlaceFile();
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(invalidateCachedVersion(ROOT, TARGET)).toBeTrue();
-		expect(vol.existsSync(CACHE_PATH)).toBeFalse();
+		seedPlaceFile({ fileSystem, volume });
+
+		expect(
+			invalidateCachedVersion({ fileSystem, rootDirectory: ROOT, target: TARGET }),
+		).toBeTrue();
+
+		expect(volume.existsSync(CACHE_PATH)).toBeFalse();
 	});
 
 	it("should degrade to a miss when the cache file is malformed", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile();
-		vol.fromJSON({ "/repo/game.rbxl": "place-bytes", [CACHE_PATH]: "{not json" });
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
+		const hash = seedPlaceFile({ fileSystem, volume });
+
+		volume.fromJSON({ "/repo/game.rbxl": "place-bytes", [CACHE_PATH]: "{not json" });
+
+		expect(
+			readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
 	});
 
 	it("should degrade to a miss when the cache file has a newer format version", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile();
-		vol.fromJSON({
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const hash = seedPlaceFile({ fileSystem, volume });
+
+		volume.fromJSON({
 			"/repo/game.rbxl": "place-bytes",
 			[CACHE_PATH]: JSON.stringify({
 				entries: { anything: { hash, versionNumber: 42 } },
@@ -223,7 +293,9 @@ describe("upload cache", () => {
 			}),
 		});
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
+		expect(
+			readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
 	});
 
 	/**
@@ -234,8 +306,11 @@ describe("upload cache", () => {
 	it("should degrade to a miss when the cache file predates boot verification", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile();
-		vol.fromJSON({
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const hash = seedPlaceFile({ fileSystem, volume });
+
+		volume.fromJSON({
 			"/repo/game.rbxl": "place-bytes",
 			[CACHE_PATH]: JSON.stringify({
 				entries: { "111/222//repo/game.rbxl": { hash, versionNumber: 42 } },
@@ -243,38 +318,53 @@ describe("upload cache", () => {
 			}),
 		});
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
+		expect(
+			readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
 	});
 
 	it("should degrade to a miss when entries is not an object", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile();
-		vol.fromJSON({
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const hash = seedPlaceFile({ fileSystem, volume });
+
+		volume.fromJSON({
 			"/repo/game.rbxl": "place-bytes",
 			[CACHE_PATH]: JSON.stringify({ entries: 7, version: 2 }),
 		});
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
+		expect(
+			readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
 	});
 
 	it("should skip an entry whose shape is junk", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile();
-		vol.fromJSON({
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const hash = seedPlaceFile({ fileSystem, volume });
+
+		volume.fromJSON({
 			"/repo/game.rbxl": "place-bytes",
 			[CACHE_PATH]: JSON.stringify({ entries: { junk: 7 }, version: 2 }),
 		});
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBeUndefined();
+		expect(
+			readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET }),
+		).toBeUndefined();
 	});
 
 	it("should retain valid entries alongside a junk entry", () => {
 		expect.assertions(1);
 
-		const hash = seedPlaceFile();
-		vol.fromJSON({
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const hash = seedPlaceFile({ fileSystem, volume });
+
+		volume.fromJSON({
 			"/repo/game.rbxl": "place-bytes",
 			[CACHE_PATH]: JSON.stringify({
 				entries: {
@@ -285,6 +375,8 @@ describe("upload cache", () => {
 			}),
 		});
 
-		expect(readCachedVersion(ROOT, TARGET, hash)).toBe(42);
+		expect(readCachedVersion({ fileSystem, hash, rootDirectory: ROOT, target: TARGET })).toBe(
+			42,
+		);
 	});
 });

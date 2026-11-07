@@ -1,51 +1,54 @@
-import { fromAny } from "@total-typescript/shoehorn";
-
 import * as crypto from "node:crypto";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 
+import { posixPath } from "#test/mocks/posix-path.ts";
 import {
 	poolKeyOf,
 	seed,
 	staged,
 	stagedProject,
 	stagedProjectSchema,
-} from "../../test/mocks/staged-project.ts";
+} from "#test/mocks/staged-project.ts";
 import type { RojoTreeNode } from "../types/rojo.ts";
-import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
+import type { FileSystem } from "../utils/file-system.ts";
 import { poolSharedMounts } from "./shared-pool.ts";
-
-vi.mock(import("node:fs"), async () => {
-	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, default: memfs.fs });
-});
 
 const PROJECT_DIR = path.resolve("/repo/cache");
 const INCLUDE = path.resolve("/repo/include");
 const SHADOW = path.resolve("/repo/cache/coverage");
 
-function run(projectJson: string): string {
-	return poolSharedMounts({ projectDirectory: PROJECT_DIR, projectJson });
+function run(fileSystem: FileSystem, projectJson: string): string {
+	return poolSharedMounts({ fileSystem, projectDirectory: PROJECT_DIR, projectJson });
 }
 
-function pooledProject(projectJson: string): typeof stagedProjectSchema.infer {
-	return stagedProjectSchema.assert(JSON.parse(run(projectJson)));
+function pooledProject(
+	fileSystem: FileSystem,
+	projectJson: string,
+): typeof stagedProjectSchema.infer {
+	return stagedProjectSchema.assert(JSON.parse(run(fileSystem, projectJson)));
 }
 
 /**
  * The digest the pass is expected to key a pooled path on, derived here from
  * the documented rule — a sha256 over the posix path relative to the project
  * directory — rather than from the pass itself.
+ * @param absolutePath - Pooled mount path.
+ * @returns The expected 16-digit hex key.
  */
 function digestOf(absolutePath: string): string {
 	return crypto
 		.createHash("sha256")
-		.update(normalizeWindowsPath(path.relative(PROJECT_DIR, absolutePath)))
+		.update(posixPath(path.relative(PROJECT_DIR, absolutePath)))
 		.digest("hex")
 		.slice(0, 16);
 }
 
-/** A childless node mounting a directory — the shape the pass pools. */
+/**
+ * A childless node mounting a directory — the shape the pass pools.
+ * @param mountPath - Directory the node mounts.
+ * @returns The Folder node.
+ */
 function folderMount(mountPath: string): RojoTreeNode {
 	return { $className: "Folder", $path: mountPath };
 }
@@ -53,6 +56,8 @@ function folderMount(mountPath: string): RojoTreeNode {
 /**
  * A package under coverage: it shares `include/` with its siblings and runs
  * against its own instrumented copy of its own `out`.
+ * @param name - Package name its shadow directory is under.
+ * @returns The package's Folder node.
  */
 function coveredPackage(name: string): RojoTreeNode {
 	return {
@@ -62,7 +67,12 @@ function coveredPackage(name: string): RojoTreeNode {
 	};
 }
 
-/** Two packages staging the same node under the same name. */
+/**
+ * Two packages staging the same node under the same name.
+ * @param node - Node both packages stage.
+ * @param key - Name both stage it under.
+ * @returns The project text.
+ */
 function twoPackagesStaging(node: RojoTreeNode, key = "Include"): string {
 	return stagedProject({
 		a: { [key]: structuredClone(node), $className: "Folder" },
@@ -74,14 +84,15 @@ describe(poolSharedMounts, () => {
 	it("should hoist a directory two packages mount into one pooled entry", () => {
 		expect.assertions(4);
 
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 
 		const project = pooledProject(
+			fileSystem,
 			twoPackagesStaging(folderMount(INCLUDE), "ReplicatedStorage"),
 		);
 		const key = digestOf(INCLUDE);
 
-		expect(staged(project, "__shared", key)!.$path).toBe(normalizeWindowsPath(INCLUDE));
+		expect(staged(project, "__shared", key)!.$path).toBe(posixPath(INCLUDE));
 		expect(poolKeyOf(staged(project, "a", "ReplicatedStorage"))).toBe(key);
 		expect(poolKeyOf(staged(project, "b", "ReplicatedStorage"))).toBe(key);
 		// Only the pooled entry still names the path; each marker lost its own.
@@ -95,9 +106,10 @@ describe(poolSharedMounts, () => {
 		// with the generated `node_modules` project hanging off it as a child
 		// of its own. A child describes the node rather than the mount, so it
 		// stays where it was written and only the mount moves.
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 
 		const project = pooledProject(
+			fileSystem,
 			twoPackagesStaging(
 				{ $path: INCLUDE, node_modules: { $className: "Folder" } },
 				"rbxts_include",
@@ -112,14 +124,26 @@ describe(poolSharedMounts, () => {
 		});
 	});
 
+	it("should traverse an ordinary instance name ending in a dollar sign", () => {
+		expect.assertions(1);
+
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const project = pooledProject(
+			fileSystem,
+			twoPackagesStaging({ $className: "Folder", Cash$: folderMount(INCLUDE) }),
+		);
+
+		expect(poolKeyOf(staged(project, "a", "Include", "Cash$"))).toBe(digestOf(INCLUDE));
+	});
+
 	it("should declare a class on both halves of what it writes", () => {
 		expect.assertions(2);
 
 		// The pool holds no mount of its own for rojo to infer a class from,
 		// and the marker has to stand where a Folder stood.
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 
-		const project = pooledProject(twoPackagesStaging(folderMount(INCLUDE)));
+		const project = pooledProject(fileSystem, twoPackagesStaging(folderMount(INCLUDE)));
 
 		expect(staged(project, "__shared")!.$className).toBe("Folder");
 		expect(staged(project, "a", "Include")!.$className).toBe("Folder");
@@ -136,11 +160,28 @@ describe(poolSharedMounts, () => {
 		// mount now lives, so it is where the class has to be read: dropping
 		// it would build the ModuleScript an `init.luau` directory makes,
 		// under a name the project declared a Folder.
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 
-		const project = pooledProject(twoPackagesStaging(node));
+		const project = pooledProject(fileSystem, twoPackagesStaging(node));
 
 		expect(staged(project, "__shared", digestOf(INCLUDE))!.$className).toBe(expected);
+	});
+
+	it("should preserve Folder when only one duplicate mount declares it", () => {
+		expect.assertions(1);
+
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const project = pooledProject(
+			fileSystem,
+			stagedProject({
+				a: { $className: "Folder", Include: folderMount(INCLUDE) },
+				b: { $className: "Folder", Include: { $path: INCLUDE } },
+			}),
+		);
+		const entry = staged(project, "__shared", digestOf(INCLUDE));
+		assert(entry !== undefined);
+
+		expect(entry.$className).toBe("Folder");
 	});
 
 	it("should pool a mount that declares no class of its own", () => {
@@ -149,9 +190,9 @@ describe(poolSharedMounts, () => {
 		// What a rojo project usually writes: a bare `{ "$path": ... }`, with
 		// the class left to rojo. Only the stage roots synthesis builds carry
 		// an explicit Folder.
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 
-		const project = pooledProject(twoPackagesStaging({ $path: INCLUDE }));
+		const project = pooledProject(fileSystem, twoPackagesStaging({ $path: INCLUDE }));
 
 		expect(poolKeyOf(staged(project, "a", "Include"))).toBe(digestOf(INCLUDE));
 	});
@@ -163,20 +204,20 @@ describe(poolSharedMounts, () => {
 		// directory named `__shared` stages under the key the pool wants. Its
 		// tree is the run, and the pool is only an optimization, so the pool is
 		// what gives way.
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 		const projectJson = stagedProject({
 			__shared: { $className: "Folder", Include: folderMount(INCLUDE) },
 			a: { $className: "Folder", Include: folderMount(INCLUDE) },
 			b: { $className: "Folder", Include: folderMount(INCLUDE) },
 		});
 
-		expect(run(projectJson)).toBe(projectJson);
+		expect(run(fileSystem, projectJson)).toBe(projectJson);
 	});
 
 	it("should leave a mount only one package references alone", () => {
 		expect.assertions(1);
 
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 		const projectJson = stagedProject({
 			a: {
 				$className: "Folder",
@@ -185,7 +226,7 @@ describe(poolSharedMounts, () => {
 			b: { $className: "Folder" },
 		});
 
-		expect(run(projectJson)).toBe(projectJson);
+		expect(run(fileSystem, projectJson)).toBe(projectJson);
 	});
 
 	it.for([
@@ -196,9 +237,9 @@ describe(poolSharedMounts, () => {
 	] as const)("should leave %s untouched", ([, projectJson]) => {
 		expect.assertions(1);
 
-		seed();
+		const { fileSystem } = seed();
 
-		expect(run(projectJson)).toBe(projectJson);
+		expect(run(fileSystem, projectJson)).toBe(projectJson);
 	});
 
 	it("should leave each package's own coverage shadow out of the pool", () => {
@@ -206,12 +247,13 @@ describe(poolSharedMounts, () => {
 
 		// What a coverage run stages: both packages share `include/`, and each
 		// runs against its own instrumented copy of its own `out`.
-		seed({
+		const { fileSystem } = seed({
 			[path.join(INCLUDE, "runtime.luau")]: "",
 			[path.join(SHADOW, "a/out/main.luau")]: "",
 			[path.join(SHADOW, "b/out/main.luau")]: "",
 		});
 		const project = pooledProject(
+			fileSystem,
 			stagedProject({
 				a: coveredPackage("a"),
 				b: coveredPackage("b"),
@@ -230,10 +272,10 @@ describe(poolSharedMounts, () => {
 	] as const)("should leave %s alone", ([, node]) => {
 		expect.assertions(1);
 
-		seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
+		const { fileSystem } = seed({ [path.join(INCLUDE, "runtime.luau")]: "" });
 		const projectJson = twoPackagesStaging(node);
 
-		expect(run(projectJson)).toBe(projectJson);
+		expect(run(fileSystem, projectJson)).toBe(projectJson);
 	});
 
 	it.for([
@@ -246,12 +288,12 @@ describe(poolSharedMounts, () => {
 		// pooled plain Folders alone would miss the tree the pool exists for.
 		// The clone the materializer resolves comes from the pooled entry, so
 		// it is that class rather than the marker's Folder.
-		seed({
+		const { fileSystem } = seed({
 			[path.join(INCLUDE, "runtime.luau")]: "",
 			[path.join(path.resolve("/repo"), seeded)]: "",
 		});
 
-		const project = pooledProject(twoPackagesStaging({ $path: INCLUDE }));
+		const project = pooledProject(fileSystem, twoPackagesStaging({ $path: INCLUDE }));
 
 		expect(poolKeyOf(staged(project, "a", "Include"))).toBe(digestOf(INCLUDE));
 	});
@@ -261,10 +303,10 @@ describe(poolSharedMounts, () => {
 
 		// A stub the run has not generated yet, or a project naming a path that
 		// moved. Nothing to pool, and nothing to fail the build over either.
-		seed();
+		const { fileSystem } = seed();
 		const projectJson = twoPackagesStaging(folderMount(path.resolve("/repo/missing")));
 
-		expect(run(projectJson)).toBe(projectJson);
+		expect(run(fileSystem, projectJson)).toBe(projectJson);
 	});
 
 	it.for([
@@ -277,12 +319,12 @@ describe(poolSharedMounts, () => {
 		// workspace run generates one `jest.config.luau` stub and mounts it from
 		// every package.
 		const stub = path.join(path.resolve("/repo"), fileName);
-		seed({ [stub]: contents });
+		const { fileSystem } = seed({ [stub]: contents });
 
-		const project = pooledProject(twoPackagesStaging({ $path: stub }, "Config"));
+		const project = pooledProject(fileSystem, twoPackagesStaging({ $path: stub }, "Config"));
 
 		expect(poolKeyOf(staged(project, "a", "Config"))).toBe(digestOf(stub));
-		expect(staged(project, "__shared", digestOf(stub))!.$path).toBe(normalizeWindowsPath(stub));
+		expect(staged(project, "__shared", digestOf(stub))!.$path).toBe(posixPath(stub));
 	});
 
 	it.for(["README.md", "init.meta.json"] as const)(
@@ -296,10 +338,10 @@ describe(poolSharedMounts, () => {
 			// where the mount it replaced was merely absent, so the rule reads
 			// an allow list rather than guessing.
 			const file = path.join(path.resolve("/repo"), fileName);
-			seed({ [file]: "{}" });
+			const { fileSystem } = seed({ [file]: "{}" });
 			const projectJson = twoPackagesStaging({ $path: file }, "Loose");
 
-			expect(run(projectJson)).toBe(projectJson);
+			expect(run(fileSystem, projectJson)).toBe(projectJson);
 		},
 	);
 
@@ -307,7 +349,7 @@ describe(poolSharedMounts, () => {
 		expect.assertions(2);
 
 		const assets = path.resolve("/repo/assets");
-		seed({
+		const { fileSystem } = seed({
 			[path.join(assets, "map.luau")]: "",
 			[path.join(INCLUDE, "runtime.luau")]: "",
 		});
@@ -318,18 +360,15 @@ describe(poolSharedMounts, () => {
 		};
 
 		const project = pooledProject(
+			fileSystem,
 			stagedProject({
 				a: structuredClone(both),
 				b: structuredClone(both),
 			}),
 		);
 
-		expect(staged(project, "__shared", digestOf(INCLUDE))!.$path).toBe(
-			normalizeWindowsPath(INCLUDE),
-		);
-		expect(staged(project, "__shared", digestOf(assets))!.$path).toBe(
-			normalizeWindowsPath(assets),
-		);
+		expect(staged(project, "__shared", digestOf(INCLUDE))!.$path).toBe(posixPath(INCLUDE));
+		expect(staged(project, "__shared", digestOf(assets))!.$path).toBe(posixPath(assets));
 	});
 
 	it("should key a mount on its path relative to the project directory", () => {
@@ -338,12 +377,13 @@ describe(poolSharedMounts, () => {
 		// The same checkout at two roots: the absolute paths differ, the
 		// relative ones do not, and place reuse hits only if the key agrees.
 		const elsewhere = path.resolve("/elsewhere");
-		seed({
+		const { fileSystem } = seed({
 			[path.join(elsewhere, "include/runtime.luau")]: "",
 			[path.join(INCLUDE, "runtime.luau")]: "",
 		});
-		const here = pooledProject(twoPackagesStaging(folderMount(INCLUDE)));
+		const here = pooledProject(fileSystem, twoPackagesStaging(folderMount(INCLUDE)));
 		const there = poolSharedMounts({
+			fileSystem,
 			projectDirectory: path.join(elsewhere, "cache"),
 			projectJson: twoPackagesStaging(folderMount(path.join(elsewhere, "include"))),
 		});

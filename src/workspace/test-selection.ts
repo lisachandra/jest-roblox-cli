@@ -2,34 +2,24 @@ import * as path from "node:path";
 
 import { applyExcludes } from "../config/apply-excludes.ts";
 import { deriveTypecheckInclude } from "../config/derive-typecheck-include.ts";
-import { createInstancePathResolver } from "../config/instance-path.ts";
-import { narrowForLuauRun } from "../config/narrow-by-files.ts";
 import type { ResolvedProjectConfig } from "../config/projects.ts";
 import type {
 	ResolvedTypecheckConfig,
 	TypecheckCliOptions,
 } from "../config/resolve-typecheck-config.ts";
 import { resolveTypecheckConfig } from "../config/resolve-typecheck-config.ts";
-import type { CliOptions, ResolvedConfig } from "../config/schema.ts";
+import type { CliOptions } from "../config/schema.ts";
 import type { TsconfigMappingCache } from "../executor/tsconfig-mappings.ts";
-import {
-	createTsconfigMappingCache,
-	resolveAllTsconfigMappings,
-} from "../executor/tsconfig-mappings.ts";
-import type { ClassifiedTestFiles } from "../run/discovery.ts";
-import { classifyTestFiles, filterByTestPathPattern } from "../run/discovery.ts";
-import type { TypecheckGroupEntry } from "../typecheck/group-by-tsconfig.ts";
+import { createTsconfigMappingCache } from "../executor/tsconfig-mappings.ts";
+import { classifyTestFiles } from "../run/discovery.ts";
+import type { TypecheckGroupEntry } from "../typecheck/typecheck-groups.ts";
+import type { FileSystem } from "../utils/file-system.ts";
+import { nodeFileSystem } from "../utils/file-system.ts";
 import { createGlobCache, type GlobCache, globSync } from "../utils/glob.ts";
 import { applyFileFilter } from "./file-filter.ts";
+import { buildPendingEntry, type PendingEntry, type ProjectCliFiles } from "./pending-entry.ts";
 import { applyProjectFilter, type PackageContext } from "./project-contexts.ts";
 import { projectKey } from "./project-key.ts";
-
-export interface PendingEntry {
-	pkg: string;
-	project: ResolvedProjectConfig;
-	projectConfig: ResolvedConfig;
-	testFiles: Array<string>;
-}
 
 /**
  * Per-package Type Test reporting/runner policy, keyed by the package
@@ -40,18 +30,25 @@ export interface PendingEntry {
  * result.
  */
 export interface PackageTypecheck {
+	/** Whether to ignore errors outside the Type Test files. */
 	ignoreSourceErrors?: boolean | undefined;
+	/** Package name. */
 	pkg: string;
+	/** Time limit for the type checker process, in milliseconds. */
 	spawnTimeout?: number | undefined;
 	/** Run-level `timeout` (package-wide); bounds the tsgo compile. */
 	timeout: number;
 }
 
-// A (package, project) pair that owns Type Tests. The type pass groups by
-// `(cwd, tsconfig)` and reports per package, so this records the project names a
-// package's type result is written under in the per-package result files.
+/**
+ * A (package, project) pair that owns Type Tests. The type pass groups by
+ * `(cwd, tsconfig)` and reports per package, so this records the project names
+ * a package's type result is written under in the per-package result files.
+ */
 export interface TypeTestProject {
+	/** Package name. */
 	pkg: string;
+	/** Project display name. */
 	project: string;
 }
 
@@ -62,16 +59,25 @@ export interface TypeTestProject {
  * before bailing.
  */
 export interface WorkspaceTestSelection {
+	/** One error per empty package that does not pass with no tests. */
 	emptyPackageErrors: Array<string>;
+	/** Contexts left after the `--project` filter. */
 	filteredContexts: Array<PackageContext>;
+	/** Runtime jobs to dispatch. */
 	pending: Array<PendingEntry>;
+	/** Type Test policy per package directory. */
 	typecheckByDirectory: Map<string, PackageTypecheck>;
+	/** Type Test files to group. */
 	typeTestEntries: Array<TypecheckGroupEntry>;
+	/** Projects that own Type Tests. */
 	typeTestProjects: Array<TypeTestProject>;
 }
 
+/** CLI options and contexts to select tests from. */
 export interface WorkspaceSelectionInput {
+	/** CLI options that filter projects and files. */
 	cli: CliOptions;
+	/** Resolved package contexts. */
 	contexts: Array<PackageContext>;
 	/**
 	 * Base a relative positional file resolves against — the directory the CLI
@@ -79,6 +85,8 @@ export interface WorkspaceSelectionInput {
 	 * above it.
 	 */
 	cwd: string;
+	/** Where discovery globs and reads tsconfigs. Defaults to the real one. */
+	fileSystem?: FileSystem;
 }
 
 interface DiscoveredTests {
@@ -92,72 +100,49 @@ interface PendingEntriesInput {
 	cli: CliOptions;
 	contexts: Array<PackageContext>;
 	filesByProject: ReadonlyMap<string, Array<string>>;
+	fileSystem: FileSystem;
 }
 
 interface PackageEntriesInput {
 	cliTypecheck: TypecheckCliOptions;
 	ctx: PackageContext;
 	filesByProject: ReadonlyMap<string, Array<string>>;
+	fileSystem: FileSystem;
 	globCache: GlobCache;
 	packageTypecheck: ResolvedTypecheckConfig;
 	tsconfigCache: TsconfigMappingCache;
-}
-
-/**
- * The positional files this project owns, absolute and already split into the
- * two halves discovery splits its own glob into — or `undefined` when the run
- * named no files, which is what leaves discovery globbing.
- *
- * Classified once, where the files are looked up, rather than at each consumer:
- * `classifyTestFiles` is the rule that decides which half a file belongs to,
- * and running it again downstream would let the dispatched file set and the
- * Luau pattern disagree about a file. `undefined` and "both halves empty"
- * differ — no project reaches here in the latter state, because the file filter
- * drops one that matches nothing before the entry is built.
- */
-type ProjectCliFiles = ClassifiedTestFiles | undefined;
-
-interface PendingEntryInput {
-	cliFiles: ProjectCliFiles;
-	ctx: PackageContext;
-	globCache: GlobCache;
-	project: ResolvedProjectConfig;
-	tsconfigCache: TsconfigMappingCache;
-	typecheck: ResolvedTypecheckConfig;
-}
-
-interface ProjectNarrowInput {
-	/**
-	 * Set when the narrow came from positionals. Half of the `filterActive`
-	 * condition multi computes in `selectProjectFiles`; the other half — a
-	 * `--testPathPattern` — is already on `projectConfig`.
-	 */
-	isPositional: boolean;
-	packageDirectory: string;
-	project: ResolvedProjectConfig;
-	projectConfig: ResolvedConfig;
-	testFiles: Array<string>;
-	tsconfigCache: TsconfigMappingCache;
-	typecheck: ResolvedTypecheckConfig;
 }
 
 interface ProjectTypeTestInput {
 	cliFiles: ProjectCliFiles;
 	ctx: PackageContext;
+	fileSystem: FileSystem;
 	globCache: GlobCache;
 	packageTypecheck: ResolvedTypecheckConfig;
 	project: ResolvedProjectConfig;
 	typecheck: ResolvedTypecheckConfig;
 }
 
-// Each package decides independently. A package with zero discovered tests
-// passes only when its OWN `passWithNoTests` is true; the workspace root's value
-// is not aggregated over packages. Projects with zero tests inside a populated
-// package are silently dropped.
+/** What the `-d` glob for one project reads, and what it reads it through. */
+type TypeTestDiscoveryInput = Pick<
+	ProjectTypeTestInput,
+	"fileSystem" | "globCache" | "project" | "typecheck"
+>;
+
+/**
+ * Each package decides independently. A package with zero discovered tests
+ * passes only when its OWN `passWithNoTests` is true; the workspace root's value
+ * is not aggregated over packages. Projects with zero tests inside a populated
+ * package are silently dropped.
+ * @param input - CLI options, contexts, invocation directory and file system.
+ * @returns The selected contexts, runtime jobs and Type Test groups.
+ * @throws {Error} When a project name or positional file matches nothing.
+ */
 export function selectWorkspaceTests({
 	cli,
 	contexts,
 	cwd,
+	fileSystem = nodeFileSystem,
 }: WorkspaceSelectionInput): WorkspaceTestSelection {
 	// Files after names: `--project` says which projects may run at all, and a
 	// positional then picks from what survived. Reversing the two would let a
@@ -178,11 +163,16 @@ export function selectWorkspaceTests({
 		cli,
 		contexts: filteredContexts,
 		filesByProject,
+		fileSystem,
 	});
 	const typeTestPackages = new Set(
 		Array.from(discovered.typecheckByDirectory.values(), (entry) => entry.pkg),
 	);
-	const policy = applyEmptyPackagePolicy(discovered.pending, filteredContexts, typeTestPackages);
+	const policy = applyEmptyPackagePolicy({
+		allEntries: discovered.pending,
+		contexts: filteredContexts,
+		typeTestPackages,
+	});
 
 	return {
 		emptyPackageErrors: policy.emptyPackageErrors,
@@ -194,26 +184,21 @@ export function selectWorkspaceTests({
 	};
 }
 
-function applyEmptyPackagePolicy(
-	allEntries: Array<PendingEntry>,
-	contexts: Array<PackageContext>,
-	typeTestPackages: ReadonlySet<string>,
-): Pick<WorkspaceTestSelection, "emptyPackageErrors" | "pending"> {
+function applyEmptyPackagePolicy({
+	allEntries,
+	contexts,
+	typeTestPackages,
+}: {
+	readonly allEntries: Array<PendingEntry>;
+	readonly contexts: Array<PackageContext>;
+	readonly typeTestPackages: ReadonlySet<string>;
+}): Pick<WorkspaceTestSelection, "emptyPackageErrors" | "pending"> {
 	const passByPackage = new Map<string, boolean>();
 	for (const ctx of contexts) {
 		passByPackage.set(ctx.info.name, ctx.pkgConfig.passWithNoTests);
 	}
 
-	const entriesByPackage = new Map<string, Array<PendingEntry>>();
-	for (const entry of allEntries) {
-		let group = entriesByPackage.get(entry.pkg);
-		if (group === undefined) {
-			group = [];
-			entriesByPackage.set(entry.pkg, group);
-		}
-
-		group.push(entry);
-	}
+	const entriesByPackage = Map.groupBy(allEntries, (entry) => entry.pkg);
 
 	const emptyPackageErrors: Array<string> = [];
 	const pending: Array<PendingEntry> = [];
@@ -238,24 +223,26 @@ function applyEmptyPackagePolicy(
 	return { emptyPackageErrors, pending };
 }
 
-// Per-(package, project) Type Test discovery, mirroring multi's
-// `collectPendingJobs`: derive the `-d` include from the project's Runtime
-// `include` (unless an explicit `test.typecheck.include` is set), glob it
-// against the package directory, classify by `TYPE_TEST_PATTERN`, then subtract
-// `test.typecheck.exclude`. Returns absolute paths so `runTypecheck` reads them
-// cwd-independently (workspace mode runs from any directory) while still keying
-// each file result package-relative against `rootDir = packageDirectory`.
+/**
+ * Per-(package, project) Type Test discovery, mirroring multi's
+ * `collectPendingJobs`: derive the `-d` include from the project's Runtime
+ * `include` (unless an explicit `test.typecheck.include` is set), glob it
+ * against the package directory, classify by `isTypeTestFile`, then subtract
+ * `test.typecheck.exclude`. Returns absolute paths so `runTypecheck` reads them
+ * cwd-independently (workspace mode runs from any directory) while still keying
+ * each file result package-relative against `rootDir = packageDirectory`.
+ * @param input - File system, glob cache, project and typecheck config.
+ * @param packageDirectory - Package directory to glob against.
+ * @returns Absolute paths of the project's Type Test files.
+ */
 function discoverProjectTypeTests(
-	project: ResolvedProjectConfig,
-	typecheck: ResolvedTypecheckConfig,
+	{ fileSystem, globCache, project, typecheck }: TypeTestDiscoveryInput,
 	packageDirectory: string,
-	globCache: GlobCache,
 ): Array<string> {
 	const include = typecheck.include ?? deriveTypecheckInclude(project.include);
-	const found: Array<string> = [];
-	for (const pattern of include) {
-		found.push(...globSync(pattern, { cache: globCache, cwd: packageDirectory }));
-	}
+	const found = include.flatMap((pattern) => {
+		return globSync(pattern, { cache: globCache, cwd: packageDirectory, fileSystem });
+	});
 
 	const { typeTestFiles } = classifyTestFiles([...new Set(found)], typecheck);
 	return applyExcludes(typeTestFiles, typecheck.exclude).map((file) => {
@@ -264,7 +251,15 @@ function discoverProjectTypeTests(
 }
 
 function recordProjectTypeTests(
-	{ cliFiles, ctx, globCache, packageTypecheck, project, typecheck }: ProjectTypeTestInput,
+	{
+		cliFiles,
+		ctx,
+		fileSystem,
+		globCache,
+		packageTypecheck,
+		project,
+		typecheck,
+	}: ProjectTypeTestInput,
 	{ typecheckByDirectory, typeTestEntries, typeTestProjects }: DiscoveredTests,
 ): void {
 	const { packageDirectory } = ctx.info;
@@ -277,7 +272,7 @@ function recordProjectTypeTests(
 	// returns platform-native ones, and both halves feed the same tsgo group.
 	const typeTestFiles =
 		cliFiles?.typeTestFiles.map((file) => path.resolve(packageDirectory, file)) ??
-		discoverProjectTypeTests(project, typecheck, packageDirectory, globCache);
+		discoverProjectTypeTests({ fileSystem, globCache, project, typecheck }, packageDirectory);
 	if (typeTestFiles.length === 0) {
 		return;
 	}
@@ -301,139 +296,12 @@ function recordProjectTypeTests(
 	});
 }
 
-function buildProjectExecutionConfig(
-	packageConfig: ResolvedConfig,
-	project: ResolvedProjectConfig,
-): ResolvedConfig {
-	return {
-		...project.config,
-		passWithNoTests: packageConfig.passWithNoTests,
-		projects: project.projects,
-		rootDir: packageConfig.rootDir,
-		testMatch: project.testMatch,
-	};
-}
-
-function discoverProjectTestFiles(
-	project: ResolvedProjectConfig,
-	packageDirectory: string,
-	globCache: GlobCache,
-): Array<string> {
-	const found: Array<string> = [];
-	for (const pattern of project.include) {
-		found.push(...globSync(pattern, { cache: globCache, cwd: packageDirectory }));
-	}
-
-	// Runtime discovery globs the Runtime `include` only; Type Tests are
-	// discovered separately by `discoverProjectTypeTests` from the `-d` include.
-	return applyExcludes([...new Set(found)], project.exclude);
-}
-
-/**
- * Resolve this project's filter — positional files, or a `--testPathPattern` —
- * against its discovered files Node-side, then forward an Instance-namespace
- * pattern (see {@link narrowForLuauRun}).
- *
- * Narrowed per project rather than per package so the mounts come from
- * `project.rojoMounts` — the same include-filtered, ancestor-pruned,
- * `outDir`-pinned set multi narrows against. A raw walk of the package's Rojo
- * tree would answer with whichever mount sits deepest on disk instead, so the
- * two modes would translate one file to two different sub-paths.
- *
- * Positionals have already selected `testFiles`, so they need no second pass
- * here; they beat a `--testPathPattern` given alongside them, as they do in
- * multi. A pattern that matches nothing in this project simply targets another
- * one: keep the (zero-matching) raw pattern so Jest-on-Roblox runs nothing,
- * and set `passWithNoTests` so it doesn't `exit(1)`. The raw pattern is
- * load-bearing here — clearing it would drop the filter entirely and make the
- * Luau side fall back to `testMatch`, running the whole project.
- */
-function narrowProjectFilter({
-	isPositional,
-	packageDirectory,
-	project,
-	projectConfig,
-	testFiles,
-	tsconfigCache,
-	typecheck,
-}: ProjectNarrowInput): ResolvedConfig {
-	if (!isPositional && projectConfig.testPathPattern === undefined) {
-		return projectConfig;
-	}
-
-	const runtimeFiles = isPositional
-		? testFiles
-		: classifyTestFiles(
-				filterByTestPathPattern(testFiles, projectConfig.testPathPattern),
-				typecheck,
-			).runtimeFiles;
-	if (runtimeFiles.length === 0) {
-		return { ...projectConfig, passWithNoTests: true };
-	}
-
-	return narrowForLuauRun({
-		config: projectConfig,
-		filterActive: true,
-		runtimeFiles,
-		// One base, not two: `discoverProjectTestFiles` globs the package
-		// directory, and `resolveAllProjects` reads the mounts and the tsconfigs
-		// from there too, so the project's `rootDir` never enters this
-		// translation.
-		toInstancePath: createInstancePathResolver({
-			mountBase: packageDirectory,
-			mounts: project.rojoMounts,
-			rootDirectory: packageDirectory,
-			tsconfigMappings: resolveAllTsconfigMappings(packageDirectory, tsconfigCache),
-		}),
-	});
-}
-
-function buildPendingEntry({
-	cliFiles,
-	ctx,
-	globCache,
-	project,
-	tsconfigCache,
-	typecheck,
-}: PendingEntryInput): PendingEntry {
-	const { packageDirectory } = ctx.info;
-	// Positionals skip the glob and the `exclude` gate both — they are
-	// user-chosen and already classified. Only the glob branch has to zero
-	// itself for `--typecheckOnly` (per-project `only`): `classifyTestFiles`
-	// already emptied the positional half.
-	//
-	// The rule matches multi's `selectProjectFiles`, but the discovery around
-	// it does not, which is why the two are not one function: multi globs one
-	// `testMatch` covering both runtime and `-d` files and splits the result,
-	// while a package globs its Runtime `include` and its derived `-d` include
-	// separately — deliberately, so coverage-source derivation never sees a
-	// `-d` glob (see `discoverProjectTypeTests`). Only the decision is shared,
-	// through `classifyTestFiles` and `narrowForLuauRun`.
-	const testFiles =
-		cliFiles?.runtimeFiles ??
-		(typecheck.only ? [] : discoverProjectTestFiles(project, packageDirectory, globCache));
-
-	return {
-		pkg: ctx.info.name,
-		project,
-		projectConfig: narrowProjectFilter({
-			isPositional: cliFiles !== undefined,
-			packageDirectory,
-			project,
-			projectConfig: buildProjectExecutionConfig(ctx.pkgConfig, project),
-			testFiles,
-			tsconfigCache,
-			typecheck,
-		}),
-		testFiles,
-	};
-}
-
 function collectPackageProjectEntries(
 	{
 		cliTypecheck,
 		ctx,
 		filesByProject,
+		fileSystem,
 		globCache,
 		packageTypecheck,
 		tsconfigCache,
@@ -449,32 +317,52 @@ function collectPackageProjectEntries(
 		const named = filesByProject.get(projectKey(ctx.info.name, project.displayName));
 		const cliFiles = named === undefined ? undefined : classifyTestFiles(named, typecheck);
 		accumulators.pending.push(
-			buildPendingEntry({ cliFiles, ctx, globCache, project, tsconfigCache, typecheck }),
+			buildPendingEntry({
+				cliFiles,
+				ctx,
+				fileSystem,
+				globCache,
+				project,
+				tsconfigCache,
+				typecheck,
+			}),
 		);
 
+		// Stryker disable next-line ConditionalExpression: perf only
 		if (typecheck.enabled) {
 			recordProjectTypeTests(
-				{ cliFiles, ctx, globCache, packageTypecheck, project, typecheck },
+				{ cliFiles, ctx, fileSystem, globCache, packageTypecheck, project, typecheck },
 				accumulators,
 			);
 		}
 	}
 }
 
+/**
+ * The four accumulators one selection fills, all empty.
+ * @returns Empty accumulators.
+ */
+function emptyDiscoveredTests(): DiscoveredTests {
+	return {
+		pending: [],
+		typecheckByDirectory: new Map<string, PackageTypecheck>(),
+		typeTestEntries: [],
+		typeTestProjects: [],
+	};
+}
+
 function collectPendingEntries({
 	cli,
 	contexts,
 	filesByProject,
+	fileSystem,
 }: PendingEntriesInput): DiscoveredTests {
 	const cliTypecheck: TypecheckCliOptions = {
 		enabled: cli.typecheck,
 		only: cli.typecheckOnly,
 		tsconfig: cli.typecheckTsconfig,
 	};
-	const pending: Array<PendingEntry> = [];
-	const typeTestEntries: Array<TypecheckGroupEntry> = [];
-	const typeTestProjects: Array<TypeTestProject> = [];
-	const typecheckByDirectory = new Map<string, PackageTypecheck>();
+	const discovered = emptyDiscoveredTests();
 	// Every project in a package globs the same package directory, for runtime
 	// specs and again for Type Tests. One cache for the whole selection turns
 	// that 2N-walk fan into one walk per package directory.
@@ -497,10 +385,18 @@ function collectPendingEntries({
 		});
 
 		collectPackageProjectEntries(
-			{ cliTypecheck, ctx, filesByProject, globCache, packageTypecheck, tsconfigCache },
-			{ pending, typecheckByDirectory, typeTestEntries, typeTestProjects },
+			{
+				cliTypecheck,
+				ctx,
+				filesByProject,
+				fileSystem,
+				globCache,
+				packageTypecheck,
+				tsconfigCache,
+			},
+			discovered,
 		);
 	}
 
-	return { pending, typecheckByDirectory, typeTestEntries, typeTestProjects };
+	return discovered;
 }

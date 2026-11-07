@@ -1,7 +1,6 @@
-import { isRojoTreeNode } from "@isentinel/rojo-utils";
-
 import type { RojoProject, RojoTreeNode } from "../types/rojo.ts";
-import type { TsconfigMapping } from "../types/tsconfig.ts";
+import { listDataModelMounts } from "../types/rojo.ts";
+import type { TsconfigMapping } from "../types/tsconfig-types.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import { findMapping, replacePrefix } from "../utils/tsconfig-mapping.ts";
 
@@ -19,10 +18,16 @@ interface SnapshotPathResolverConfig {
 	rojoProject: RojoProject;
 }
 
+/**
+ * Map a DataModel snapshot path to the `$path` mount it sits under, then from
+ * `outDir` to `rootDir` when a tsconfig mapping covers it.
+ * @param config - Rojo project and optional tsconfig mappings.
+ * @returns A resolver that answers `undefined` for a path no mount covers.
+ */
 export function createSnapshotPathResolver(
 	config: SnapshotPathResolverConfig,
 ): SnapshotPathResolver {
-	const rojoMappings = buildMappings(config.rojoProject.tree, "");
+	const rojoMappings = buildMappings(config.rojoProject.tree);
 	const tsconfigMappings = config.mappings ?? [];
 
 	return {
@@ -36,13 +41,17 @@ export function createSnapshotPathResolver(
 					continue;
 				}
 
-				const suffix = normalized.slice(prefix.length + 1);
-				const result = `${basePath}/${suffix}`;
+				const suffix = normalized.slice(prefix.length);
+				const result = `${basePath}${suffix}`;
 
-				const mapping = findMapping(result, tsconfigMappings);
+				const mapping = findMapping({ filePath: result, mappings: tsconfigMappings });
 				if (mapping !== undefined) {
 					return {
-						filePath: replacePrefix(result, mapping.outDir, mapping.rootDir),
+						filePath: replacePrefix({
+							filePath: result,
+							from: mapping.outDir,
+							to: mapping.rootDir,
+						}),
 						mapping,
 					};
 				}
@@ -55,22 +64,8 @@ export function createSnapshotPathResolver(
 	};
 }
 
-function buildMappings(tree: RojoTreeNode, prefix: string): Array<[string, string]> {
-	const mappings: Array<[string, string]> = [];
-
-	for (const [key, value] of Object.entries(tree)) {
-		if (!isRojoTreeNode(value) || key.startsWith("$")) {
-			continue;
-		}
-
-		const dataModelPath = prefix ? `${prefix}/${key}` : key;
-
-		if (typeof value.$path === "string") {
-			mappings.push([dataModelPath, value.$path]);
-		}
-
-		mappings.push(...buildMappings(value, dataModelPath));
-	}
+function buildMappings(tree: RojoTreeNode): Array<[string, string]> {
+	const mappings = listDataModelMounts(tree, "/");
 
 	// Longest prefix first for greedy matching
 	mappings.sort((a, b) => b[0].length - a[0].length);

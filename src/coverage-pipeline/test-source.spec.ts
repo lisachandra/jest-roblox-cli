@@ -1,16 +1,9 @@
-import { fromAny } from "@total-typescript/shoehorn";
+import { describe, expect, it } from "vitest";
 
-import { vol } from "memfs";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
-
-import type { JestResult, TestCaseResult } from "../types/jest-result.ts";
-import { hashFile, hashString } from "../utils/hash.ts";
+import { sha256, sha256File } from "#test/mocks/coverage-hash.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import type { JestResult, TestCaseResult } from "../types/jest-result-types.ts";
 import { createTestSourceResolver } from "./test-source.ts";
-
-vi.mock(import("node:fs"), async () => {
-	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, default: memfs.fs });
-});
 
 const SOURCE = ["import x;", "", "it('a', () => {", "});", "", "it('b', () => {", "});", ""].join(
 	"\n",
@@ -50,6 +43,9 @@ function jestResult(testFilePath: string, cases: Array<TestCaseResult>): JestRes
 /**
  * A mapper that resolves every test file to `diskPath` and offsets lines by
  * `lineShift`.
+ * @param diskPath - Path every test file resolves to.
+ * @param lineShift - Lines added to each Luau line.
+ * @returns The test file mapper.
  */
 function mapperFor(diskPath: string | undefined, lineShift = 0) {
 	return {
@@ -62,72 +58,75 @@ describe(createTestSourceResolver, () => {
 	it("should close each test's range at the next test's start and the last at end of file", () => {
 		expect.assertions(2);
 
-		onTestFinished(() => {
-			vol.reset();
-		});
-		vol.mkdirSync("/src", { recursive: true });
-		vol.writeFileSync("/src/m.spec.ts", SOURCE);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [testCase("b", 6), testCase("a", 3)]),
-			mapperFor("/src/m.spec.ts"),
-		);
+		volume.mkdirSync("/src", { recursive: true });
+
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
+
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [testCase("b", 6), testCase("a", 3)]),
+			sourceMapper: mapperFor("/src/m.spec.ts"),
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "a").testSourceHash).toBe(
-			hashString("it('a', () => {\n});\n"),
+			sha256("it('a', () => {\n});\n"),
 		);
 		expect(resolve("ReplicatedStorage/m.spec", "b").testSourceHash).toBe(
-			hashString("it('b', () => {\n});\n"),
+			sha256("it('b', () => {\n});\n"),
 		);
 	});
 
 	it("should hash from the first line when a test starts there", () => {
 		expect.assertions(1);
 
-		onTestFinished(() => {
-			vol.reset();
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		volume.mkdirSync("/src", { recursive: true });
+
+		volume.writeFileSync("/src/m.spec.ts", "a\nb");
+
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [testCase("a", 1)]),
+			sourceMapper: mapperFor("/src/m.spec.ts"),
 		});
-		vol.mkdirSync("/src", { recursive: true });
-		vol.writeFileSync("/src/m.spec.ts", "a\nb");
 
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [testCase("a", 1)]),
-			mapperFor("/src/m.spec.ts"),
-		);
-
-		expect(resolve("ReplicatedStorage/m.spec", "a").testSourceHash).toBe(hashString("a\nb"));
+		expect(resolve("ReplicatedStorage/m.spec", "a").testSourceHash).toBe(sha256("a\nb"));
 	});
 
 	it("should record the mapped line and the range hash of a located test", () => {
 		expect.assertions(1);
 
-		onTestFinished(() => {
-			vol.reset();
-		});
-		vol.mkdirSync("/src", { recursive: true });
-		vol.writeFileSync("/src/m.spec.ts", SOURCE);
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		volume.mkdirSync("/src", { recursive: true });
+
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
 
 		// Luau lines 10 and 13 map to TypeScript lines 3 and 6.
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [testCase("a", 10), testCase("b", 13)]),
-			mapperFor("/src/m.spec.ts", -7),
-		);
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [testCase("a", 10), testCase("b", 13)]),
+			sourceMapper: mapperFor("/src/m.spec.ts", -7),
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "a")).toStrictEqual({
 			location: { column: 0, line: 3 },
-			testFileSourceHash: hashFile("/src/m.spec.ts"),
-			testSourceHash: hashString("it('a', () => {\n});\n"),
+			testFileSourceHash: sha256File("/src/m.spec.ts", fileSystem),
+			testSourceHash: sha256("it('a', () => {\n});\n"),
 		});
 	});
 
 	it("should join a Jest file named by its disk path, as Studio reports it", () => {
 		expect.assertions(1);
 
-		onTestFinished(() => {
-			vol.reset();
-		});
-		vol.mkdirSync("/src", { recursive: true });
-		vol.writeFileSync("/src/m.spec.ts", SOURCE);
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		volume.mkdirSync("/src", { recursive: true });
+
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
 
 		// Only the DataModel form resolves; the disk form is already on disk.
 		const diskPaths = new Map([["ReplicatedStorage/m.spec", "/src/m.spec.ts"]]);
@@ -135,10 +134,11 @@ describe(createTestSourceResolver, () => {
 			mapTestFileLine: (_testFilePath: string, luauLine: number) => luauLine,
 			resolveTestFilePath: (testFilePath: string) => diskPaths.get(testFilePath),
 		};
-		const resolve = createTestSourceResolver(
-			jestResult("/src/m.spec.ts", [testCase("a", 3)]),
-			mapper,
-		);
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("/src/m.spec.ts", [testCase("a", 3)]),
+			sourceMapper: mapper,
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "a").location).toStrictEqual({
 			column: 0,
@@ -149,71 +149,129 @@ describe(createTestSourceResolver, () => {
 	it("should give each-table rows on one line the same range hash", () => {
 		expect.assertions(1);
 
-		onTestFinished(() => {
-			vol.reset();
-		});
-		vol.mkdirSync("/src", { recursive: true });
-		vol.writeFileSync("/src/m.spec.ts", SOURCE);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [
+		volume.mkdirSync("/src", { recursive: true });
+
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
+
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [
 				testCase("row true", 3),
 				testCase("row false", 3),
 				testCase("b", 6),
 			]),
-			mapperFor("/src/m.spec.ts"),
-		);
+			sourceMapper: mapperFor("/src/m.spec.ts"),
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "row false").testSourceHash).toBe(
 			resolve("ReplicatedStorage/m.spec", "row true").testSourceHash,
 		);
 	});
 
+	it("should keep a file's first source decision for the whole result", () => {
+		expect.assertions(2);
+
+		const { fileSystem, volume } = createMemoryFileSystem();
+		volume.mkdirSync("/src", { recursive: true });
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
+		const result = jestResult("ReplicatedStorage/m.spec", [testCase("a", 3)]);
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result,
+			sourceMapper: mapperFor("/src/m.spec.ts"),
+		});
+
+		const first = resolve("ReplicatedStorage/m.spec", "a");
+
+		expect(first.testSourceHash).toBeDefined();
+
+		result.testResults = [];
+		volume.writeFileSync("/src/m.spec.ts", "changed");
+
+		expect(resolve("ReplicatedStorage/m.spec", "a")).toStrictEqual(first);
+	});
+
 	it("should fall back to the file hash alone when the line has no source mapping", () => {
 		expect.assertions(1);
 
-		onTestFinished(() => {
-			vol.reset();
-		});
-		vol.mkdirSync("/src", { recursive: true });
-		vol.writeFileSync("/src/m.spec.ts", SOURCE);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [testCase("a", 3)]),
-			{ mapTestFileLine: () => {}, resolveTestFilePath: () => "/src/m.spec.ts" },
-		);
+		volume.mkdirSync("/src", { recursive: true });
+
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
+
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [testCase("a", 3)]),
+			sourceMapper: {
+				mapTestFileLine: () => {},
+				resolveTestFilePath: () => "/src/m.spec.ts",
+			},
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "a")).toStrictEqual({
-			testFileSourceHash: hashFile("/src/m.spec.ts"),
+			testFileSourceHash: sha256File("/src/m.spec.ts", fileSystem),
 		});
 	});
 
 	it("should fall back to the file hash alone for a test without a location", () => {
 		expect.assertions(1);
 
-		onTestFinished(() => {
-			vol.reset();
-		});
-		vol.mkdirSync("/src", { recursive: true });
-		vol.writeFileSync("/src/m.spec.ts", SOURCE);
+		const { fileSystem, volume } = createMemoryFileSystem();
 
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [testCase("a")]),
-			mapperFor("/src/m.spec.ts"),
-		);
+		volume.mkdirSync("/src", { recursive: true });
+
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
+
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [testCase("a")]),
+			sourceMapper: mapperFor("/src/m.spec.ts"),
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "a")).toStrictEqual({
-			testFileSourceHash: hashFile("/src/m.spec.ts"),
+			testFileSourceHash: sha256File("/src/m.spec.ts", fileSystem),
+		});
+	});
+
+	it("should use the file hash alone when the Jest result has no matching file", () => {
+		expect.assertions(1);
+
+		const { fileSystem, volume } = createMemoryFileSystem();
+		volume.mkdirSync("/src", { recursive: true });
+		volume.writeFileSync("/src/m.spec.ts", SOURCE);
+
+		const diskPaths = new Map([
+			["ReplicatedStorage/m.spec", "/src/m.spec.ts"],
+			["ReplicatedStorage/other.spec", "/src/other.spec.ts"],
+		]);
+		const mapper = {
+			mapTestFileLine: (_testFilePath: string, luauLine: number) => luauLine,
+			resolveTestFilePath: (testFilePath: string) => diskPaths.get(testFilePath),
+		};
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/other.spec", [testCase("a", 1)]),
+			sourceMapper: mapper,
+		});
+
+		expect(resolve("ReplicatedStorage/m.spec", "a")).toStrictEqual({
+			testFileSourceHash: sha256File("/src/m.spec.ts", fileSystem),
 		});
 	});
 
 	it("should record an empty file hash when the test file is not on disk", () => {
 		expect.assertions(1);
 
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [testCase("a", 3)]),
-			mapperFor("/src/missing.spec.ts"),
-		);
+		const { fileSystem } = createMemoryFileSystem();
+
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [testCase("a", 3)]),
+			sourceMapper: mapperFor("/src/missing.spec.ts"),
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "a")).toStrictEqual({ testFileSourceHash: "" });
 	});
@@ -221,10 +279,13 @@ describe(createTestSourceResolver, () => {
 	it("should record an empty file hash when there is no source mapper", () => {
 		expect.assertions(1);
 
-		const resolve = createTestSourceResolver(
-			jestResult("ReplicatedStorage/m.spec", [testCase("a", 3)]),
-			undefined,
-		);
+		const { fileSystem } = createMemoryFileSystem();
+
+		const resolve = createTestSourceResolver({
+			fileSystem,
+			result: jestResult("ReplicatedStorage/m.spec", [testCase("a", 3)]),
+			sourceMapper: undefined,
+		});
 
 		expect(resolve("ReplicatedStorage/m.spec", "a")).toStrictEqual({ testFileSourceHash: "" });
 	});

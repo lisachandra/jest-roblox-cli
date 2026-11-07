@@ -7,6 +7,7 @@ import process from "node:process";
 const DEFAULT_MAX_BUFFER = 1024 * 1024;
 const DEFAULT_TIMEOUT = 30_000;
 
+/** The script invocation and limits applied to the Lute subprocess. */
 export interface LuteSpawnOptions {
 	/** Arguments to pass after -- separator. */
 	args: Array<string>;
@@ -18,20 +19,36 @@ export interface LuteSpawnOptions {
 	timeout?: number | undefined;
 }
 
+/** The Luau source and file base name for a temporary script. */
+export interface TemporaryLuauScriptOptions {
+	/** Base name for the temp file (without extension). */
+	name: string;
+	/** Luau source code to write. */
+	source: string;
+}
+
 /**
  * Spawn lute to run a Luau script and return its stdout.
  *
  * @param options - Spawn configuration.
+ * @param execute - The subprocess host, defaulting to Node's synchronous executor.
  * @returns The stdout output from lute.
  */
-export function spawnLute({
-	args,
-	maxBuffer = DEFAULT_MAX_BUFFER,
-	scriptPath,
-	timeout = DEFAULT_TIMEOUT,
-}: LuteSpawnOptions): string {
+export function spawnLute(
+	{
+		args,
+		maxBuffer = DEFAULT_MAX_BUFFER,
+		scriptPath,
+		timeout = DEFAULT_TIMEOUT,
+	}: LuteSpawnOptions,
+	execute: (
+		file: string,
+		args: ReadonlyArray<string>,
+		options: cp.ExecFileSyncOptionsWithStringEncoding,
+	) => string = cp.execFileSync,
+): string {
 	try {
-		return cp.execFileSync("lute", ["run", scriptPath, "--", ...args], {
+		return execute("lute", ["run", scriptPath, "--", ...args], {
 			encoding: "utf-8",
 			maxBuffer,
 			timeout,
@@ -52,13 +69,16 @@ export function spawnLute({
 /**
  * Write a Luau script string to a temp file and return its path.
  *
- * @param source - Luau source code to write.
- * @param name - Base name for the temp file (without extension).
+ * @param options - The script source and file base name.
+ * @param fileSystem - Adapter for directory creation and script writes.
  * @returns Absolute path to the written .luau file.
  */
-export function writeTemporaryLuauScript(source: string, name: string): string {
+export function writeTemporaryLuauScript(
+	{ name, source }: TemporaryLuauScriptOptions,
+	fileSystem: Pick<typeof fs, "mkdirSync" | "writeFileSync"> = fs,
+): string {
 	const directory = path.join(os.tmpdir(), "luau-ast");
-	fs.mkdirSync(directory, { recursive: true });
+	fileSystem.mkdirSync(directory, { recursive: true });
 
 	// Scope the filename to the process. Test runners execute spec files in
 	// parallel worker processes, each spawning Lute against this script; a
@@ -66,7 +86,7 @@ export function writeTemporaryLuauScript(source: string, name: string): string {
 	// another's Lute reads it, yielding intermittent parse failures. One file
 	// per process avoids the race (calls within a process run sync, serially).
 	const scriptPath = path.join(directory, `${name}.${process.pid}.luau`);
-	fs.writeFileSync(scriptPath, source);
+	fileSystem.writeFileSync(scriptPath, source);
 
 	return scriptPath;
 }

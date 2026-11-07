@@ -3,7 +3,8 @@ import process from "node:process";
 
 import packageJson from "../../package.json" with { type: "json" };
 import type { ResolvedConfig } from "../config/schema.ts";
-import { type ExecuteResult, formatExecuteOutput } from "../executor.ts";
+import type { ExecuteResult } from "../executor/executor-types.ts";
+import { formatExecuteOutput } from "../executor/format-output.ts";
 import { formatAgentMultiProject } from "../formatters/agent.ts";
 import { toFormatOptions } from "../formatters/format-options.ts";
 import {
@@ -19,57 +20,101 @@ import {
 	hasFormatter,
 	usesAgentFormatter,
 } from "../formatters/utils.ts";
-import type { PreDispatchTiming, ProjectResult } from "../run/types.ts";
-import type { JestResult } from "../types/jest-result.ts";
-import type { TimingResult } from "../types/timing.ts";
+import type { PreDispatchTiming, ProjectResult } from "../run/run-types.ts";
+import type { JestResult } from "../types/jest-result-types.ts";
+import type { TimingResult } from "../types/timing-types.ts";
 
+/** The formatters the print functions render through, injectable for tests. */
+export interface ResultRenderer {
+	/** Renders a multi-project run for the agent formatter. */
+	formatAgentMultiProject: typeof formatAgentMultiProject;
+	/** Renders one runtime result with the default formatter. */
+	formatExecuteOutput: typeof formatExecuteOutput;
+	/** Renders a multi-project run with the default formatter. */
+	formatMultiProjectResult: typeof formatMultiProjectResult;
+	/** Renders one result with the configured formatter. */
+	formatResult: typeof formatResult;
+	/** Renders the type-test report. */
+	formatTypecheckReport: typeof formatTypecheckReport;
+}
+
+/** What {@link printMultiResults} renders for a multi or workspace run. */
 export interface MultiOutputContext extends PreDispatchTiming {
 	/** Workspace `--bail` only: how far the run got before it stopped. */
 	bail?: BailSummary | undefined;
+	/** The resolved run config. */
 	config: ResolvedConfig;
 	/**
 	 * Resolved Game Output path for "View …" hints (workspace consensus or
 	 * config).
 	 */
 	gameOutputHint?: string | undefined;
+	/** The projects' results merged into one. */
 	merged: ExecuteResult;
 	/**
 	 * Resolved result-file path for "View …" hints (workspace consensus or
 	 * config).
 	 */
 	outputFileHint?: string | undefined;
+	/** The result of each project. */
 	projectResults: Array<ProjectResult>;
+	/** The formatters to render through. */
+	renderer: ResultRenderer;
+	/** The type-test pass result, when one ran. */
 	typecheckResult?: JestResult | undefined;
 }
 
 interface FormattedOutputOptions {
 	config: ResolvedConfig;
 	mergedResult: JestResult;
+	renderer: ResultRenderer;
 	runtimeResult?: ExecuteResult | undefined;
 	timing?: TimingResult | undefined;
 	typecheckResult?: JestResult | undefined;
 }
 
 interface RuntimeOutputOptions {
+	renderer: ResultRenderer;
 	runtimeResult: ExecuteResult;
 	timing: TimingResult;
 	/** Type errors from the parallel type pass, when one ran. */
 	typeErrorCount?: number | undefined;
 }
 
+interface CombinedOutputOptions {
+	mergedResult: JestResult;
+	renderer: ResultRenderer;
+	runtimeResult: ExecuteResult;
+	timing: TimingResult;
+	typecheckResult: JestResult;
+}
+
 interface SingleResultsOptions extends PreDispatchTiming {
 	mergedResult: JestResult;
+	renderer: ResultRenderer;
 	runtimeResult?: ExecuteResult | undefined;
 	typecheckResult?: JestResult | undefined;
 }
 
 const VERSION = packageJson.version;
 
-// Prints the run results for `single`, honouring `config.silent` and folding
-// the two pre-dispatch phases into the reported timing. The multi/workspace
-// twin is `printMultiResults`.
+export const defaultResultRenderer: ResultRenderer = {
+	formatAgentMultiProject,
+	formatExecuteOutput,
+	formatMultiProjectResult,
+	formatResult,
+	formatTypecheckReport,
+};
+
+/**
+ * Prints the run results for `single`, honouring `config.silent` and folding
+ * the two pre-dispatch phases into the reported timing. The multi/workspace
+ * twin is `printMultiResults`.
+ * @param config - The resolved run config.
+ * @param options - The results, renderer and pre-dispatch timing.
+ */
 export function printSingleResults(config: ResolvedConfig, options: SingleResultsOptions): void {
-	const { mergedResult, runtimeResult, typecheckResult } = options;
+	const { mergedResult, renderer, runtimeResult, typecheckResult } = options;
 	if (config.silent) {
 		return;
 	}
@@ -78,14 +123,24 @@ export function printSingleResults(config: ResolvedConfig, options: SingleResult
 		runtimeResult !== undefined
 			? addPreDispatchTiming(runtimeResult.timing, options)
 			: undefined;
-	printFormattedOutput({ config, mergedResult, runtimeResult, timing, typecheckResult });
+	printFormattedOutput({
+		config,
+		mergedResult,
+		renderer,
+		runtimeResult,
+		timing,
+		typecheckResult,
+	});
 }
 
-// Prints the run results for `multi`/`workspace`, honouring the same
-// formatter precedence as the single-run path: agent, then json, then the
-// default multi-project renderer.
+/**
+ * Prints the run results for `multi`/`workspace`, honouring the same
+ * formatter precedence as the single-run path: agent, then json, then the
+ * default multi-project renderer.
+ * @param context - The run's results, config and renderer.
+ */
 export function printMultiResults(context: MultiOutputContext): void {
-	const { config, typecheckResult } = context;
+	const { config, renderer, typecheckResult } = context;
 	if (config.silent) {
 		return;
 	}
@@ -93,13 +148,20 @@ export function printMultiResults(context: MultiOutputContext): void {
 	printMultiProjectOutput(context);
 
 	if (typecheckResult !== undefined && !usesDefaultFormatter(config)) {
-		writeTypecheckReport(config, typecheckResult);
+		writeTypecheckReport({ config, renderer, typecheckResult });
 	}
 }
 
-// Folds a run's {@link PreDispatchTiming} into the timing the formatters
-// render: both phases sit outside the window `totalMs` measures, so each is
-// added onto it rather than found inside it.
+/**
+ * Folds a run's {@link PreDispatchTiming} into the timing the formatters
+ * render: both phases sit outside the window `totalMs` measures, so each is
+ * added onto it rather than found inside it.
+ * @param timing - The run's timing.
+ * @param preDispatch - The pre-dispatch phase durations.
+ * @param preDispatch.coverageMs - Time spent instrumenting coverage.
+ * @param preDispatch.stagingMs - Time spent staging the place.
+ * @returns The timing with both phases set and added to `totalMs`.
+ */
 function addPreDispatchTiming(
 	timing: TimingResult,
 	{ coverageMs, stagingMs }: PreDispatchTiming,
@@ -114,16 +176,16 @@ function addPreDispatchTiming(
 
 function printOutput(out: string): void {
 	if (out !== "") {
-		// eslint-disable-next-line no-console -- CLI result output belongs on stdout.
+		// oxlint-disable-next-line no-console -- CLI result output belongs on stdout.
 		console.log(out);
 	}
 }
 
 function formatRuntimeOutput(
 	config: ResolvedConfig,
-	{ runtimeResult, timing, typeErrorCount }: RuntimeOutputOptions,
+	{ renderer, runtimeResult, timing, typeErrorCount }: RuntimeOutputOptions,
 ): string {
-	return formatExecuteOutput({
+	return renderer.formatExecuteOutput({
 		config,
 		result: runtimeResult.result,
 		snapshotWriteFailures: runtimeResult.snapshotWriteFailures,
@@ -134,14 +196,26 @@ function formatRuntimeOutput(
 	});
 }
 
-// The agent formatter is plain text throughout, so the type report beside it
-// drops colour too rather than being the one block that carries escapes.
+/**
+ * The agent formatter is plain text throughout, so the type report beside it
+ * drops colour too rather than being the one block that carries escapes.
+ * @param config - The resolved run config.
+ * @returns Whether the type report uses colour.
+ */
 function typecheckReportColor(config: ResolvedConfig): boolean {
 	return config.color && !usesAgentFormatter(config.formatters, config.verbose);
 }
 
-function writeTypecheckReport(config: ResolvedConfig, typecheckResult: JestResult): void {
-	const report = formatTypecheckReport(typecheckResult, {
+function writeTypecheckReport({
+	config,
+	renderer,
+	typecheckResult,
+}: {
+	config: ResolvedConfig;
+	renderer: ResultRenderer;
+	typecheckResult: JestResult;
+}): void {
+	const report = renderer.formatTypecheckReport(typecheckResult, {
 		// The agent formatter builds the summary rows into its own block, so
 		// only the failure detail is still missing here.
 		includeSummaryRows: !usesAgentFormatter(config.formatters, config.verbose),
@@ -163,36 +237,31 @@ function usesDefaultFormatter(config: ResolvedConfig): boolean {
 
 function printCombinedOutput(
 	config: ResolvedConfig,
-	{
-		mergedResult,
-		runtimeResult,
-		timing,
-		typecheckResult,
-	}: {
-		mergedResult: JestResult;
-		runtimeResult: ExecuteResult;
-		timing: TimingResult;
-		typecheckResult: JestResult;
-	},
+	{ mergedResult, renderer, runtimeResult, timing, typecheckResult }: CombinedOutputOptions,
 ): void {
 	if (!usesDefaultFormatter(config)) {
 		printOutput(
 			formatRuntimeOutput(config, {
+				renderer,
 				runtimeResult,
 				timing,
 				typeErrorCount: typecheckResult.numFailedTests,
 			}),
 		);
-		writeTypecheckReport(config, typecheckResult);
+		writeTypecheckReport({ config, renderer, typecheckResult });
 		return;
 	}
 
 	printOutput(
-		formatResult(mergedResult, timing, {
-			...toFormatOptions(config, VERSION),
-			snapshotWriteFailures: runtimeResult.snapshotWriteFailures,
-			sourceMapper: runtimeResult.sourceMapper,
-			typeErrors: typecheckResult.numFailedTests,
+		renderer.formatResult({
+			options: {
+				...toFormatOptions(config, VERSION),
+				snapshotWriteFailures: runtimeResult.snapshotWriteFailures,
+				sourceMapper: runtimeResult.sourceMapper,
+				typeErrors: typecheckResult.numFailedTests,
+			},
+			result: mergedResult,
+			timing,
 		}),
 	);
 }
@@ -200,12 +269,19 @@ function printCombinedOutput(
 function printFormattedOutput({
 	config,
 	mergedResult,
+	renderer,
 	runtimeResult,
 	timing,
 	typecheckResult,
 }: FormattedOutputOptions): void {
 	if (typecheckResult !== undefined && runtimeResult !== undefined && timing !== undefined) {
-		printCombinedOutput(config, { mergedResult, runtimeResult, timing, typecheckResult });
+		printCombinedOutput(config, {
+			mergedResult,
+			renderer,
+			runtimeResult,
+			timing,
+			typecheckResult,
+		});
 		return;
 	}
 
@@ -213,13 +289,15 @@ function printFormattedOutput({
 	// thing: rows included, whatever the formatter.
 	if (typecheckResult !== undefined) {
 		process.stdout.write(
-			formatTypecheckReport(typecheckResult, { useColor: typecheckReportColor(config) }),
+			renderer.formatTypecheckReport(typecheckResult, {
+				useColor: typecheckReportColor(config),
+			}),
 		);
 		return;
 	}
 
-	assert(runtimeResult !== undefined && timing !== undefined, "runtime result required");
-	printOutput(formatRuntimeOutput(config, { runtimeResult, timing }));
+	assert(runtimeResult !== undefined && timing !== undefined);
+	printOutput(formatRuntimeOutput(config, { renderer, runtimeResult, timing }));
 }
 
 function toProjectEntries(projectResults: Array<ProjectResult>): Array<FormatterProjectEntry> {
@@ -229,12 +307,12 @@ function toProjectEntries(projectResults: Array<ProjectResult>): Array<Formatter
 			displayName: entry.displayName,
 			gameOutput: entry.result.gameOutput,
 			result: entry.result.result,
+			rootDir: entry.rootDir,
 		};
 	});
 }
 
 function getAgentMaxFailures(config: ResolvedConfig): number {
-	assert(config.formatters !== undefined, "formatters is set by resolveFormatters");
 	const options = findFormatterOptions(config.formatters, "agent");
 	if (options !== undefined && typeof options.maxFailures === "number") {
 		return options.maxFailures;
@@ -250,9 +328,10 @@ function formatAgentMultiOutput({
 	merged,
 	outputFileHint,
 	projectResults,
+	renderer,
 	typecheckResult,
 }: MultiOutputContext): string {
-	return formatAgentMultiProject(toProjectEntries(projectResults), {
+	return renderer.formatAgentMultiProject(toProjectEntries(projectResults), {
 		bail,
 		gameOutput: gameOutputHint,
 		maxFailures: getAgentMaxFailures(config),
@@ -264,7 +343,7 @@ function formatAgentMultiOutput({
 }
 
 function printMultiProjectOutput(context: MultiOutputContext): void {
-	const { config, merged, projectResults, typecheckResult } = context;
+	const { config, merged, projectResults, renderer, typecheckResult } = context;
 
 	if (usesAgentFormatter(config.formatters, config.verbose)) {
 		printOutput(formatAgentMultiOutput(context));
@@ -273,17 +352,21 @@ function printMultiProjectOutput(context: MultiOutputContext): void {
 
 	const timing = addPreDispatchTiming(merged.timing, context);
 	if (hasFormatter(config.formatters, "json")) {
-		printOutput(formatRuntimeOutput(config, { runtimeResult: merged, timing }));
+		printOutput(formatRuntimeOutput(config, { renderer, runtimeResult: merged, timing }));
 		return;
 	}
 
 	printOutput(
-		formatMultiProjectResult(toProjectEntries(projectResults), timing, {
-			...toFormatOptions(config, VERSION),
-			bail: context.bail,
-			snapshotWriteFailures: merged.snapshotWriteFailures,
-			sourceMapper: merged.sourceMapper,
-			typeErrors: typecheckResult?.numFailedTests,
+		renderer.formatMultiProjectResult({
+			options: {
+				...toFormatOptions(config, VERSION),
+				bail: context.bail,
+				snapshotWriteFailures: merged.snapshotWriteFailures,
+				sourceMapper: merged.sourceMapper,
+				typeErrors: typecheckResult?.numFailedTests,
+			},
+			projects: toProjectEntries(projectResults),
+			timing,
 		}),
 	);
 }

@@ -28,6 +28,12 @@ const TS_SUPPORTED_EXTS = new Set(
 
 const LUAU_SUPPORTED_EXTS = new Set([".lua", ".luau"]);
 
+/**
+ * Syntax-highlight source for the terminal, picking the grammar by extension.
+ * @param id - The file path, used for its extension.
+ * @param source - The source text.
+ * @returns The highlighted text, or the source unchanged for other files.
+ */
 export function highlightCode(id: string, source: string): string {
 	const extension = extname(id);
 
@@ -86,7 +92,7 @@ function convertHljsToAnsi(html: string): string {
 		previous = result;
 		result = result.replace(
 			/<span class="([^"]+)">([^<]*)<\/span>/g,
-			(_, cssClasses, content) => {
+			(...[, cssClasses, content]: Array<number | string>) => {
 				// Multi-class spans (e.g., "hljs-title function_") use first
 				// class
 				const primaryClass = String(cssClasses).split(" ", 1).join();
@@ -101,7 +107,7 @@ function convertHljsToAnsi(html: string): string {
 	// second time: '&amp;lt;' has to come back out as '&lt;', not '<'.
 	return result.replace(HTML_ENTITY_REGEX, (entity) => {
 		const char = HTML_ENTITY_TO_CHAR.get(entity);
-		assert(char !== undefined, "regex only matches mapped entities");
+		assert(char !== undefined);
 		return char;
 	});
 }

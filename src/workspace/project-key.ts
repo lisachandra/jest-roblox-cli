@@ -3,7 +3,7 @@
  * keys by it — the file selection and the per-package output sinks.
  *
  * JSON-encode the pair so neither segment's content can collide into another
- * pair's key (parity with `groupTypecheckByTsconfig`). A project's
+ * pair's key (parity with `groupTypecheckPassesAsync`). A project's
  * `displayName` is unique only within its own package, so keying on it alone
  * would let two packages that both name a project `shared` collapse onto one
  * entry.
@@ -11,6 +11,9 @@
  * One encoder, not one per map: the two callers key the same pair, and a rule
  * added to only one of them would surface as a package silently unfiltered, or
  * written to another package's output file, rather than as an error.
+ * @param packageName - Name of the package that owns the project.
+ * @param project - Display name of the project within that package.
+ * @returns The JSON-encoded pair.
  */
 export function projectKey(packageName: string, project: string): string {
 	return JSON.stringify([packageName, project]);

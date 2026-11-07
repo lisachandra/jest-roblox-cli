@@ -1,69 +1,59 @@
 import { fromAny } from "@total-typescript/shoehorn";
 
-import { vol } from "memfs";
 import * as path from "node:path";
 import process from "node:process";
 import type { Except } from "type-fest";
 import { assert, describe, expect, it, vi } from "vitest";
 
-import { movableClockCollector } from "../test/mocks/movable-clock.ts";
+import { createLuteChildProcess } from "#test/mocks/lute-child-process.ts";
+import type { MemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { movableClockCollector } from "#test/mocks/movable-clock.ts";
+import { posixRoot } from "#test/mocks/posix-path.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
+import { configErrorLike } from "#test/mocks/run-config-error.ts";
+import { MANIFEST_VERSION } from "#test/mocks/run-constants.ts";
+import { recordingTimingCollector } from "#test/mocks/workspace-timing-recorder.ts";
 import type {
 	Backend,
 	BackendOptions,
 	BackendResult,
 	EnvelopeEntry,
 } from "./backends/interface.ts";
-import { loadConfig } from "./config/loader.ts";
+import type { PackageConfigLoader } from "./config/loader.ts";
 import type {
 	CliOptions,
 	ProjectEntry,
 	ResolvedConfig,
 	WorkspaceRunOptions,
 } from "./config/schema.ts";
-import { DEFAULT_CONFIG } from "./config/schema.ts";
-import { MANIFEST_VERSION } from "./coverage-pipeline/manifest.ts";
 import type { WorkspacePackageCoverage } from "./coverage-pipeline/workspace-prepare.ts";
-import { prepareWorkStealingQueueAsync } from "./memory-store/work-stealing.ts";
-import { buildPlaceAsync } from "./staging/place-builder.ts";
-import { createTimingCollector } from "./timing/orchestration-collector.ts";
-import { runTypecheckAsync } from "./typecheck/runner.ts";
-import type { JestResult } from "./types/jest-result.ts";
-import { toPosixRoot } from "./utils/normalize-windows-path.ts";
-import type { WorkspaceProjectResult } from "./workspace-runner.ts";
+import type { prepareWorkStealingQueueAsync } from "./memory-store/work-stealing.ts";
+import type { runTypecheckAsync } from "./typecheck/runner.ts";
+import type { JestResult } from "./types/jest-result-types.ts";
+import type { ChildProcessRunner } from "./utils/child-process.ts";
+import type { FileSystem } from "./utils/file-system.ts";
+import type { RojoResolverFactory } from "./utils/rojo-project-reader.ts";
+import type { WorkspaceProjectResult, WorkspaceRunnerOutput } from "./workspace-runner.ts";
 import { runWorkspaceAsync } from "./workspace-runner.ts";
+import type { PrepareCoverage } from "./workspace/coverage-attach.ts";
 
-vi.mock(import("./memory-store/work-stealing.ts"), () => {
-	return {
-		prepareWorkStealingQueueAsync: vi.fn<typeof prepareWorkStealingQueueAsync>(),
+function resolverReturning(mapping: Record<string, Array<string>>): RojoResolverFactory {
+	return () => {
+		return fromAny({
+			getRbxPathFromFilePath(filePath: string) {
+				return mapping[filePath];
+			},
+		});
 	};
-});
-
-vi.mock(import("node:fs"), async () => {
-	const memfs = await vi.importActual<typeof import("memfs")>("memfs");
-	return fromAny({ ...memfs.fs, default: memfs.fs });
-});
-
-vi.mock(import("./staging/place-builder.ts"));
-
-vi.mock(import("./config/loader.ts"), async (importOriginal) => {
-	const actual = await importOriginal();
-	return { ...actual, loadConfig: vi.fn<typeof actual.loadConfig>(actual.loadConfig) };
-});
-
-// rojo-utils is loaded only transitively (via ./workspace-runner.ts), never as a
-// direct top-level import: this suite mocks node:fs, and loading the bundled
-// rojo-utils module before the async node:fs mock resolves trips a hoisting TDZ.
-// Tests grab RojoResolver via a (cached) dynamic import and spy on fromPath, so
-// the real tree-walking helpers stay real while the filesystem walk is stubbed.
-
-vi.mock(import("./coverage-pipeline/workspace-prepare.ts"));
-
-// The host-side Type Test pass spawns tsgo; mock the runner so the suite drives
-// attribution off fixture output rather than a real compile. The real
-// `groupTypecheckByTsconfig` still groups entries and calls this mock per group.
-vi.mock(import("./typecheck/runner.ts"));
+}
 
 const ROOT = path.resolve("/repo");
+const WORKSPACE_CACHE = path.join(ROOT, ".jest-roblox", "workspace");
+const SYNTHESIZED_PROJECT = path.join(WORKSPACE_CACHE, "synthesized.project.json");
+/** Beside the place the run builds, named after it. */
+const CODE_BUNDLE = path.join(WORKSPACE_CACHE, "synthesized.code-bundle.json");
+const PLACE_BYTES = "RBXL-BYTES";
 const FOO_DIR = path.join(ROOT, "packages/foo");
 const BAR_DIR = path.join(ROOT, "packages/bar");
 const BAZ_DIR = path.join(ROOT, "packages/baz");
@@ -115,6 +105,9 @@ function failingResult(): string {
  * The script this run dispatched. A workspace run hands the backend a factory
  * rather than a script, so the whole run's script is the factory over every
  * job — what a lone bucket carries.
+ *
+ * @param captured - Holder of the backend options the stub captured.
+ * @returns The script the factory builds over every job.
  */
 function dispatchedScript(captured: Partial<Record<"options", BackendOptions>>): string {
 	const options = captured.options!;
@@ -128,6 +121,7 @@ function createStubBackend(
 	const captured: Partial<Record<"options", BackendOptions>> = {};
 	const backend: Backend = {
 		kind: "open-cloud",
+		placeInput: "built",
 		runTestsAsync: async (options): Promise<BackendResult> => {
 			captured.options = options;
 			return {
@@ -161,12 +155,12 @@ function createStubBackend(
 
 function makeRunOptions(overrides: Partial<WorkspaceRunOptions> = {}): WorkspaceRunOptions {
 	return {
-		backend: DEFAULT_CONFIG.backend,
+		backend: createResolvedConfig().backend,
 		bail: false,
-		color: DEFAULT_CONFIG.color,
+		color: createResolvedConfig().color,
 		formatters: [],
-		port: DEFAULT_CONFIG.port,
-		silent: DEFAULT_CONFIG.silent,
+		port: createResolvedConfig().port,
+		silent: createResolvedConfig().silent,
 		workspaceGameOutput: false,
 		workspaceOutputFile: false,
 		...overrides,
@@ -177,19 +171,109 @@ function makeCli(overrides: Partial<CliOptions> = {}): CliOptions {
 	return { ...overrides };
 }
 
-// Most specs assert only on the runtime results array; unwrap it from the
-// runner output so they stay focused on the per-(package, project) entries.
-// Preserves the `undefined` preflight sentinel.
+function timedRojo(fileSystem: FileSystem, onBuild: () => void): ChildProcessRunner {
+	return fromAny({
+		execFile: (
+			...[, args, , callback]: [
+				file: string,
+				args: Array<string>,
+				options: object,
+				callback: (cause: Error | null, stdout: string, stderr: string) => void,
+			]
+		) => {
+			onBuild();
+			fileSystem.writeFileSync(String(args[3]), PLACE_BYTES);
+			callback(null, "", "");
+		},
+	});
+}
+
+function stubRojo(fileSystem: FileSystem): ChildProcessRunner {
+	return timedRojo(fileSystem, () => {});
+}
+
+function failingRojo(stderr: string): ChildProcessRunner {
+	return fromAny({
+		execFile: (
+			...args: [
+				file: string,
+				args: Array<string>,
+				options: object,
+				callback: (cause: Error | null, stdout: string, stderr: string) => void,
+			]
+		) => {
+			args[3](new Error("rojo exited with 1"), "", stderr);
+		},
+	});
+}
+
+function stagedPackages(fileSystem: FileSystem): Array<string> {
+	const project = fromAny<{ tree: Record<string, Record<string, object>> }, JSONValue>(
+		JSON.parse(fileSystem.readFileSync(SYNTHESIZED_PROJECT, "utf-8")),
+	);
+	const stage = project.tree["ServerStorage"]?.["__pkg_stage"] ?? {};
+	return Object.keys(stage).filter((key) => !key.startsWith("$"));
+}
+
+function buildManifestPath(manifestPath: string): string {
+	return path.join(path.dirname(manifestPath), "build-manifest.json");
+}
+
+function buildManifestAt(
+	fileSystem: FileSystem,
+	manifestPath: string,
+): { coveragePlace: { path: string } } {
+	return fromAny(JSON.parse(fileSystem.readFileSync(buildManifestPath(manifestPath), "utf-8")));
+}
+
+const loadPackageConfig = vi.fn<PackageConfigLoader>(async ({ cwd } = {}) => {
+	return createResolvedConfig(cwd === undefined ? {} : { rootDir: cwd });
+});
+
+const runTypecheck = vi.fn<typeof runTypecheckAsync>();
+
+type StagedRunOptions = Except<
+	Parameters<typeof runWorkspaceAsync>[0],
+	"cli" | "runOptions" | "version" | "workspaceRoot"
+> &
+	Partial<Parameters<typeof runWorkspaceAsync>[0]>;
+
+async function runStagedWorkspaceAsync(
+	options: StagedRunOptions,
+): Promise<undefined | WorkspaceRunnerOutput> {
+	const { fileSystem } = options;
+	assert(fileSystem !== undefined);
+
+	return runWorkspaceAsync({
+		childProcess: stubRojo(fileSystem),
+		cli: makeCli(),
+		loadPackageConfig,
+		runOptions: makeRunOptions(),
+		runTypecheck,
+		version: "0.0.0-test",
+		workspaceRoot: ROOT,
+		...options,
+	});
+}
+
+/**
+ * Most specs assert only on the runtime results array; unwrap it from the
+ * runner output so they stay focused on the per-(package, project) entries.
+ * Preserves the `undefined` preflight sentinel.
+ *
+ * @param options - Inputs passed through to the staged run.
+ * @returns The runtime results, or `undefined` when preflight rejected the run.
+ */
 async function runWorkspaceResultsAsync(
-	options: Parameters<typeof runWorkspaceAsync>[0],
+	options: StagedRunOptions,
 ): Promise<Array<WorkspaceProjectResult> | undefined> {
-	const output = await runWorkspaceAsync(options);
+	const output = await runStagedWorkspaceAsync(options);
 	return output?.results;
 }
 
 function coverageEntry(packageName: string): WorkspacePackageCoverage {
 	return {
-		coverageRoots: [{ luauRoot: toPosixRoot("src"), shadowDir: "/shadow/src" }],
+		coverageRoots: [{ luauRoot: posixRoot("src"), shadowDir: "/shadow/src" }],
 		coverageSpine: [],
 		manifest: {
 			buildId: "test-build-id",
@@ -218,7 +302,7 @@ function makeProjectEntries(entries: Array<ProjectEntry>): Array<ProjectEntry> {
 }
 
 function setLoadedConfigPerPackage(map: Readonly<Record<string, PreResolutionConfig>>): void {
-	vi.mocked(loadConfig).mockImplementation(async (_path, cwd) => {
+	loadPackageConfig.mockImplementation(async ({ cwd } = {}) => {
 		const config = map[cwd ?? ""];
 		if (config === undefined) {
 			throw new Error(`No mocked config for cwd: ${cwd ?? "<undefined>"}`);
@@ -253,44 +337,269 @@ function seedPackage(
 	};
 }
 
+const WORKSPACE_YAML = {
+	[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+};
+
+interface Scenario {
+	configs: Readonly<Record<string, PreResolutionConfig>>;
+	entries: Array<BackendStubEntry>;
+	files: Record<string, string>;
+	run: Except<StagedRunOptions, "backend" | "fileSystem">;
+}
+
+function seedSpec(info: { name: string; packageDirectory: string }, ...specFiles: Array<string>) {
+	return seedPackage(info.packageDirectory, {
+		name: info.name,
+		specFiles: Object.fromEntries(
+			specFiles.map((specFile) => [path.join(info.packageDirectory, specFile), ""]),
+		),
+	});
+}
+
+function rooted(
+	rootDirectory: string,
+	overrides: Partial<PreResolutionConfig> = {},
+): PreResolutionConfig {
+	return { ...createResolvedConfig(), rootDir: rootDirectory, ...overrides };
+}
+
+function passingEntries(...packages: Array<string>): Array<BackendStubEntry> {
+	return packages.map((name) => ({ jestOutput: passingResult(), pkg: name }));
+}
+
+function passingProjectEntry(name: string, project: string): BackendStubEntry {
+	return { jestOutput: passingResult(), pkg: name, project };
+}
+
+function fooBarFiles(): Record<string, string> {
+	return {
+		...seedSpec(FOO_INFO, "src/foo.spec.luau"),
+		...seedSpec(BAR_INFO, "src/bar.spec.luau"),
+	};
+}
+
+function luauConfigs(...directories: Array<string>): Record<string, PreResolutionConfig> {
+	return Object.fromEntries(
+		directories.map((directory) => [
+			directory,
+			rooted(directory, { testMatch: ["**/*.spec.luau"] }),
+		]),
+	);
+}
+
+function clientServerFooFiles(): Record<string, string> {
+	return seedPackage(FOO_DIR, {
+		name: "@halcyon/foo",
+		specFiles: {
+			[path.join(FOO_DIR, "out/Client/foo.spec.luau")]: "",
+			[path.join(FOO_DIR, "out/Server/bar.spec.luau")]: "",
+		},
+		tree: {
+			$className: "DataModel",
+			ReplicatedStorage: { Client: { $path: "out/Client" } },
+			ServerScriptService: { Server: { $path: "out/Server" } },
+		},
+	});
+}
+
+function customProjectBarFiles(): Record<string, string> {
+	return {
+		[path.join(BAR_DIR, "custom.project.json")]: packageJson({
+			name: "bar-test",
+			tree: { $className: "DataModel", ReplicatedStorage: { Pkg: { $path: "src" } } },
+		}),
+		[path.join(BAR_DIR, "jest.config.ts")]: "export default {}",
+		[path.join(BAR_DIR, "package.json")]: packageJson({ name: "@halcyon/bar" }),
+		[path.join(BAR_DIR, "src/bar.spec.luau")]: "",
+	};
+}
+
+function stageWorkspace(
+	files: Record<string, string>,
+	configs: Readonly<Record<string, PreResolutionConfig>>,
+): MemoryFileSystem {
+	const memory = createMemoryFileSystem();
+	memory.volume.fromJSON({ ...files, ...WORKSPACE_YAML });
+	setLoadedConfigPerPackage(configs);
+	return memory;
+}
+
+async function runScenarioAsync({ configs, entries, files, run }: Scenario) {
+	const memory = stageWorkspace(files, configs);
+	const stub = createStubBackend(entries);
+	const output = await runStagedWorkspaceAsync({
+		backend: stub.backend,
+		fileSystem: memory.fileSystem,
+		...run,
+	});
+	return { ...memory, ...stub, output, results: output?.results };
+}
+
+async function runLuauFooAsync(files: Record<string, string>, cli: CliOptions) {
+	return runScenarioAsync({
+		configs: { [FOO_DIR]: rooted(FOO_DIR, { testMatch: ["**/*.spec.luau"] }) },
+		entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+		files,
+		run: { cli, packageInfos: [FOO_INFO] },
+	});
+}
+
+const TIMEOUT_CONFIGS = {
+	[BAR_DIR]: rooted(BAR_DIR, { testTimeout: 5678 }),
+	[FOO_DIR]: rooted(FOO_DIR, { testTimeout: 1234 }),
+};
+
+const SETUP = ["./src/Shared/setup.luau"];
+
+async function runSetupFooAsync(setup: Partial<PreResolutionConfig>) {
+	return runScenarioAsync({
+		configs: { [FOO_DIR]: rooted(FOO_DIR, setup) },
+		entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+		files: seedSpec(FOO_INFO, "src/foo.spec.luau", "src/Shared/setup.luau"),
+		run: {
+			createResolver: resolverReturning({
+				[path.resolve(FOO_DIR, SETUP[0]!)]: ["ReplicatedStorage", "Pkg", "Shared", "setup"],
+			}),
+			packageInfos: [FOO_INFO],
+		},
+	});
+}
+
+async function runCoverageFooAsync(config: Partial<PreResolutionConfig> = {}) {
+	const entry = coverageEntry("@halcyon/foo");
+	const prepareCoverage = vi.fn<PrepareCoverage>(() => [entry]);
+	const scenario = await runScenarioAsync({
+		configs: { [FOO_DIR]: rooted(FOO_DIR, { collectCoverage: true, ...config }) },
+		entries: passingEntries("@halcyon/foo"),
+		files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+		run: {
+			cli: makeCli({ collectCoverage: true }),
+			packageInfos: [FOO_INFO],
+			prepareCoverage,
+		},
+	});
+	return { ...scenario, entry, prepareCoverage };
+}
+
+function stagePassingTypecheckFoo(): MemoryFileSystem {
+	const memory = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec-d.ts", "src/foo.spec.ts"), {
+		[FOO_DIR]: rooted(FOO_DIR, { testMatch: ["**/*.spec.ts"], typecheck: { enabled: true } }),
+	});
+	runTypecheck.mockResolvedValue(
+		makeTypeResult({
+			testResults: [
+				{
+					numFailingTests: 0,
+					numPassingTests: 1,
+					numPendingTests: 0,
+					testFilePath: "src/foo.spec-d.ts",
+					testResults: [],
+				},
+			],
+		}),
+	);
+	return memory;
+}
+
+async function typecheckFooFilesAsync(
+	typecheck: NonNullable<PreResolutionConfig["typecheck"]>,
+	...specFiles: Array<string>
+): Promise<Array<string>> {
+	runTypecheck.mockResolvedValue(makeTypeResult());
+	await runScenarioAsync({
+		configs: { [FOO_DIR]: rooted(FOO_DIR, { testMatch: ["**/*.spec.ts"], typecheck }) },
+		entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+		files: seedSpec(FOO_INFO, ...specFiles),
+		run: { packageInfos: [FOO_INFO] },
+	});
+	return runTypecheck.mock.calls[0]![0].files;
+}
+
+describe("the place a workspace run uploads", () => {
+	/**
+	 * One passing package, run against the named backend.
+	 * @param backendKind - The backend kind to run against.
+	 * @returns The memory file system after the run.
+	 */
+	async function runOnBackendAsync(
+		backendKind: Backend["kind"] = "open-cloud",
+	): Promise<MemoryFileSystem> {
+		const memory = createMemoryFileSystem();
+
+		memory.volume.fromJSON({
+			...seedSpec(FOO_INFO, "src/foo.spec.luau"),
+			...WORKSPACE_YAML,
+		});
+		setLoadedConfigPerPackage({ [FOO_DIR]: rooted(FOO_DIR) });
+
+		const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
+
+		await runStagedWorkspaceAsync({
+			backend: { ...backend, kind: backendKind },
+			fileSystem: memory.fileSystem,
+			packageInfos: [FOO_INFO],
+		});
+		return memory;
+	}
+
+	/**
+	 * A Shared Place run builds every package into the one place: only an
+	 * Exclusive Place grant makes a Harness Place safe, and none exists.
+	 */
+	it("should build the whole open-cloud place", async () => {
+		expect.assertions(2);
+
+		const memory = await runOnBackendAsync();
+
+		expect(memory.volume.existsSync(CODE_BUNDLE)).toBeFalse();
+		expect(
+			JSON.stringify(
+				JSON.parse(memory.fileSystem.readFileSync(SYNTHESIZED_PROJECT, "utf-8")),
+			),
+		).toContain("Pkg");
+	});
+
+	it("should build the whole place for a Studio backend", async () => {
+		expect.assertions(1);
+
+		const memory = await runOnBackendAsync("studio");
+
+		expect(memory.volume.existsSync(CODE_BUNDLE)).toBeFalse();
+	});
+});
+
 describe(runWorkspaceAsync, () => {
 	it("should load each package's config independently and embed both in the materializer payload", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR, testTimeout: 5678 },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testTimeout: 1234 },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: TIMEOUT_CONFIGS,
+			entries: passingEntries("@halcyon/foo", "@halcyon/bar"),
+			files: fooBarFiles(),
+			run: {
+				packageInfos: [FOO_INFO, BAR_INFO],
+			},
 		});
 
 		expect(dispatchedScript(captured)).toContain('"testTimeout":1234');
 		expect(dispatchedScript(captured)).toContain('"testTimeout":5678');
+	});
+
+	it("should hand the backend the VM count the run options carry", async () => {
+		expect.assertions(1);
+
+		const { captured } = await runScenarioAsync({
+			configs: { [FOO_DIR]: rooted(FOO_DIR) },
+			entries: passingEntries("@halcyon/foo"),
+			files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+			run: {
+				packageInfos: [FOO_INFO],
+				runOptions: makeRunOptions({ experimentalVmParallel: 3 }),
+			},
+		});
+
+		expect(captured.options!.vmParallel).toBe(3);
 	});
 
 	// Workspace mode builds the materializer payload from the pending entries
@@ -299,61 +608,32 @@ describe(runWorkspaceAsync, () => {
 	// own default and a roblox-ts package's snapshots come back in `Table {`
 	// form while multi mode writes `{`.
 	it("should resolve printBasicPrototype for a typescript package before dispatch", async () => {
-		expect.assertions(2);
+		expect.assertions(3);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.ts")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: { [FOO_DIR]: rooted(FOO_DIR) },
+			entries: passingEntries("@halcyon/foo"),
+			files: seedSpec(FOO_INFO, "src/foo.spec.ts"),
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(dispatchedScript(captured)).toContain('"printBasicPrototype":false');
 		expect(dispatchedScript(captured)).not.toContain('"printBasicPrototype":true');
+		expect(dispatchedScript(captured)).not.toContain('"testPathPattern":');
 	});
 
 	it("should resolve printBasicPrototype for a luau package before dispatch", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({ [BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR } });
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: { [BAR_DIR]: rooted(BAR_DIR) },
+			entries: passingEntries("@halcyon/bar"),
+			files: seedSpec(BAR_INFO, "src/bar.spec.luau"),
+			run: {
+				packageInfos: [BAR_INFO],
+			},
 		});
 
 		expect(dispatchedScript(captured)).toContain('"printBasicPrototype":true');
@@ -366,28 +646,13 @@ describe(runWorkspaceAsync, () => {
 	it("should keep the resolved printBasicPrototype in a rebuilt script", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.ts")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: { [FOO_DIR]: rooted(FOO_DIR) },
+			entries: passingEntries("@halcyon/foo"),
+			files: seedSpec(FOO_INFO, "src/foo.spec.ts"),
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		const factory = captured.options!.scriptFactory;
@@ -403,36 +668,13 @@ describe(runWorkspaceAsync, () => {
 	it("should supply a factory that rebuilds the script for a subset of jobs", async () => {
 		expect.assertions(3);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR, testTimeout: 5678 },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testTimeout: 1234 },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: TIMEOUT_CONFIGS,
+			entries: passingEntries("@halcyon/foo", "@halcyon/bar"),
+			files: fooBarFiles(),
+			run: {
+				packageInfos: [FOO_INFO, BAR_INFO],
+			},
 		});
 
 		const factory = captured.options!.scriptFactory;
@@ -450,31 +692,10 @@ describe(runWorkspaceAsync, () => {
 	it("should forward a basename testPathPattern when --testPathPattern is a filesystem path", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ testPathPattern: "src/foo.spec" }),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		const { captured } = await runLuauFooAsync(
+			seedSpec(FOO_INFO, "src/foo.spec.luau"),
+			makeCli({ testPathPattern: "src/foo.spec" }),
+		);
 
 		expect(dispatchedScript(captured)).toContain('"testPathPattern":"(Pkg/foo\\\\.spec)"');
 		expect(dispatchedScript(captured)).not.toContain('"testPathPattern":"src/foo.spec"');
@@ -486,34 +707,10 @@ describe(runWorkspaceAsync, () => {
 	it("should forward the instance sub-path so a namesake spec is left out", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/a/index.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/b/index.spec.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ testPathPattern: "src/a/index.spec" }),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		const { captured } = await runLuauFooAsync(
+			seedSpec(FOO_INFO, "src/a/index.spec.luau", "src/b/index.spec.luau"),
+			makeCli({ testPathPattern: "src/a/index.spec" }),
+		);
 
 		expect(dispatchedScript(captured)).toContain('"testPathPattern":"(Pkg/a/index\\\\.spec)"');
 		expect(dispatchedScript(captured)).not.toContain('"testPathPattern":"(index\\\\.spec)"');
@@ -525,33 +722,27 @@ describe(runWorkspaceAsync, () => {
 	it("should narrow against the project's pinned mount, not the package tree", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/deep/thing.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
-			{ test: { displayName: "main", include: ["src/**/*.spec.luau"], outDir: "src/deep" } },
+			{
+				test: {
+					displayName: "main",
+					include: ["src/**/*.spec.luau"],
+					outDir: "src/deep",
+				},
+			},
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "main" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ testPathPattern: "src/deep/thing.spec" }),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "main")],
+			files: {
+				...seedSpec(FOO_INFO, "src/deep/thing.spec.luau"),
+			},
+			run: {
+				cli: makeCli({ testPathPattern: "src/deep/thing.spec" }),
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(dispatchedScript(captured)).toContain('"testPathPattern":"(deep/thing\\\\.spec)"');
@@ -560,31 +751,10 @@ describe(runWorkspaceAsync, () => {
 	it("should pass with no tests in a package the testPathPattern does not match", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ testPathPattern: "src/other-package.spec" }),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		const { captured } = await runLuauFooAsync(
+			seedSpec(FOO_INFO, "src/foo.spec.luau"),
+			makeCli({ testPathPattern: "src/other-package.spec" }),
+		);
 
 		expect(dispatchedScript(captured)).toContain('"passWithNoTests":true');
 		// The zero-matching pattern is intentionally retained (not cleared) so
@@ -598,44 +768,21 @@ describe(runWorkspaceAsync, () => {
 	it("should dispatch only the package a positional file names", async () => {
 		expect.assertions(3);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR, testMatch: ["**/*.spec.luau"] },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ files: [path.join(FOO_DIR, "src/foo.spec.luau")] }),
-			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured, fileSystem } = await runScenarioAsync({
+			configs: luauConfigs(BAR_DIR, FOO_DIR),
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: fooBarFiles(),
+			run: {
+				cli: makeCli({ files: [path.join(FOO_DIR, "src/foo.spec.luau")] }),
+				packageInfos: [FOO_INFO, BAR_INFO],
+			},
 		});
 
 		expect(captured.options!.jobs.map((job) => job.pkg)).toStrictEqual(["@halcyon/foo"]);
 
 		// The place carries only the named package, so the build shrinks with
 		// the selection rather than staging the whole workspace anyway.
-		const staged = vi.mocked(buildPlaceAsync).mock.lastCall![0].packages;
-
-		expect(staged.map((entry) => entry.name)).toStrictEqual(["@halcyon/foo"]);
+		expect(stagedPackages(fileSystem)).toStrictEqual(["@halcyon/foo"]);
 		expect(dispatchedScript(captured)).not.toContain("@halcyon/bar");
 	});
 
@@ -646,36 +793,15 @@ describe(runWorkspaceAsync, () => {
 	it("should resolve a relative positional against the invocation directory", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR, testMatch: ["**/*.spec.luau"] },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ files: ["src/foo.spec.luau"] }),
-			cwd: FOO_DIR,
-			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: luauConfigs(BAR_DIR, FOO_DIR),
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: fooBarFiles(),
+			run: {
+				cli: makeCli({ files: ["src/foo.spec.luau"] }),
+				cwd: FOO_DIR,
+				packageInfos: [FOO_INFO, BAR_INFO],
+			},
 		});
 
 		expect(captured.options!.jobs.map((job) => job.pkg)).toStrictEqual(["@halcyon/foo"]);
@@ -687,34 +813,10 @@ describe(runWorkspaceAsync, () => {
 	it("should narrow to the positional file's instance sub-path", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/a/index.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/b/index.spec.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ files: [path.join(FOO_DIR, "src/a/index.spec.luau")] }),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		const { captured } = await runLuauFooAsync(
+			seedSpec(FOO_INFO, "src/a/index.spec.luau", "src/b/index.spec.luau"),
+			makeCli({ files: [path.join(FOO_DIR, "src/a/index.spec.luau")] }),
+		);
 
 		expect(dispatchedScript(captured)).toContain('"testPathPattern":"(Pkg/a/index\\\\.spec)"');
 		expect(dispatchedScript(captured)).not.toContain("b/index");
@@ -726,37 +828,13 @@ describe(runWorkspaceAsync, () => {
 	it("should let a positional file override a testPathPattern given with it", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/a.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/b.spec.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({
+		const { captured } = await runLuauFooAsync(
+			seedSpec(FOO_INFO, "src/a.spec.luau", "src/b.spec.luau"),
+			makeCli({
 				files: [path.join(FOO_DIR, "src/a.spec.luau")],
 				testPathPattern: "src/b.spec",
 			}),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		);
 
 		expect(dispatchedScript(captured)).toContain('"testPathPattern":"(Pkg/a\\\\.spec)"');
 		expect(dispatchedScript(captured)).not.toContain('"testPathPattern":"src/b.spec"');
@@ -767,29 +845,19 @@ describe(runWorkspaceAsync, () => {
 	it("should reject a positional file no package owns, naming the roots searched", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.luau"] },
-		});
+		const { fileSystem } = stageWorkspace(
+			seedSpec(FOO_INFO, "src/foo.spec.luau"),
+			luauConfigs(FOO_DIR),
+		);
 
 		const { backend } = createStubBackend([]);
 
 		await expect(
-			runWorkspaceAsync({
+			runStagedWorkspaceAsync({
 				backend,
 				cli: makeCli({ files: [path.join(ROOT, "elsewhere/nope.spec.luau")] }),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			}),
 		).rejects.toThrow("No project contains the requested file(s):");
 	});
@@ -797,254 +865,105 @@ describe(runWorkspaceAsync, () => {
 	it("should synthesize one virtual project named after the package when projects: is absent", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured, results } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(dispatchedScript(captured)).toContain('"project":"@halcyon/foo"');
 		expect(results![0]!.displayName).toBe("@halcyon/foo");
 	});
 
-	it("should print a nested host [TIMING] report when TIMING is set", async () => {
-		expect.assertions(1);
+	it("should open every host phase, nesting each package's config load", async () => {
+		expect.assertions(2);
 
-		vi.stubEnv("TIMING", "1");
-		const writes: Array<string> = [];
-		vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
-			writes.push(String(chunk));
-			return true;
-		});
-
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
+		const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+			[FOO_DIR]: rooted(FOO_DIR),
 		});
 
 		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 		]);
 
-		// Lifecycle (create + flush) moved to `runJestRoblox` so a single
-		// collector covers single/multi/workspace modes. Tests that exercise
-		// `runWorkspace` directly must own that lifecycle themselves.
-		const timing = createTimingCollector();
-		try {
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				timing,
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
-		} finally {
-			timing.flushTimingReport();
-		}
+		const { collector, paths } = recordingTimingCollector();
+		await runStagedWorkspaceAsync({
+			backend,
+			fileSystem,
+			packageInfos: [FOO_INFO],
+			timing: collector,
+		});
 
-		const timingLines = writes
-			.join("")
-			.split("\n")
-			.filter((line) => line.startsWith("[TIMING]"));
-
-		expect(timingLines).toStrictEqual(
+		expect(paths).toStrictEqual(
 			expect.arrayContaining([
-				expect.stringMatching(/^\[TIMING] loadPackages: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] {3}load-config:@halcyon\/foo: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] resolveContexts: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] discoverTests: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] buildStubs: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] buildJobs: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] prepareDispatch: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] runProjects: \d+ms$/),
-				expect.stringMatching(/^\[TIMING] TOTAL \(host\): \d+ms$/),
+				"loadPackages",
+				"loadPackages > load-config:@halcyon/foo",
+				"resolveContexts",
+				"discoverTests",
+				"buildStubs",
+				"buildJobs",
+				"prepareDispatch",
+				"runProjects",
 			]),
 		);
+		expect(collector.flushTimingReport).not.toHaveBeenCalled();
 	});
 
-	it("should report a host phase and its subtree before the report is flushed", async () => {
-		expect.assertions(2);
+	it("should open the host phases before a later phase throws", async () => {
+		expect.assertions(3);
 
-		vi.stubEnv("TIMING", "1");
-		const writes: Array<string> = [];
-		vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
-			writes.push(String(chunk));
-			return true;
-		});
-
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
+		const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+			[FOO_DIR]: rooted(FOO_DIR),
 		});
 
 		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 		]);
 
-		// Deliberately no flush: every line asserted here must have been
-		// written while the run was still in progress.
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			timing: createTimingCollector(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		const { collector, paths } = recordingTimingCollector();
 
-		const timingLines = writes
-			.join("")
-			.split("\n")
-			.filter((line) => line.startsWith("[TIMING]"));
-
-		expect(timingLines).toContainEqual(
-			expect.stringMatching(/^\[TIMING] loadPackages: \d+ms$/),
-		);
-		expect(timingLines).toContainEqual(
-			expect.stringMatching(/^\[TIMING] {3}load-config:@halcyon\/foo: \d+ms$/),
-		);
-	});
-
-	it("should still flush the [TIMING] report when a phase throws", async () => {
-		expect.assertions(2);
-
-		vi.stubEnv("TIMING", "1");
-		const writes: Array<string> = [];
-		vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
-			writes.push(String(chunk));
-			return true;
-		});
-
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
+		await expect(
+			runStagedWorkspaceAsync({
+				backend,
+				childProcess: failingRojo("rojo boom"),
+				fileSystem,
+				packageInfos: [FOO_INFO],
+				timing: collector,
 			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
+		).rejects.toThrow("rojo boom");
 
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
-
-		vi.mocked(buildPlaceAsync).mockImplementationOnce(async () => {
-			throw new Error("rojo boom");
-		});
-
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		// Caller-owned try/finally must still flush — the test asserts the
-		// host waterfall lands even when a profiled phase throws (lute
-		// missing, rojo build failure, dispatch timeout).
-		const timing = createTimingCollector();
-		try {
-			await expect(
-				runWorkspaceAsync({
-					backend,
-					cli: makeCli(),
-					packageInfos: [FOO_INFO],
-					runOptions: makeRunOptions(),
-					timing,
-					version: "0.0.0-test",
-					workspaceRoot: ROOT,
-				}),
-			).rejects.toThrow("rojo boom");
-		} finally {
-			timing.flushTimingReport();
-		}
-
-		const timingLines = writes
-			.join("")
-			.split("\n")
-			.filter((line) => line.startsWith("[TIMING]"));
-
-		expect(timingLines).toContainEqual(
-			expect.stringMatching(/^\[TIMING] TOTAL \(host\): \d+ms$/),
-		);
+		expect(paths).toContain("loadPackages");
+		expect(paths).not.toContain("runProjects");
 	});
 
 	it("should pass through explicit projects when present, not virtual-wrap", async () => {
 		expect.assertions(3);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "out/Client/foo.spec.luau")]: "",
-					[path.join(FOO_DIR, "out/Server/bar.spec.luau")]: "",
-				},
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Client: { $path: "out/Client" } },
-					ServerScriptService: { Server: { $path: "out/Server" } },
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
-			{ test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] } },
-			{ test: { displayName: "server", include: ["out/Server/**/*.spec.luau"] } },
+			{
+				test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] },
+			},
+			{
+				test: { displayName: "server", include: ["out/Server/**/*.spec.luau"] },
+			},
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "server" },
-		]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured, results } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
+			},
+			entries: [
+				passingProjectEntry("@halcyon/foo", "client"),
+				passingProjectEntry("@halcyon/foo", "server"),
+			],
+			files: clientServerFooFiles(),
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(dispatchedScript(captured)).toContain('"project":"client"');
@@ -1055,18 +974,6 @@ describe(runWorkspaceAsync, () => {
 	it("should drop runtime test files matching a per-project exclude glob", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/a.gen.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/a.spec.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
 			{
 				test: {
@@ -1076,21 +983,15 @@ describe(runWorkspaceAsync, () => {
 				},
 			},
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "main" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "main")],
+			files: seedSpec(FOO_INFO, "src/a.gen.spec.luau", "src/a.spec.luau"),
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(captured.options!.jobs[0]!.testFiles).toStrictEqual(["src/a.spec.luau"]);
@@ -1099,35 +1000,19 @@ describe(runWorkspaceAsync, () => {
 	it("should drop runtime test files matching a package-level test.exclude glob", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/a.gen.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/a.spec.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		// No `projects:` — the package's global `test.exclude` must flow into the
 		// synthesized virtual project, mirroring single-mode `test.exclude`.
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, exclude: ["**/*.gen.spec.luau"], rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, {
+					exclude: ["**/*.gen.spec.luau"],
+				}),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: seedSpec(FOO_INFO, "src/a.gen.spec.luau", "src/a.spec.luau"),
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(captured.options!.jobs[0]!.testFiles).toStrictEqual(["src/a.spec.luau"]);
@@ -1136,9 +1021,10 @@ describe(runWorkspaceAsync, () => {
 	it("should pre-flight clean marker-bearing leftover stubs from package source and emit a stderr notice", async () => {
 		expect.assertions(2);
 
-		vol.reset();
+		const { fileSystem, volume } = createMemoryFileSystem();
+
 		const leftoverStub = path.join(FOO_DIR, "out/Client/jest.config.luau");
-		vol.fromJSON({
+		volume.fromJSON({
 			...seedPackage(FOO_DIR, {
 				name: "@halcyon/foo",
 				specFiles: { [path.join(FOO_DIR, "out/Client/spec.spec.luau")]: "" },
@@ -1148,43 +1034,39 @@ describe(runWorkspaceAsync, () => {
 				},
 			}),
 			[leftoverStub]: "-- Auto-generated by jest-roblox (do not edit)\nreturn {}\n",
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			...WORKSPACE_YAML,
 		});
 
 		const projects = makeProjectEntries([
-			{ test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] } },
+			{
+				test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] },
+			},
 		]);
 		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
+			[FOO_DIR]: rooted(FOO_DIR, { projects }),
 		});
 
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" },
-		]);
+		const { backend } = createStubBackend([passingProjectEntry("@halcyon/foo", "client")]);
 
 		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
-		await runWorkspaceAsync({
+		await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
-		expect(vol.existsSync(leftoverStub)).toBeFalse();
+		expect(volume.existsSync(leftoverStub)).toBeFalse();
 		expect(stderr).toHaveBeenCalledWith(
 			`jest-roblox: cleaned 1 leftover stub(s) from @halcyon/foo:\n  ${leftoverStub}\n`,
 		);
 	});
 
-	it("should skip stubMounts construction for mounts that already have a user-authored config on disk", async () => {
-		expect.assertions(2);
+	it("should run a project jest.config.luau that holds code through the run's runner", async () => {
+		expect.assertions(1);
 
-		vol.reset();
-		const userConfigPath = path.join(FOO_DIR, "out/Client/jest.config.luau");
-		vol.fromJSON({
+		const { fileSystem, volume } = createMemoryFileSystem();
+		volume.fromJSON({
 			...seedPackage(FOO_DIR, {
 				name: "@halcyon/foo",
 				specFiles: { [path.join(FOO_DIR, "out/Client/spec.spec.luau")]: "" },
@@ -1193,80 +1075,103 @@ describe(runWorkspaceAsync, () => {
 					ReplicatedStorage: { Client: { $path: "out/Client" } },
 				},
 			}),
+			[path.join(FOO_DIR, "out/Client/jest.config.luau")]:
+				'return { displayName = "client" .. "-luau" }\n',
 			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			// User-authored config (no marker) at the mount —
-			// `hasUserAuthoredConfig` should return true and the stubMount
-			// construction must skip it.
+		});
+		setLoadedConfigPerPackage({
+			[FOO_DIR]: rooted(FOO_DIR, { projects: ["out/Client"] }),
+		});
+
+		await expect(
+			runStagedWorkspaceAsync({
+				childProcess: createLuteChildProcess({ version: "9.9.9" }),
+				cli: makeCli(),
+				fileSystem,
+				packageInfos: [FOO_INFO],
+				runOptions: makeRunOptions(),
+				version: "0.0.0-test",
+				workspaceRoot: ROOT,
+			}),
+		).rejects.toThrow('--version" printed "9.9.9"');
+	});
+
+	it("should write a cache stub for a mount that holds a user-authored config", async () => {
+		expect.assertions(2);
+
+		const { fileSystem, volume } = createMemoryFileSystem();
+
+		const userConfigPath = path.join(FOO_DIR, "out/Client/jest.config.luau");
+		volume.fromJSON({
+			...seedPackage(FOO_DIR, {
+				name: "@halcyon/foo",
+				specFiles: { [path.join(FOO_DIR, "out/Client/spec.spec.luau")]: "" },
+				tree: {
+					$className: "DataModel",
+					ReplicatedStorage: { Client: { $path: "out/Client" } },
+				},
+			}),
+			...WORKSPACE_YAML,
 			[userConfigPath]: "return { displayName = 'user-shared' }\n",
 		});
 
 		const projects = makeProjectEntries([
-			{ test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] } },
+			{
+				test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] },
+			},
 		]);
 		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
+			[FOO_DIR]: rooted(FOO_DIR, { projects }),
 		});
 
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" },
-		]);
+		const { backend } = createStubBackend([passingProjectEntry("@halcyon/foo", "client")]);
 
-		await runWorkspaceAsync({
+		await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
-		// User file survives the run (cleanLeftoverStubs only touches markers).
-		expect(vol.existsSync(userConfigPath)).toBeTrue();
+		expect(volume.readFileSync(userConfigPath, "utf8")).toBe(
+			"return { displayName = 'user-shared' }\n",
+		);
 
-		// And the cache stub was NOT written for that mount because
-		// hasUserAuthoredConfig short-circuited generateProjectStubs.
 		const cacheStub = path.join(
 			ROOT,
 			".jest-roblox/workspace/@halcyon/foo/out/Client/jest.config.luau",
 		);
 
-		expect(vol.existsSync(cacheStub)).toBeFalse();
+		expect(volume.readFileSync(cacheStub, "utf8")).toStartWith(
+			"-- Auto-generated by jest-roblox (do not edit)\n",
+		);
 	});
 
 	it("should write stubs into the workspace cache, not into package source", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "out/Client/spec.spec.luau")]: "" },
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Client: { $path: "out/Client" } },
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
-			{ test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] } },
+			{
+				test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] },
+			},
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
-		});
-
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { volume } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "client")],
+			files: {
+				...seedPackage(FOO_DIR, {
+					name: "@halcyon/foo",
+					specFiles: { [path.join(FOO_DIR, "out/Client/spec.spec.luau")]: "" },
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { Client: { $path: "out/Client" } },
+					},
+				}),
+			},
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		const cacheStub = path.join(
@@ -1275,65 +1180,61 @@ describe(runWorkspaceAsync, () => {
 		);
 		const sourceStub = path.join(FOO_DIR, "out/Client/jest.config.luau");
 
-		expect(vol.existsSync(cacheStub)).toBeTrue();
-		expect(vol.existsSync(sourceStub)).toBeFalse();
+		expect(volume.existsSync(cacheStub)).toBeTrue();
+		expect(volume.existsSync(sourceStub)).toBeFalse();
 	});
 
 	it("should fan out (P × N) jobs, one per (package, project) pair", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "out/Client/foo.spec.luau")]: "",
-					[path.join(FOO_DIR, "out/Server/foo.spec.luau")]: "",
-				},
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Client: { $path: "out/Client" } },
-					ServerScriptService: { Server: { $path: "out/Server" } },
-				},
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: {
-					[path.join(BAR_DIR, "out/Client/bar.spec.luau")]: "",
-					[path.join(BAR_DIR, "out/Server/bar.spec.luau")]: "",
-				},
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Client: { $path: "out/Client" } },
-					ServerScriptService: { Server: { $path: "out/Server" } },
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
-			{ test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] } },
-			{ test: { displayName: "server", include: ["out/Server/**/*.spec.luau"] } },
+			{
+				test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] },
+			},
+			{
+				test: { displayName: "server", include: ["out/Server/**/*.spec.luau"] },
+			},
 		]);
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: BAR_DIR },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "server" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar", project: "client" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar", project: "server" },
-		]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured, results } = await runScenarioAsync({
+			configs: {
+				[BAR_DIR]: rooted(BAR_DIR, { projects }),
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
+			},
+			entries: [
+				passingProjectEntry("@halcyon/foo", "client"),
+				passingProjectEntry("@halcyon/foo", "server"),
+				passingProjectEntry("@halcyon/bar", "client"),
+				passingProjectEntry("@halcyon/bar", "server"),
+			],
+			files: {
+				...seedPackage(FOO_DIR, {
+					name: "@halcyon/foo",
+					specFiles: {
+						[path.join(FOO_DIR, "out/Client/foo.spec.luau")]: "",
+						[path.join(FOO_DIR, "out/Server/foo.spec.luau")]: "",
+					},
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { Client: { $path: "out/Client" } },
+						ServerScriptService: { Server: { $path: "out/Server" } },
+					},
+				}),
+				...seedPackage(BAR_DIR, {
+					name: "@halcyon/bar",
+					specFiles: {
+						[path.join(BAR_DIR, "out/Client/bar.spec.luau")]: "",
+						[path.join(BAR_DIR, "out/Server/bar.spec.luau")]: "",
+					},
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { Client: { $path: "out/Client" } },
+						ServerScriptService: { Server: { $path: "out/Server" } },
+					},
+				}),
+			},
+			run: {
+				packageInfos: [FOO_INFO, BAR_INFO],
+			},
 		});
 
 		expect(captured.options!.jobs).toHaveLength(4);
@@ -1343,42 +1244,37 @@ describe(runWorkspaceAsync, () => {
 	it("should keep only filtered project displayNames when --project is set", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "out/Client/spec.spec.luau")]: "",
-					[path.join(FOO_DIR, "out/Server/spec.spec.luau")]: "",
-				},
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Client: { $path: "out/Client" } },
-					ServerScriptService: { Server: { $path: "out/Server" } },
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
-			{ test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] } },
-			{ test: { displayName: "server", include: ["out/Server/**/*.spec.luau"] } },
+			{
+				test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] },
+			},
+			{
+				test: { displayName: "server", include: ["out/Server/**/*.spec.luau"] },
+			},
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
-		});
-
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" },
-		]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli({ project: ["client"] }),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { results } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "client")],
+			files: {
+				...seedPackage(FOO_DIR, {
+					name: "@halcyon/foo",
+					specFiles: {
+						[path.join(FOO_DIR, "out/Client/spec.spec.luau")]: "",
+						[path.join(FOO_DIR, "out/Server/spec.spec.luau")]: "",
+					},
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { Client: { $path: "out/Client" } },
+						ServerScriptService: { Server: { $path: "out/Server" } },
+					},
+				}),
+			},
+			run: {
+				cli: makeCli({ project: ["client"] }),
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(results).toHaveLength(1);
@@ -1388,29 +1284,18 @@ describe(runWorkspaceAsync, () => {
 	it("should throw when --project filter names match no project across packages", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
+		const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+			[FOO_DIR]: rooted(FOO_DIR),
 		});
 
 		const { backend } = createStubBackend([]);
 
 		await expect(
-			runWorkspaceAsync({
+			runStagedWorkspaceAsync({
 				backend,
 				cli: makeCli({ project: ["nonexistent"] }),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			}),
 		).rejects.toThrow(/Unknown project name/);
 	});
@@ -1418,57 +1303,9 @@ describe(runWorkspaceAsync, () => {
 	it("should resolve per-project setupFiles and setupFilesAfterEnv against the package's rojo tree", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/Shared/setup.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				setupFiles: ["./src/Shared/setup.luau"],
-				setupFilesAfterEnv: ["./src/Shared/setup.luau"],
-			},
-		});
-
-		// Mock the RojoResolver so the resolver's filesystem walk is skipped and
-		// these tests stay focused on workspace orchestration.
-		const mapping = {
-			[path.resolve(FOO_DIR, "./src/Shared/setup.luau")]: [
-				"ReplicatedStorage",
-				"Pkg",
-				"Shared",
-				"setup",
-			],
-		} satisfies Record<string, Array<string>>;
-		const { RojoResolver } = await import("@isentinel/rojo-utils");
-		vi.spyOn(RojoResolver, "fromPath").mockReturnValue(
-			fromAny({
-				getRbxPathFromFilePath(filePath: string) {
-					return mapping[filePath];
-				},
-			}),
-		);
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runSetupFooAsync({
+			setupFiles: SETUP,
+			setupFilesAfterEnv: SETUP,
 		});
 
 		// The resolver replaces the filesystem string with the DataModel
@@ -1486,85 +1323,33 @@ describe(runWorkspaceAsync, () => {
 	it("should not build a rojo resolver for packages without setup files", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+		const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+			[FOO_DIR]: rooted(FOO_DIR),
 		});
 
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
-
-		const { RojoResolver } = await import("@isentinel/rojo-utils");
-		const fromPathSpy = vi.spyOn(RojoResolver, "fromPath");
+		const createResolver = vi.fn<RojoResolverFactory>();
 
 		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 		]);
 
-		await runWorkspaceAsync({
+		await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			createResolver,
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		// No project declares setupFiles/setupFilesAfterEnv, so the costly
 		// RojoResolver tree walk must be skipped entirely — it is the dominant
 		// resolveContexts cost and resolves nothing here.
-		expect(fromPathSpy).not.toHaveBeenCalled();
+		expect(createResolver).not.toHaveBeenCalled();
 	});
 
 	it("should resolve a project that declares only setupFiles", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/Shared/setup.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				setupFiles: ["./src/Shared/setup.luau"],
-			},
-		});
-
-		const { RojoResolver } = await import("@isentinel/rojo-utils");
-		vi.spyOn(RojoResolver, "fromPath").mockReturnValue(
-			fromAny({
-				getRbxPathFromFilePath() {
-					return ["ReplicatedStorage", "Pkg", "Shared", "setup"];
-				},
-			}),
-		);
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		const { captured } = await runSetupFooAsync({ setupFiles: SETUP });
 
 		expect(dispatchedScript(captured)).toContain(
 			'"setupFiles":["ReplicatedStorage/Pkg/Shared/setup"]',
@@ -1575,47 +1360,7 @@ describe(runWorkspaceAsync, () => {
 	it("should resolve a project that declares only setupFilesAfterEnv", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/Shared/setup.luau")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				setupFilesAfterEnv: ["./src/Shared/setup.luau"],
-			},
-		});
-
-		const { RojoResolver } = await import("@isentinel/rojo-utils");
-		vi.spyOn(RojoResolver, "fromPath").mockReturnValue(
-			fromAny({
-				getRbxPathFromFilePath() {
-					return ["ReplicatedStorage", "Pkg", "Shared", "setup"];
-				},
-			}),
-		);
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
+		const { captured } = await runSetupFooAsync({ setupFilesAfterEnv: SETUP });
 
 		expect(dispatchedScript(captured)).toContain(
 			'"setupFilesAfterEnv":["ReplicatedStorage/Pkg/Shared/setup"]',
@@ -1626,57 +1371,45 @@ describe(runWorkspaceAsync, () => {
 	it("should honor per-package rojoProject from each package's own jest.config", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			[path.join(BAR_DIR, "custom.project.json")]: packageJson({
-				name: "bar-test",
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Pkg: { $path: "src" } },
-				},
-			}),
-			[path.join(BAR_DIR, "jest.config.ts")]: "export default {}",
-			// Bar has ONLY custom.project.json — no test.project.json on disk.
-			// Bar's per-package config sets rojoProject: "custom.project.json".
-			// If the per-package value is ignored, preflight fails because the
-			// default test.project.json does not exist at Bar.
-			[path.join(BAR_DIR, "package.json")]: packageJson({ name: "@halcyon/bar" }),
-			[path.join(BAR_DIR, "src/bar.spec.luau")]: "",
-			[path.join(FOO_DIR, "jest.config.ts")]: "export default {}",
-			[path.join(FOO_DIR, "package.json")]: packageJson({ name: "@halcyon/foo" }),
-			[path.join(FOO_DIR, "src/foo.spec.luau")]: "",
-			// Foo has only test.project.json (default).
-			[path.join(FOO_DIR, "test.project.json")]: packageJson({
-				name: "foo-test",
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Pkg: { $path: "src" } },
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: {
-				...DEFAULT_CONFIG,
-				rojoProject: "custom.project.json",
-				rootDir: BAR_DIR,
+		const { fileSystem } = stageWorkspace(
+			{
+				// Bar has ONLY custom.project.json — no test.project.json on
+				// disk. Bar's per-package config sets rojoProject:
+				// "custom.project.json". If the per-package value is ignored,
+				// preflight fails because the default test.project.json does not
+				// exist at Bar.
+				...customProjectBarFiles(),
+				[path.join(FOO_DIR, "jest.config.ts")]: "export default {}",
+				[path.join(FOO_DIR, "package.json")]: packageJson({
+					name: "@halcyon/foo",
+				}),
+				[path.join(FOO_DIR, "src/foo.spec.luau")]: "",
+				// Foo has only test.project.json (default).
+				[path.join(FOO_DIR, "test.project.json")]: packageJson({
+					name: "foo-test",
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { Pkg: { $path: "src" } },
+					},
+				}),
 			},
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
+			{
+				[BAR_DIR]: rooted(BAR_DIR, {
+					rojoProject: "custom.project.json",
+				}),
+				[FOO_DIR]: rooted(FOO_DIR),
+			},
+		);
 
 		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar", project: "@halcyon/bar" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
+			passingProjectEntry("@halcyon/bar", "@halcyon/bar"),
 		]);
 
 		const results = await runWorkspaceResultsAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		// Both packages produce jobs because each package's own rojoProject
@@ -1689,51 +1422,43 @@ describe(runWorkspaceAsync, () => {
 	it("should resolve a Nevermore-style subdir rojoProject that mounts the package via '..'", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			// Package manifest maps src to the tree root (standard Wally layout).
-			[path.join(FOO_DIR, "default.project.json")]: packageJson({
-				name: "foo",
-				tree: { $path: "src" },
-			}),
-			[path.join(FOO_DIR, "jest.config.ts")]: "export default {}",
-			[path.join(FOO_DIR, "package.json")]: packageJson({ name: "@halcyon/foo" }),
-			[path.join(FOO_DIR, "src/foo.spec.lua")]: "",
-			// Test harness lives in a subdirectory and mounts the package via
-			// "..", which Rojo resolves through the package default.project.json.
-			[path.join(FOO_DIR, "test/default.project.json")]: packageJson({
-				name: "foo-test",
-				tree: {
-					$className: "DataModel",
-					ServerScriptService: { Pkg: { $path: ".." } },
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
 			{ test: { displayName: "@halcyon/foo", include: ["src/**/*.spec.lua"] } },
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				projects,
-				rojoProject: "test/default.project.json",
-				rootDir: FOO_DIR,
+		const { captured, results } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, {
+					projects,
+					rojoProject: "test/default.project.json",
+				}),
 			},
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: {
+				// Package manifest maps src to the tree root (standard Wally
+				// layout).
+				[path.join(FOO_DIR, "default.project.json")]: packageJson({
+					name: "foo",
+					tree: { $path: "src" },
+				}),
+				[path.join(FOO_DIR, "jest.config.ts")]: "export default {}",
+				[path.join(FOO_DIR, "package.json")]: packageJson({
+					name: "@halcyon/foo",
+				}),
+				[path.join(FOO_DIR, "src/foo.spec.lua")]: "",
+				// Test harness lives in a subdirectory and mounts the package via
+				// "..", which Rojo resolves through the package
+				// default.project.json.
+				[path.join(FOO_DIR, "test/default.project.json")]: packageJson({
+					name: "foo-test",
+					tree: {
+						$className: "DataModel",
+						ServerScriptService: { Pkg: { $path: ".." } },
+					},
+				}),
+			},
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		// The "src" include root (package-relative) resolves through the
@@ -1751,30 +1476,20 @@ describe(runWorkspaceAsync, () => {
 	it("should NOT fall back to workspace-root config.rojoProject when the package config omits it", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			[path.join(BAR_DIR, "custom.project.json")]: packageJson({
-				name: "bar-test",
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Pkg: { $path: "src" } },
-				},
-			}),
-			[path.join(BAR_DIR, "jest.config.ts")]: "export default {}",
-			[path.join(BAR_DIR, "package.json")]: packageJson({ name: "@halcyon/bar" }),
-			[path.join(BAR_DIR, "src/bar.spec.luau")]: "",
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		// Bar's per-pkg config has no rojoProject — previously the middle
 		// arm of `pkg ?? config ?? DEFAULT` would pick up the workspace-root
 		// value below and resolve "custom.project.json". After the collapse,
 		// resolution falls straight to `ROJO_PROJECT_DEFAULT`
 		// ("test.project.json") — which does not exist at BAR_DIR, so preflight
 		// fails.
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR },
-		});
+		const { fileSystem } = stageWorkspace(
+			{
+				...customProjectBarFiles(),
+			},
+			{
+				[BAR_DIR]: rooted(BAR_DIR),
+			},
+		);
 
 		const { backend } = createStubBackend([]);
 
@@ -1782,11 +1497,8 @@ describe(runWorkspaceAsync, () => {
 
 		const results = await runWorkspaceResultsAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		stderr.mockRestore();
@@ -1797,35 +1509,21 @@ describe(runWorkspaceAsync, () => {
 	it("should drop empty packages from the materializer payload while keeping packages with specs", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/a.spec.luau")]: "",
-					[path.join(FOO_DIR, "src/b.spec.luau")]: "",
-				},
-			}),
-			...seedPackage(BAR_DIR, { name: "@halcyon/bar" }),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, passWithNoTests: true, rootDir: BAR_DIR },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured, results } = await runScenarioAsync({
+			configs: {
+				[BAR_DIR]: rooted(BAR_DIR, {
+					passWithNoTests: true,
+				}),
+				[FOO_DIR]: rooted(FOO_DIR),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: {
+				...seedSpec(FOO_INFO, "src/a.spec.luau", "src/b.spec.luau"),
+				...seedPackage(BAR_DIR, { name: "@halcyon/bar" }),
+			},
+			run: {
+				packageInfos: [FOO_INFO, BAR_INFO],
+			},
 		});
 
 		// The empty bar package must NOT produce a job; only foo's job is
@@ -1835,58 +1533,54 @@ describe(runWorkspaceAsync, () => {
 	});
 
 	it("should pass with no tests when passWithNoTests is true and zero specs are discovered", async () => {
-		expect.assertions(1);
+		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, { name: "@halcyon/foo" }),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, passWithNoTests: true, rootDir: FOO_DIR },
-		});
+		const { fileSystem } = stageWorkspace(
+			{ ...seedPackage(FOO_DIR, { name: "@halcyon/foo" }) },
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					passWithNoTests: true,
+				}),
+			},
+		);
 
 		const { backend } = createStubBackend([]);
+		const mkdir = vi.spyOn(fileSystem, "mkdirSync");
 
 		const results = await runWorkspaceResultsAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+			runOptions: makeRunOptions({ workspaceOutputFile: true }),
 		});
 
 		expect(results).toStrictEqual([]);
+		expect(mkdir).not.toHaveBeenCalledWith(
+			path.join(ROOT, ".jest-roblox", "output"),
+			expect.anything(),
+		);
 	});
 
 	it("should honor per-package passWithNoTests when the workspace config does not set it", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, { name: "@halcyon/foo" }),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		// Package opts in to passWithNoTests via its OWN jest.config; the
 		// workspace-level config has no real global. Workspace mode must
 		// consult the per-package value, not aggregate over the workspace
 		// root.
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, passWithNoTests: true, rootDir: FOO_DIR },
-		});
-
-		const { backend } = createStubBackend([]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { results } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, {
+					passWithNoTests: true,
+				}),
+			},
+			entries: [],
+			files: {
+				...seedPackage(FOO_DIR, { name: "@halcyon/foo" }),
+			},
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		expect(results).toStrictEqual([]);
@@ -1895,29 +1589,29 @@ describe(runWorkspaceAsync, () => {
 	it("should error when one package has zero tests and its own passWithNoTests is false even if another package opts in", async () => {
 		expect.assertions(3);
 
-		vol.reset();
+		const { fileSystem, volume } = createMemoryFileSystem();
+
 		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
-		vol.fromJSON({
+		volume.fromJSON({
 			...seedPackage(FOO_DIR, { name: "@halcyon/foo" }),
 			...seedPackage(BAR_DIR, { name: "@halcyon/bar" }),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			...WORKSPACE_YAML,
 		});
 
 		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, passWithNoTests: true, rootDir: FOO_DIR },
+			[BAR_DIR]: rooted(BAR_DIR),
+			[FOO_DIR]: rooted(FOO_DIR, {
+				passWithNoTests: true,
+			}),
 		});
 
 		const { backend } = createStubBackend([]);
 
 		const results = await runWorkspaceResultsAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		expect(results).toBeUndefined();
@@ -1925,77 +1619,32 @@ describe(runWorkspaceAsync, () => {
 		expect(stderr).not.toHaveBeenCalledWith(expect.stringMatching(/@halcyon\/foo/));
 	});
 
-	it("should error 2 with no tests when passWithNoTests is false", async () => {
-		expect.assertions(2);
-
-		vol.reset();
-		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, { name: "@halcyon/foo" }),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
-
-		const { backend } = createStubBackend([]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		expect(results).toBeUndefined();
-		expect(stderr).toHaveBeenCalledWith(
-			expect.stringMatching(/No test files found in package @halcyon\/foo/),
-		);
-	});
-
 	it("should map each backend result to a WorkspaceProjectResult preserving pkg + project axes", async () => {
 		expect.assertions(4);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-			}),
-			...seedPackage(BAZ_DIR, {
-				name: "@halcyon/baz",
-				specFiles: { [path.join(BAZ_DIR, "src/baz.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR },
-			[BAZ_DIR]: { ...DEFAULT_CONFIG, rootDir: BAZ_DIR },
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
-
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-			{ jestOutput: failingResult(), pkg: "@halcyon/bar", project: "@halcyon/bar" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/baz", project: "@halcyon/baz" },
-		]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO, BAR_INFO, BAZ_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { results } = await runScenarioAsync({
+			configs: {
+				[BAR_DIR]: rooted(BAR_DIR),
+				[BAZ_DIR]: rooted(BAZ_DIR),
+				[FOO_DIR]: rooted(FOO_DIR),
+			},
+			entries: [
+				passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
+				{
+					jestOutput: failingResult(),
+					pkg: "@halcyon/bar",
+					project: "@halcyon/bar",
+				},
+				passingProjectEntry("@halcyon/baz", "@halcyon/baz"),
+			],
+			files: {
+				...seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				...seedSpec(BAR_INFO, "src/bar.spec.luau"),
+				...seedSpec(BAZ_INFO, "src/baz.spec.luau"),
+			},
+			run: {
+				packageInfos: [FOO_INFO, BAR_INFO, BAZ_INFO],
+			},
 		});
 
 		expect(results!.map((entry) => entry.pkg)).toStrictEqual([
@@ -2008,119 +1657,76 @@ describe(runWorkspaceAsync, () => {
 		expect(results![2]!.result.exitCode).toBe(0);
 	});
 
-	it("should surface preflight errors and skip the backend", async () => {
-		expect.assertions(3);
-
-		vol.reset();
-		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-
-		vol.fromJSON({
-			[path.join(BAR_DIR, "package.json")]: packageJson({ name: "@halcyon/bar" }),
-			[path.join(FOO_DIR, "package.json")]: packageJson({ name: "@halcyon/foo" }),
-			[path.join(FOO_DIR, "test.project.json")]: packageJson({
-				name: "foo-test",
-				tree: { $className: "DataModel" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		const { backend } = createStubBackend([]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		expect(results).toBeUndefined();
-		expect(stderr).toHaveBeenCalledWith("Pre-flight validation failed:\n");
-		expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/@halcyon\/bar/));
-	});
-
 	it("should auto-create $path directories that have child entries even with extension", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			[path.join(FOO_DIR, "package.json")]: packageJson({ name: "@halcyon/foo" }),
-			// Pre-existing leaf-file mount lets ensure-paths see a $path with
-			// extension and no children — should NOT be created as a directory.
-			[path.join(FOO_DIR, "src/init.luau")]: "return {}",
-			[path.join(FOO_DIR, "test.project.json")]: packageJson({
-				name: "foo-test",
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: {
-						Container: {
-							$path: "src/has.dot",
-							Inner: { $className: "Folder" },
-						},
-						Leaf: { $path: "src/init.luau" },
-					},
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		const projects = makeProjectEntries([
-			{ test: { displayName: "main", include: ["src/has.dot/**/*.spec.luau"] } },
+			{
+				test: { displayName: "main", include: ["src/has.dot/**/*.spec.luau"] },
+			},
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
+		const { volume } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
+			},
+			entries: [],
+			files: {
+				[path.join(FOO_DIR, "package.json")]: packageJson({
+					name: "@halcyon/foo",
+				}),
+				// Pre-existing leaf-file mount lets ensure-paths see a $path with
+				// extension and no children — should NOT be created as a
+				// directory.
+				[path.join(FOO_DIR, "src/init.luau")]: "return {}",
+				[path.join(FOO_DIR, "test.project.json")]: packageJson({
+					name: "foo-test",
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: {
+							Container: {
+								$path: "src/has.dot",
+								Inner: { $className: "Folder" },
+							},
+							Leaf: { $path: "src/init.luau" },
+						},
+					},
+				}),
+			},
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
-		const { backend } = createStubBackend([]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		expect(vol.existsSync(path.join(FOO_DIR, "src/has.dot"))).toBeTrue();
+		expect(volume.existsSync(path.join(FOO_DIR, "src/has.dot"))).toBeTrue();
 		// init.luau wasn't directory-created (would clobber the existing file).
-		expect(vol.statSync(path.join(FOO_DIR, "src/init.luau")).isFile()).toBeTrue();
+		expect(volume.statSync(path.join(FOO_DIR, "src/init.luau")).isFile()).toBeTrue();
 	});
 
 	it("should include dotted-name directories as virtual-wrap mounts", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			[path.join(FOO_DIR, "package.json")]: packageJson({ name: "@halcyon/foo" }),
-			[path.join(FOO_DIR, "src/has.dot/spec.spec.luau")]: "",
-			[path.join(FOO_DIR, "test.project.json")]: packageJson({
-				name: "foo-test",
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Container: { $path: "src/has.dot" } },
-				},
-			}),
-			...emptyJestConfig(FOO_DIR),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-		});
-
-		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
+		const { captured } = await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: {
+				[path.join(FOO_DIR, "package.json")]: packageJson({
+					name: "@halcyon/foo",
+				}),
+				[path.join(FOO_DIR, "src/has.dot/spec.spec.luau")]: "",
+				[path.join(FOO_DIR, "test.project.json")]: packageJson({
+					name: "foo-test",
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { Container: { $path: "src/has.dot" } },
+					},
+				}),
+				...emptyJestConfig(FOO_DIR),
+			},
+			run: {
+				packageInfos: [FOO_INFO],
+			},
 		});
 
 		// The virtual-wrap project must include the dotted-name directory
@@ -2129,90 +1735,17 @@ describe(runWorkspaceAsync, () => {
 		expect(captured.options!.jobs).toHaveLength(1);
 	});
 
-	it("should defer malformed rojo project to preflight without crashing ensure-paths", async () => {
-		expect.assertions(2);
-
-		vol.reset();
-		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-
-		vol.fromJSON({
-			[path.join(FOO_DIR, "package.json")]: packageJson({ name: "@halcyon/foo" }),
-			[path.join(FOO_DIR, "test.project.json")]: "not valid json {{",
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		const { backend } = createStubBackend([]);
-
-		const results = await runWorkspaceResultsAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		expect(results).toBeUndefined();
-		expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/failed to parse rojoProject/));
-	});
-
 	describe("coverage", () => {
 		it("should call prepareWorkspaceCoverage with the workspace packages when collectCoverage is set", async () => {
-			expect.assertions(2);
+			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
+			const { prepareCoverage } = await runCoverageFooAsync();
+
+			expect(prepareCoverage).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({
+					packages: [expect.objectContaining({ name: "@halcyon/foo" })],
 				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
-
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([
-				{
-					coverageRoots: [{ luauRoot: toPosixRoot("src"), shadowDir: "/shadow/src" }],
-					coverageSpine: [],
-					manifest: {
-						buildId: "test-build-id",
-						files: {},
-						generatedAt: "x",
-						instrumenterVersion: 2,
-						luauRoots: [],
-						nonInstrumentedFiles: {},
-						shadowDir: "/shadow",
-						version: MANIFEST_VERSION,
-					},
-					manifestPath: "/shadow/coverage-manifest.json",
-					pkg: "@halcyon/foo",
-					rootDir: FOO_DIR,
-				},
-			]);
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli({ collectCoverage: true }),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
-
-			expect(prepareWorkspaceCoverage).toHaveBeenCalledOnce();
-
-			const callArgs = vi.mocked(prepareWorkspaceCoverage).mock.calls[0]![0];
-
-			expect(callArgs.packages.map((entry) => entry.name)).toStrictEqual(["@halcyon/foo"]);
+			);
 		});
 
 		// The per-package coverage knobs must reach the descriptor so
@@ -2223,61 +1756,12 @@ describe(runWorkspaceAsync, () => {
 		it("should propagate pkgConfig luauRoots and coveragePathIgnorePatterns onto the descriptor", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			const { prepareCoverage } = await runCoverageFooAsync({
+				coveragePathIgnorePatterns: ["**/vendored-packages/**"],
+				luauRoots: ["src"],
 			});
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
-					collectCoverage: true,
-					coveragePathIgnorePatterns: ["**/vendored-packages/**"],
-					luauRoots: ["src"],
-					rootDir: FOO_DIR,
-				},
-			});
-
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([
-				{
-					coverageRoots: [{ luauRoot: toPosixRoot("src"), shadowDir: "/shadow/src" }],
-					coverageSpine: [],
-					manifest: {
-						buildId: "test-build-id",
-						files: {},
-						generatedAt: "x",
-						instrumenterVersion: 2,
-						luauRoots: [],
-						nonInstrumentedFiles: {},
-						shadowDir: "/shadow",
-						version: MANIFEST_VERSION,
-					},
-					manifestPath: "/shadow/coverage-manifest.json",
-					pkg: "@halcyon/foo",
-					rootDir: FOO_DIR,
-				},
-			]);
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli({ collectCoverage: true }),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
-
-			const callArgs = vi.mocked(prepareWorkspaceCoverage).mock.calls[0]![0];
+			const callArgs = prepareCoverage.mock.calls[0]![0];
 			const descriptor = callArgs.packages[0]!;
 
 			expect(descriptor.luauRoots).toStrictEqual(["src"]);
@@ -2286,159 +1770,29 @@ describe(runWorkspaceAsync, () => {
 			]);
 		});
 
-		// Follow-up: the descriptor must distinguish "user set
-		// coveragePathIgnorePatterns" from "default value present after merge"
-		// — otherwise every package looks like an override and the workspace
-		// root's custom patterns silently never apply. `resolveConfig`
-		// (loader.ts:42) preserves the `DEFAULT_CONFIG` array reference when
-		// the package config omits the key, so reference identity gates the
-		// descriptor field.
-		// Per-pkg `coverageCache` reaches the descriptor so the
-		// cache gate in `prepareWorkspaceCoverage` can honor an opt-out
-		// declared in a package's own jest.config (or extended from
-		// jest.shared.ts). The workspace-root config no longer drives this
-		// knob.
 		it("should propagate pkgConfig.coverageCache: false onto the descriptor", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			const { prepareCoverage } = await runCoverageFooAsync({
+				coverageCache: false,
 			});
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
-					collectCoverage: true,
-					coverageCache: false,
-					rootDir: FOO_DIR,
-				},
-			});
-
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([
-				{
-					coverageRoots: [{ luauRoot: toPosixRoot("src"), shadowDir: "/shadow/src" }],
-					coverageSpine: [],
-					manifest: {
-						buildId: "test-build-id",
-						files: {},
-						generatedAt: "x",
-						instrumenterVersion: 2,
-						luauRoots: [],
-						nonInstrumentedFiles: {},
-						shadowDir: "/shadow",
-						version: MANIFEST_VERSION,
-					},
-					manifestPath: "/shadow/coverage-manifest.json",
-					pkg: "@halcyon/foo",
-					rootDir: FOO_DIR,
-				},
-			]);
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli({ collectCoverage: true }),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
-
-			const callArgs = vi.mocked(prepareWorkspaceCoverage).mock.calls[0]![0];
+			const callArgs = prepareCoverage.mock.calls[0]![0];
 			const descriptor = callArgs.packages[0]!;
 
 			expect(descriptor.coverageCache).toBeFalse();
 		});
 
-		it("should leave descriptor.coveragePathIgnorePatterns undefined when the package config defaults", async () => {
-			expect.assertions(1);
-
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			// Spread DEFAULT_CONFIG without overriding coveragePathIgnorePatterns
-			// — the field keeps the DEFAULT_CONFIG reference verbatim, which
-			// the loadPackages gate treats as "inherit root".
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
-
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([
-				{
-					coverageRoots: [{ luauRoot: toPosixRoot("src"), shadowDir: "/shadow/src" }],
-					coverageSpine: [],
-					manifest: {
-						buildId: "test-build-id",
-						files: {},
-						generatedAt: "x",
-						instrumenterVersion: 2,
-						luauRoots: [],
-						nonInstrumentedFiles: {},
-						shadowDir: "/shadow",
-						version: MANIFEST_VERSION,
-					},
-					manifestPath: "/shadow/coverage-manifest.json",
-					pkg: "@halcyon/foo",
-					rootDir: FOO_DIR,
-				},
-			]);
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli({ collectCoverage: true }),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
-
-			const callArgs = vi.mocked(prepareWorkspaceCoverage).mock.calls[0]![0];
-			const descriptor = callArgs.packages[0]!;
-
-			expect(descriptor.coveragePathIgnorePatterns).toBeUndefined();
-		});
-
 		it("should embed runnerCoverage in the materializer config when collectCoverage is set", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
+			const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR, {
+					collectCoverage: true,
 				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
 			});
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
-
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => [
 				{
 					coverageRoots: [],
 					coverageSpine: [],
@@ -2458,17 +1812,14 @@ describe(runWorkspaceAsync, () => {
 				},
 			]);
 
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend, captured } = createStubBackend(passingEntries("@halcyon/foo"));
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
 				cli: makeCli({ collectCoverage: true }),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
 			expect(dispatchedScript(captured)).toContain('"runnerCoverage":true');
@@ -2477,21 +1828,12 @@ describe(runWorkspaceAsync, () => {
 		it("should expose per-package coverage descriptors on the workspace result", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
+			const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR, {
+					collectCoverage: true,
 				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
 			});
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
-
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
 			const manifest = {
 				buildId: "test-build-id",
 				files: {},
@@ -2502,9 +1844,9 @@ describe(runWorkspaceAsync, () => {
 				shadowDir: "/shadow",
 				version: MANIFEST_VERSION,
 			};
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => [
 				{
-					coverageRoots: [{ luauRoot: toPosixRoot("src"), shadowDir: "/shadow/src" }],
+					coverageRoots: [{ luauRoot: posixRoot("src"), shadowDir: "/shadow/src" }],
 					coverageSpine: [],
 					manifest,
 					manifestPath: "/shadow/coverage-manifest.json",
@@ -2513,17 +1855,14 @@ describe(runWorkspaceAsync, () => {
 				},
 			]);
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
 			const results = await runWorkspaceResultsAsync({
 				backend,
 				cli: makeCli({ collectCoverage: true }),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
 			expect(results![0]!.coverageManifest).toBe(manifest);
@@ -2533,44 +1872,31 @@ describe(runWorkspaceAsync, () => {
 		it("should carry the package's own coverage report settings onto the workspace result", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
+			const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR, {
 					collectCoverage: true,
 					collectCoverageFrom: ["src/**/*.ts"],
 					coverageDirectory: "reports/cov",
 					coverageReporters: ["cobertura"],
 					coverageThreshold: { branches: 70, statements: 90 },
-					rootDir: FOO_DIR,
-				},
+				}),
 			});
 
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([
-				{ ...coverageEntry("@halcyon/foo"), coveragePathIgnorePatterns: ["**/vendor/**"] },
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => [
+				{
+					...coverageEntry("@halcyon/foo"),
+					coveragePathIgnorePatterns: ["**/vendor/**"],
+				},
 			]);
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
 			const results = await runWorkspaceResultsAsync({
 				backend,
 				cli: makeCli({ collectCoverage: true }),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
 			// `coverageDirectory` resolves against the package's own rootDir, so
@@ -2589,53 +1915,29 @@ describe(runWorkspaceAsync, () => {
 		it("should warn when a package declares coverageThreshold without collectCoverage", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
 			// foo's threshold can never be enforced (no instrumentation without
 			// collectCoverage); bar opted in properly and must not be flagged.
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: {
-					...DEFAULT_CONFIG,
+			const { fileSystem } = stageWorkspace(fooBarFiles(), {
+				[BAR_DIR]: rooted(BAR_DIR, {
 					collectCoverage: true,
 					coverageThreshold: { lines: 100 },
-					rootDir: BAR_DIR,
-				},
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
+				}),
+				[FOO_DIR]: rooted(FOO_DIR, {
 					coverageThreshold: { statements: 90 },
-					rootDir: FOO_DIR,
-				},
+				}),
 			});
 
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([coverageEntry("@halcyon/bar")]);
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => [coverageEntry("@halcyon/bar")]);
 
 			const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-				{ jestOutput: passingResult(), pkg: "@halcyon/bar" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo", "@halcyon/bar"));
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO, BAR_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
 			const warnings = stderr.mock.calls
@@ -2651,49 +1953,41 @@ describe(runWorkspaceAsync, () => {
 		it("should restrict prepareWorkspaceCoverage to packages with pending test files", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				// foo has a spec file
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				// bar has NO spec files — should be excluded from instrumentation
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: {},
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: {
-					...DEFAULT_CONFIG,
-					collectCoverage: true,
-					passWithNoTests: true,
-					rootDir: BAR_DIR,
+			const { fileSystem } = stageWorkspace(
+				{
+					// foo has a spec file
+					...seedSpec(FOO_INFO, "src/foo.spec.luau"),
+					// bar has NO spec files — should be excluded from
+					// instrumentation
+					...seedPackage(BAR_DIR, {
+						name: "@halcyon/bar",
+						specFiles: {},
+					}),
 				},
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
+				{
+					[BAR_DIR]: rooted(BAR_DIR, {
+						collectCoverage: true,
+						passWithNoTests: true,
+					}),
+					[FOO_DIR]: rooted(FOO_DIR, {
+						collectCoverage: true,
+					}),
+				},
+			);
 
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([]);
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => []);
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
 				cli: makeCli({ collectCoverage: true }),
+				fileSystem,
 				packageInfos: [FOO_INFO, BAR_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
-			const callArgs = vi.mocked(prepareWorkspaceCoverage).mock.calls[0]![0];
+			const callArgs = prepareCoverage.mock.calls[0]![0];
 
 			expect(callArgs.packages.map((entry) => entry.name)).toStrictEqual(["@halcyon/foo"]);
 		});
@@ -2701,74 +1995,52 @@ describe(runWorkspaceAsync, () => {
 		it("should not call prepareWorkspaceCoverage when collectCoverage is false", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR),
 			});
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => []);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
-			expect(prepareWorkspaceCoverage).not.toHaveBeenCalled();
+			expect(prepareCoverage).not.toHaveBeenCalled();
 		});
 
 		it("should honor per-package collectCoverage when the workspace config does not set it", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
 			// Per-package opts in; workspace does not. The workspace runner
 			// must still instrument so the materializer's runtime coverage
 			// collection has a shadow dir to read from.
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
+			const { fileSystem } = stageWorkspace(
+				{
+					...seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				},
+				{
+					[FOO_DIR]: rooted(FOO_DIR, {
+						collectCoverage: true,
+					}),
+				},
+			);
 
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([]);
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => []);
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
-			const callArgs = vi.mocked(prepareWorkspaceCoverage).mock.calls[0]![0];
+			const callArgs = prepareCoverage.mock.calls[0]![0];
 
 			expect(callArgs.packages.map((entry) => entry.name)).toStrictEqual(["@halcyon/foo"]);
 		});
@@ -2776,43 +2048,25 @@ describe(runWorkspaceAsync, () => {
 		it("should restrict prepareWorkspaceCoverage to packages that opted in via per-package collectCoverage", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
+			const { fileSystem } = stageWorkspace(fooBarFiles(), {
+				[BAR_DIR]: rooted(BAR_DIR),
+				[FOO_DIR]: rooted(FOO_DIR, {
+					collectCoverage: true,
 				}),
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
 			});
 
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR },
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => []);
 
-			const { prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo", "@halcyon/bar"));
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-				{ jestOutput: passingResult(), pkg: "@halcyon/bar" },
-			]);
-
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO, BAR_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				prepareCoverage,
 			});
 
-			const callArgs = vi.mocked(prepareWorkspaceCoverage).mock.calls[0]![0];
+			const callArgs = prepareCoverage.mock.calls[0]![0];
 
 			expect(callArgs.packages.map((entry) => entry.name)).toStrictEqual(["@halcyon/foo"]);
 		});
@@ -2820,132 +2074,68 @@ describe(runWorkspaceAsync, () => {
 		it("should emit per-package build manifests over the built place after a coverage run", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
+			const { entry, fileSystem } = await runCoverageFooAsync();
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
-
-			const entry = coverageEntry("@halcyon/foo");
-			const { emitWorkspaceBuildManifests, prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([entry]);
-			const place = { hash: "place-hash", path: "synthesized.rbxl" };
-			vi.mocked(buildPlaceAsync).mockResolvedValue(place);
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli({ collectCoverage: true }),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
-
-			expect(vi.mocked(emitWorkspaceBuildManifests)).toHaveBeenCalledWith([entry], place);
+			expect(buildManifestAt(fileSystem, entry.manifestPath).coveragePlace.path).toBe(
+				path.join(WORKSPACE_CACHE, "synthesized.rbxl"),
+			);
 		});
 
 		it("should not emit a build manifest when the shared place build fails", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
+			const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR, {
+					collectCoverage: true,
 				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
 			});
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
-			});
+			const entry = coverageEntry("@halcyon/foo");
+			const prepareCoverage = vi.fn<PrepareCoverage>(() => [entry]);
 
-			const { emitWorkspaceBuildManifests, prepareWorkspaceCoverage } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-			vi.mocked(prepareWorkspaceCoverage).mockReturnValue([coverageEntry("@halcyon/foo")]);
-			vi.mocked(buildPlaceAsync).mockImplementationOnce(async () => {
-				throw new Error("rojo boom");
-			});
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
 			await expect(
-				runWorkspaceAsync({
+				runStagedWorkspaceAsync({
 					backend,
+					childProcess: failingRojo("rojo boom"),
 					cli: makeCli({ collectCoverage: true }),
+					fileSystem,
 					packageInfos: [FOO_INFO],
-					runOptions: makeRunOptions(),
-					version: "0.0.0-test",
-					workspaceRoot: ROOT,
+					prepareCoverage,
 				}),
 			).rejects.toThrow("rojo boom");
 
-			expect(vi.mocked(emitWorkspaceBuildManifests)).not.toHaveBeenCalled();
+			expect(fileSystem.existsSync(buildManifestPath(entry.manifestPath))).toBeFalse();
 		});
 
 		it("should not emit a build manifest when coverage is disabled", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			const { fileSystem } = await runScenarioAsync({
+				configs: {
+					[FOO_DIR]: rooted(FOO_DIR),
+				},
+				entries: passingEntries("@halcyon/foo"),
+				files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				run: {
+					packageInfos: [FOO_INFO],
+				},
 			});
 
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
-
-			const { emitWorkspaceBuildManifests } =
-				await import("./coverage-pipeline/workspace-prepare.ts");
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
-
-			expect(vi.mocked(emitWorkspaceBuildManifests)).not.toHaveBeenCalled();
+			expect(
+				fileSystem.existsSync(
+					buildManifestPath(coverageEntry("@halcyon/foo").manifestPath),
+				),
+			).toBeFalse();
 		});
 	});
 
 	it("should measure the place staging as stagingMs", async () => {
 		expect.assertions(3);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
+		const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+			[FOO_DIR]: rooted(FOO_DIR),
 		});
 
 		// Staging is synchronous, so the only way to give it a measurable
@@ -2956,24 +2146,18 @@ describe(runWorkspaceAsync, () => {
 		const clock = movableClockCollector(0);
 		let wallMs = 1_000;
 		vi.spyOn(Date, "now").mockImplementation(() => wallMs);
-		vi.mocked(buildPlaceAsync).mockImplementationOnce(async () => {
-			clock.advance(250);
-			wallMs += 900;
-			return { hash: "hash", path: "place.rbxl" };
-		});
 
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-		]);
+		const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
-		const output = await runWorkspaceAsync({
+		const output = await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			childProcess: timedRojo(fileSystem, () => {
+				clock.advance(250);
+				wallMs += 900;
+			}),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
 			timing: clock.timing,
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		expect(output!.stagingMs).toBe(250);
@@ -2987,43 +2171,29 @@ describe(runWorkspaceAsync, () => {
 	it("should report the coverage bake apart from the staging around it", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
+		const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+			[FOO_DIR]: rooted(FOO_DIR, {
+				collectCoverage: true,
 			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, collectCoverage: true, rootDir: FOO_DIR },
 		});
 
 		const clock = movableClockCollector(1_000);
 
-		const { prepareWorkspaceCoverage } =
-			await import("./coverage-pipeline/workspace-prepare.ts");
-		vi.mocked(prepareWorkspaceCoverage).mockImplementation(() => {
-			clock.advance(120);
-			return [coverageEntry("@halcyon/foo")];
-		});
-		vi.mocked(buildPlaceAsync).mockImplementationOnce(async () => {
-			clock.advance(250);
-			return { hash: "hash", path: "place.rbxl" };
-		});
+		const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-		]);
-
-		const output = await runWorkspaceAsync({
+		const output = await runStagedWorkspaceAsync({
 			backend,
+			childProcess: timedRojo(fileSystem, () => {
+				clock.advance(250);
+			}),
 			cli: makeCli({ collectCoverage: true }),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
+			prepareCoverage: vi.fn<PrepareCoverage>(() => {
+				clock.advance(120);
+				return [coverageEntry("@halcyon/foo")];
+			}),
 			timing: clock.timing,
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		expect(output!.coverageMs).toBe(120);
@@ -3032,9 +2202,28 @@ describe(runWorkspaceAsync, () => {
 
 	describe("work-stealing", () => {
 		const testCredentials = { apiKey: "test-key", universeId: "u-123" };
+		const prepareWorkStealingQueue = vi.fn<typeof prepareWorkStealingQueueAsync>();
+
+		async function runStealingWorkspaceAsync(
+			options: Parameters<typeof runWorkspaceAsync>[0],
+		): Promise<undefined | WorkspaceRunnerOutput> {
+			return runStagedWorkspaceAsync({ prepareWorkStealingQueue, ...options });
+		}
+
+		async function runStealingFooAsync(
+			run: Partial<StagedRunOptions>,
+			specFile = "src/foo.spec.luau",
+		) {
+			return runScenarioAsync({
+				configs: { [FOO_DIR]: rooted(FOO_DIR) },
+				entries: passingEntries("@halcyon/foo"),
+				files: seedSpec(FOO_INFO, specFile),
+				run: { packageInfos: [FOO_INFO], prepareWorkStealingQueue, ...run },
+			});
+		}
 
 		function mockPreparedQueue(queueId: string): void {
-			vi.mocked(prepareWorkStealingQueueAsync).mockResolvedValue({
+			prepareWorkStealingQueue.mockResolvedValue({
 				invisibilityWindowSeconds: 90,
 				queueId,
 				ttlSeconds: 600,
@@ -3044,33 +2233,20 @@ describe(runWorkspaceAsync, () => {
 		it("should push every (pkg, project) onto the queue and pass workStealing to backend when parallel>1", async () => {
 			expect.assertions(3);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR },
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
+			const { fileSystem } = stageWorkspace(fooBarFiles(), {
+				[BAR_DIR]: rooted(BAR_DIR),
+				[FOO_DIR]: rooted(FOO_DIR),
 			});
 
 			mockPreparedQueue("queue-1");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-				{ jestOutput: passingResult(), pkg: "@halcyon/bar" },
-			]);
+			const { backend, captured } = createStubBackend(
+				passingEntries("@halcyon/foo", "@halcyon/bar"),
+			);
 
-			await runWorkspaceAsync({
+			await runStealingWorkspaceAsync({
 				backend,
 				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO, BAR_INFO],
 				runOptions: makeRunOptions({ parallel: 2 }),
 				version: "0.0.0-test",
@@ -3081,7 +2257,7 @@ describe(runWorkspaceAsync, () => {
 			expect(captured.options!.workStealing).toBeTrue();
 			expect(captured.options!.parallel).toBe(2);
 
-			const prepareCall = vi.mocked(prepareWorkStealingQueueAsync).mock.calls[0]![0];
+			const prepareCall = prepareWorkStealingQueue.mock.calls[0]![0];
 
 			expect(prepareCall.packages).toIncludeAllMembers([
 				{ pkg: "@halcyon/foo", project: "@halcyon/foo" },
@@ -3092,30 +2268,9 @@ describe(runWorkspaceAsync, () => {
 		it("should embed the same queueId in the script as the queue pushes", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
-
 			mockPreparedQueue("specific-queue-id");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured } = await runStealingFooAsync({
 				runOptions: makeRunOptions({ parallel: 2 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3128,32 +2283,14 @@ describe(runWorkspaceAsync, () => {
 		it("should carry the resolved printBasicPrototype into the queue script", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.ts")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
-
 			mockPreparedQueue("queue-format");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ parallel: 2 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-				workStealingCredentials: testCredentials,
-			});
+			const { captured } = await runStealingFooAsync(
+				{
+					runOptions: makeRunOptions({ parallel: 2 }),
+					workStealingCredentials: testCredentials,
+				},
+				"src/foo.spec.ts",
+			);
 
 			expect(captured.options!.scriptOverride).toContain('"printBasicPrototype":false');
 		});
@@ -3161,30 +2298,9 @@ describe(runWorkspaceAsync, () => {
 		it("should shard on parallel auto rather than falling back to one task", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
-
 			mockPreparedQueue("queue-auto");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured } = await runStealingFooAsync({
 				runOptions: makeRunOptions({ parallel: "auto" }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3195,33 +2311,12 @@ describe(runWorkspaceAsync, () => {
 		it("should fall back to the single-task path when the queue cannot be prepared", async () => {
 			expect.assertions(4);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
-
-			vi.mocked(prepareWorkStealingQueueAsync).mockRejectedValue(
+			prepareWorkStealingQueue.mockRejectedValue(
 				new Error("Failed to enqueue work item: insufficient scope"),
 			);
 			const warn = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			const output = await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured, output } = await runStealingFooAsync({
 				runOptions: makeRunOptions({ parallel: 3 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3234,62 +2329,20 @@ describe(runWorkspaceAsync, () => {
 		it("should keep the existing single-task path when parallel is unset", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
-
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured } = await runStealingFooAsync({
 				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
 			expect(captured.options!.workStealing).toBeUndefined();
-			expect(vi.mocked(prepareWorkStealingQueueAsync)).not.toHaveBeenCalled();
+			expect(prepareWorkStealingQueue).not.toHaveBeenCalled();
 		});
 
 		it("should keep the existing path when workStealingCredentials is not provided even with parallel>1", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
-			});
-
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured } = await runStealingFooAsync({
 				runOptions: makeRunOptions({ parallel: 4 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
 			expect(captured.options!.workStealing).toBeUndefined();
@@ -3299,29 +2352,22 @@ describe(runWorkspaceAsync, () => {
 		it("should forward workStealingCredentials.baseUrl into prepareWorkStealingQueue", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
+			const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR),
 			});
 
 			mockPreparedQueue("queue-base-url");
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
-			await runWorkspaceAsync({
+			await runStealingWorkspaceAsync({
 				backend,
 				cli: makeCli(),
-				// Exercise the streaming-side baseUrl plumbing on the same call;
-				// keeps the SortedMap client constructor seeing the override
-				// when work-stealing fires.
+				fileSystem,
+				/**
+				 * Exercise the streaming-side baseUrl plumbing on the same
+				 * call; keeps the SortedMap client constructor seeing the
+				 * override when work-stealing fires.
+				 */
 				onStreamingResult: () => {
 					/* intentionally inert */
 				},
@@ -3329,10 +2375,13 @@ describe(runWorkspaceAsync, () => {
 				runOptions: makeRunOptions({ parallel: 2 }),
 				version: "0.0.0-test",
 				workspaceRoot: ROOT,
-				workStealingCredentials: { ...testCredentials, baseUrl: "http://127.0.0.1:4010" },
+				workStealingCredentials: {
+					...testCredentials,
+					baseUrl: "http://127.0.0.1:4010",
+				},
 			});
 
-			expect(vi.mocked(prepareWorkStealingQueueAsync).mock.calls[0]![0].baseUrl).toBe(
+			expect(prepareWorkStealingQueue.mock.calls[0]![0].baseUrl).toBe(
 				"http://127.0.0.1:4010",
 			);
 		});
@@ -3340,31 +2389,12 @@ describe(runWorkspaceAsync, () => {
 		it("should provide a streaming reader and onPackageResult to the backend when onStreamingResult is set", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
 			mockPreparedQueue("queue-stream");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
+			const { captured } = await runStealingFooAsync({
 				onStreamingResult: () => {
 					/* intentionally inert */
 				},
-				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ parallel: 2 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3375,31 +2405,12 @@ describe(runWorkspaceAsync, () => {
 		it("should embed a sortedMapId in the work-stealing script when onStreamingResult is set", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
 			mockPreparedQueue("queue-stream");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
+			const { captured } = await runStealingFooAsync({
 				onStreamingResult: () => {
 					/* intentionally inert */
 				},
-				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ parallel: 2 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3412,21 +2423,9 @@ describe(runWorkspaceAsync, () => {
 		it("should drop the packages a bailed run never reached", async () => {
 			expect.assertions(3);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR },
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR },
+			const { fileSystem } = stageWorkspace(fooBarFiles(), {
+				[BAR_DIR]: rooted(BAR_DIR),
+				[FOO_DIR]: rooted(FOO_DIR),
 			});
 
 			mockPreparedQueue("queue-bailed");
@@ -3435,9 +2434,10 @@ describe(runWorkspaceAsync, () => {
 				{ bailedJobIndices: [0] },
 			);
 
-			const output = await runWorkspaceAsync({
+			const output = await runStealingWorkspaceAsync({
 				backend,
 				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO, BAR_INFO],
 				runOptions: makeRunOptions({ bail: true, parallel: 2 }),
 				version: "0.0.0-test",
@@ -3456,37 +2456,50 @@ describe(runWorkspaceAsync, () => {
 		it("should not report a partly-run package as one the bail skipped", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: {
-						[path.join(FOO_DIR, "src/a.spec.luau")]: "",
-						[path.join(FOO_DIR, "src/b.spec.luau")]: "",
-					},
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
-					projects: [
-						{ test: { displayName: "client", include: ["src/a.spec.luau"] } },
-						{ test: { displayName: "server", include: ["src/b.spec.luau"] } },
-					],
-					rootDir: FOO_DIR,
+			const { fileSystem } = stageWorkspace(
+				{
+					...seedPackage(FOO_DIR, {
+						name: "@halcyon/foo",
+						specFiles: {
+							[path.join(FOO_DIR, "out/Client/a.spec.luau")]: "",
+							[path.join(FOO_DIR, "out/Server/b.spec.luau")]: "",
+						},
+						tree: {
+							$className: "DataModel",
+							ReplicatedStorage: { Client: { $path: "out/Client" } },
+							ServerScriptService: { Server: { $path: "out/Server" } },
+						},
+					}),
 				},
-			});
-
-			mockPreparedQueue("queue-partial");
-			const { backend } = createStubBackend(
-				[{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" }],
-				{ bailedJobIndices: [1] },
+				{
+					[FOO_DIR]: rooted(FOO_DIR, {
+						projects: makeProjectEntries([
+							{
+								test: {
+									displayName: "client",
+									include: ["out/Client/**/*.spec.luau"],
+								},
+							},
+							{
+								test: {
+									displayName: "server",
+									include: ["out/Server/**/*.spec.luau"],
+								},
+							},
+						]),
+					}),
+				},
 			);
 
-			const output = await runWorkspaceAsync({
+			mockPreparedQueue("queue-partial");
+			const { backend } = createStubBackend([passingProjectEntry("@halcyon/foo", "client")], {
+				bailedJobIndices: [1],
+			});
+
+			const output = await runStealingWorkspaceAsync({
 				backend,
 				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ bail: true, parallel: 2 }),
 				version: "0.0.0-test",
@@ -3501,28 +2514,9 @@ describe(runWorkspaceAsync, () => {
 		it("should embed bail in the work-stealing script when --bail is set", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
 			mockPreparedQueue("queue-bail");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured } = await runStealingFooAsync({
 				runOptions: makeRunOptions({ bail: true, parallel: 2 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3534,28 +2528,9 @@ describe(runWorkspaceAsync, () => {
 		it("should create a signal map for the bail without a streaming consumer", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
 			mockPreparedQueue("queue-bail-map");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured } = await runStealingFooAsync({
 				runOptions: makeRunOptions({ bail: true, parallel: 2 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3565,28 +2540,9 @@ describe(runWorkspaceAsync, () => {
 		it("should skip streaming setup when onStreamingResult is omitted (no SortedMap polling overhead)", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
 			mockPreparedQueue("queue-stream");
-			const { backend, captured } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
+			const { captured } = await runStealingFooAsync({
 				runOptions: makeRunOptions({ parallel: 2 }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 				workStealingCredentials: testCredentials,
 			});
 
@@ -3597,15 +2553,9 @@ describe(runWorkspaceAsync, () => {
 		it("should route streaming entries through the supplied onStreamingResult", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			const { fileSystem } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR),
 			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
 
 			mockPreparedQueue("queue-stream");
 			const seen: Array<string> = [];
@@ -3619,22 +2569,22 @@ describe(runWorkspaceAsync, () => {
 				success: true,
 			};
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 			// Wrap the stub so it invokes the streaming hook before returning,
 			// simulating an entry observed mid-task.
 			const wrappedBackend: Backend = {
 				kind: "open-cloud",
+				placeInput: "built",
 				runTestsAsync: async (options) => {
 					options.streaming!.onPackageResult(streamedEntry);
 					return backend.runTestsAsync(options);
 				},
 			};
 
-			await runWorkspaceAsync({
+			await runStealingWorkspaceAsync({
 				backend: wrappedBackend,
 				cli: makeCli(),
+				fileSystem,
 				onStreamingResult: (entry) => {
 					seen.push(entry.pkg);
 				},
@@ -3653,27 +2603,16 @@ describe(runWorkspaceAsync, () => {
 		it("should write .jest-roblox/output/<pkg>--<project>.jest-output.log under the workspace root from final results", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ workspaceOutputFile: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const { volume } = await runScenarioAsync({
+				configs: {
+					[FOO_DIR]: rooted(FOO_DIR),
+				},
+				entries: passingEntries("@halcyon/foo"),
+				files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				run: {
+					packageInfos: [FOO_INFO],
+					runOptions: makeRunOptions({ workspaceOutputFile: true }),
+				},
 			});
 
 			const file = path.join(
@@ -3683,8 +2622,8 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-foo--@halcyon-foo.jest-output.log",
 			);
 
-			expect(vol.existsSync(file)).toBeTrue();
-			expect(JSON.parse(vol.readFileSync(file, "utf-8").toString())).toMatchObject({
+			expect(volume.existsSync(file)).toBeTrue();
+			expect(JSON.parse(volume.readFileSync(file, "utf-8").toString())).toMatchObject({
 				numFailedTests: 0,
 				numPassedTests: 1,
 				success: true,
@@ -3694,33 +2633,22 @@ describe(runWorkspaceAsync, () => {
 		it("should sanitize filesystem-unsafe characters in pkg/project segments", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ workspaceOutputFile: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const { volume } = await runScenarioAsync({
+				configs: {
+					[FOO_DIR]: rooted(FOO_DIR),
+				},
+				entries: passingEntries("@halcyon/foo"),
+				files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				run: {
+					packageInfos: [FOO_INFO],
+					runOptions: makeRunOptions({ workspaceOutputFile: true }),
+				},
 			});
 
 			// `@halcyon/foo` → `@halcyon-foo`; slashes and other unsafe chars
 			// become hyphens so the path component stays a single segment.
 			expect(
-				vol.existsSync(
+				volume.existsSync(
 					path.join(
 						ROOT,
 						".jest-roblox",
@@ -3734,31 +2662,19 @@ describe(runWorkspaceAsync, () => {
 		it("should NOT write per-package result files when workspace.outputFile is disabled", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions(),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const { volume } = await runScenarioAsync({
+				configs: {
+					[FOO_DIR]: rooted(FOO_DIR),
+				},
+				entries: passingEntries("@halcyon/foo"),
+				files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				run: {
+					packageInfos: [FOO_INFO],
+				},
 			});
 
 			expect(
-				vol.existsSync(
+				volume.existsSync(
 					path.join(
 						ROOT,
 						".jest-roblox",
@@ -3774,48 +2690,16 @@ describe(runWorkspaceAsync, () => {
 		it("should write a package's type test result to .jest-roblox/output/<pkg>--<project>.jest-output.log under --typecheckOnly", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: {
-						[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-						[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-					},
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
-					rootDir: FOO_DIR,
-					testMatch: ["**/*.spec.ts"],
-					typecheck: { enabled: true },
-				},
-			});
-			vi.mocked(runTypecheckAsync).mockResolvedValue(
-				makeTypeResult({
-					testResults: [
-						{
-							numFailingTests: 0,
-							numPassingTests: 1,
-							numPendingTests: 0,
-							testFilePath: "src/foo.spec-d.ts",
-							testResults: [],
-						},
-					],
-				}),
-			);
+			const { fileSystem, volume } = stagePassingTypecheckFoo();
 
 			const { backend } = createStubBackend([]);
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
 				cli: makeCli({ typecheckOnly: true }),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ workspaceOutputFile: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
 			const file = path.join(
@@ -3825,8 +2709,8 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-foo--@halcyon-foo.jest-output.log",
 			);
 
-			expect(vol.existsSync(file)).toBeTrue();
-			expect(JSON.parse(vol.readFileSync(file, "utf-8").toString())).toMatchObject({
+			expect(volume.existsSync(file)).toBeTrue();
+			expect(JSON.parse(volume.readFileSync(file, "utf-8").toString())).toMatchObject({
 				success: true,
 				testResults: [{ testFilePath: "@halcyon/foo/src/foo.spec-d.ts" }],
 			});
@@ -3835,50 +2719,17 @@ describe(runWorkspaceAsync, () => {
 		it("should merge the type test result into the per-package file alongside runtime results", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: {
-						[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-						[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-					},
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
-					rootDir: FOO_DIR,
-					testMatch: ["**/*.spec.ts"],
-					typecheck: { enabled: true },
-				},
-			});
-			vi.mocked(runTypecheckAsync).mockResolvedValue(
-				makeTypeResult({
-					testResults: [
-						{
-							numFailingTests: 0,
-							numPassingTests: 1,
-							numPendingTests: 0,
-							testFilePath: "src/foo.spec-d.ts",
-							testResults: [],
-						},
-					],
-				}),
-			);
+			const { fileSystem, volume } = stagePassingTypecheckFoo();
 
 			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+				passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 			]);
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ workspaceOutputFile: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
 			const file = path.join(
@@ -3888,7 +2739,7 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-foo--@halcyon-foo.jest-output.log",
 			);
 
-			expect(JSON.parse(vol.readFileSync(file, "utf-8").toString())).toStrictEqual({
+			expect(JSON.parse(volume.readFileSync(file, "utf-8").toString())).toStrictEqual({
 				numFailedTests: 0,
 				numPassedTests: 2,
 				numPendingTests: 0,
@@ -3910,34 +2761,29 @@ describe(runWorkspaceAsync, () => {
 	});
 
 	describe("per-package gameOutput files", () => {
+		async function runGameOutputFooAsync(
+			gameOutput: string | undefined,
+			runOptions: Partial<WorkspaceRunOptions>,
+		) {
+			return runScenarioAsync({
+				configs: { [FOO_DIR]: rooted(FOO_DIR) },
+				entries: [
+					gameOutput === undefined
+						? { jestOutput: passingResult(), pkg: "@halcyon/foo" }
+						: { gameOutput, jestOutput: passingResult(), pkg: "@halcyon/foo" },
+				],
+				files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				run: { packageInfos: [FOO_INFO], runOptions: makeRunOptions(runOptions) },
+			});
+		}
+
 		it("should write parsed entries to .jest-roblox/output/<pkg>--<project>.game-output.log when workspace.gameOutput is enabled", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const gameOutputRaw = JSON.stringify([
-				{ message: "hello", messageType: 0, timestamp: 1000 },
-			]);
-			const { backend } = createStubBackend([
-				{ gameOutput: gameOutputRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ workspaceGameOutput: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
+			const { volume } = await runGameOutputFooAsync(
+				JSON.stringify([{ message: "hello", messageType: 0, timestamp: 1000 }]),
+				{ workspaceGameOutput: true },
+			);
 
 			const file = path.join(
 				ROOT,
@@ -3946,8 +2792,8 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-foo--@halcyon-foo.game-output.log",
 			);
 
-			expect(vol.existsSync(file)).toBeTrue();
-			expect(JSON.parse(vol.readFileSync(file, "utf-8").toString())).toStrictEqual([
+			expect(volume.existsSync(file)).toBeTrue();
+			expect(JSON.parse(volume.readFileSync(file, "utf-8").toString())).toStrictEqual([
 				{ message: "hello", messageType: 0, timestamp: 1000 },
 			]);
 		});
@@ -3955,38 +2801,17 @@ describe(runWorkspaceAsync, () => {
 		it("should NOT write per-package gameOutput files when workspace.gameOutput is disabled", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const gameOutputRaw = JSON.stringify([
-				{ message: "hello", messageType: 0, timestamp: 1000 },
-			]);
-			const { backend } = createStubBackend([
-				{ gameOutput: gameOutputRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ workspaceOutputFile: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
-			});
+			const { volume } = await runGameOutputFooAsync(
+				JSON.stringify([{ message: "hello", messageType: 0, timestamp: 1000 }]),
+				{ workspaceOutputFile: true },
+			);
 
 			// The two per-package sinks are independent: with
 			// workspace.outputFile on, the result JSON sibling is emitted, but
 			// the .game-output.log companion stays absent because
 			// workspace.gameOutput is off.
 			expect(
-				vol.existsSync(
+				volume.existsSync(
 					path.join(
 						ROOT,
 						".jest-roblox",
@@ -3996,7 +2821,7 @@ describe(runWorkspaceAsync, () => {
 				),
 			).toBeTrue();
 			expect(
-				vol.existsSync(
+				volume.existsSync(
 					path.join(
 						ROOT,
 						".jest-roblox",
@@ -4010,27 +2835,8 @@ describe(runWorkspaceAsync, () => {
 		it("should write an empty array when the package's gameOutput is missing", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ workspaceGameOutput: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const { volume } = await runGameOutputFooAsync(undefined, {
+				workspaceGameOutput: true,
 			});
 
 			const file = path.join(
@@ -4040,33 +2846,14 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-foo--@halcyon-foo.game-output.log",
 			);
 
-			expect(JSON.parse(vol.readFileSync(file, "utf-8").toString())).toStrictEqual([]);
+			expect(JSON.parse(volume.readFileSync(file, "utf-8").toString())).toStrictEqual([]);
 		});
 
 		it("should write an empty array when the package's gameOutput is invalid JSON", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const { backend } = createStubBackend([
-				{ gameOutput: "not-json", jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ workspaceGameOutput: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const { volume } = await runGameOutputFooAsync("not-json", {
+				workspaceGameOutput: true,
 			});
 
 			const file = path.join(
@@ -4076,7 +2863,7 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-foo--@halcyon-foo.game-output.log",
 			);
 
-			expect(JSON.parse(vol.readFileSync(file, "utf-8").toString())).toStrictEqual([]);
+			expect(JSON.parse(volume.readFileSync(file, "utf-8").toString())).toStrictEqual([]);
 		});
 
 		// A failure envelope synthesizes an ExecuteResult
@@ -4085,22 +2872,9 @@ describe(runWorkspaceAsync, () => {
 		it("should still write per-package gameOutput files when one entry's envelope is a failure", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR, silent: true },
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, silent: true },
+			const { fileSystem, volume } = stageWorkspace(fooBarFiles(), {
+				[BAR_DIR]: rooted(BAR_DIR, { silent: true }),
+				[FOO_DIR]: rooted(FOO_DIR, { silent: true }),
 			});
 
 			const failureEnvelope = JSON.stringify({
@@ -4112,17 +2886,19 @@ describe(runWorkspaceAsync, () => {
 			]);
 
 			const { backend } = createStubBackend([
-				{ gameOutput: fooGameOutput, jestOutput: failureEnvelope, pkg: "@halcyon/foo" },
+				{
+					gameOutput: fooGameOutput,
+					jestOutput: failureEnvelope,
+					pkg: "@halcyon/foo",
+				},
 				{ jestOutput: passingResult(), pkg: "@halcyon/bar" },
 			]);
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO, BAR_INFO],
 				runOptions: makeRunOptions({ silent: true, workspaceGameOutput: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
 			const fooFile = path.join(
@@ -4138,38 +2914,31 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-bar--@halcyon-bar.game-output.log",
 			);
 
-			expect(JSON.parse(vol.readFileSync(fooFile, "utf-8").toString())).toStrictEqual([
+			expect(JSON.parse(volume.readFileSync(fooFile, "utf-8").toString())).toStrictEqual([
 				{ message: "captured before crash", messageType: 2, timestamp: 5 },
 			]);
-			expect(JSON.parse(vol.readFileSync(barFile, "utf-8").toString())).toStrictEqual([]);
+			expect(JSON.parse(volume.readFileSync(barFile, "utf-8").toString())).toStrictEqual([]);
 		});
 
 		it("should emit a separate gameOutput file per project for multi-project packages", async () => {
 			expect.assertions(4);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: {
-						[path.join(FOO_DIR, "out/Client/foo.spec.luau")]: "",
-						[path.join(FOO_DIR, "out/Server/bar.spec.luau")]: "",
-					},
-					tree: {
-						$className: "DataModel",
-						ReplicatedStorage: { Client: { $path: "out/Client" } },
-						ServerScriptService: { Server: { $path: "out/Server" } },
-					},
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
 			const projects = makeProjectEntries([
-				{ test: { displayName: "client", include: ["out/Client/**/*.spec.luau"] } },
-				{ test: { displayName: "server", include: ["out/Server/**/*.spec.luau"] } },
+				{
+					test: {
+						displayName: "client",
+						include: ["out/Client/**/*.spec.luau"],
+					},
+				},
+				{
+					test: {
+						displayName: "server",
+						include: ["out/Server/**/*.spec.luau"],
+					},
+				},
 			]);
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: { ...DEFAULT_CONFIG, projects, rootDir: FOO_DIR },
+			const { fileSystem, volume } = stageWorkspace(clientServerFooFiles(), {
+				[FOO_DIR]: rooted(FOO_DIR, { projects }),
 			});
 
 			const clientOutput = JSON.stringify([
@@ -4193,13 +2962,11 @@ describe(runWorkspaceAsync, () => {
 				},
 			]);
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ workspaceGameOutput: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
 			const clientFile = path.join(
@@ -4215,28 +2982,45 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-foo--server.game-output.log",
 			);
 
-			expect(vol.existsSync(clientFile)).toBeTrue();
-			expect(vol.existsSync(serverFile)).toBeTrue();
-			expect(JSON.parse(vol.readFileSync(clientFile, "utf-8").toString())).toStrictEqual([
+			expect(volume.existsSync(clientFile)).toBeTrue();
+			expect(volume.existsSync(serverFile)).toBeTrue();
+			expect(JSON.parse(volume.readFileSync(clientFile, "utf-8").toString())).toStrictEqual([
 				{ message: "client", messageType: 0, timestamp: 1 },
 			]);
-			expect(JSON.parse(vol.readFileSync(serverFile, "utf-8").toString())).toStrictEqual([
+			expect(JSON.parse(volume.readFileSync(serverFile, "utf-8").toString())).toStrictEqual([
 				{ message: "server", messageType: 1, timestamp: 2 },
 			]);
 		});
 	});
 
 	describe("aggregated gameOutput", () => {
-		function seedFoo(): void {
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+		async function announceAsync(runOptions: Partial<WorkspaceRunOptions>) {
+			const { fileSystem } = seedFoo();
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const { backend } = createStubBackend([
+				{ gameOutput: helloRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
+			]);
+
+			await runStagedWorkspaceAsync({
+				backend,
+				fileSystem,
+				packageInfos: [FOO_INFO],
+				runOptions: makeRunOptions(runOptions),
 			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
+			return errorSpy;
+		}
+
+		function seedFoo(): MemoryFileSystem {
+			const memory = createMemoryFileSystem();
+
+			memory.volume.fromJSON({
+				...seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				...WORKSPACE_YAML,
+			});
+			setLoadedConfigPerPackage({
+				[FOO_DIR]: rooted(FOO_DIR),
+			});
+			return memory;
 		}
 
 		const helloRaw = JSON.stringify([{ message: "hello", messageType: 0, timestamp: 1000 }]);
@@ -4251,21 +3035,25 @@ describe(runWorkspaceAsync, () => {
 		it("should write a single grouped aggregate file when runOptions.gameOutput is set", async () => {
 			expect.assertions(1);
 
-			seedFoo();
+			const { fileSystem, volume } = seedFoo();
 			const { backend } = createStubBackend([
-				{ gameOutput: helloRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
+				{
+					gameOutput: helloRaw,
+					jestOutput: passingResult(),
+					pkg: "@halcyon/foo",
+				},
 			]);
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ gameOutput: aggregateFile, silent: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
-			expect(JSON.parse(vol.readFileSync(aggregateFile, "utf-8").toString())).toStrictEqual([
+			expect(
+				JSON.parse(volume.readFileSync(aggregateFile, "utf-8").toString()),
+			).toStrictEqual([
 				{
 					entries: [{ message: "hello", messageType: 0, timestamp: 1000 }],
 					package: "@halcyon/foo",
@@ -4277,48 +3065,37 @@ describe(runWorkspaceAsync, () => {
 		it("should write both the aggregate and per-package files when both are enabled", async () => {
 			expect.assertions(2);
 
-			seedFoo();
+			const { fileSystem, volume } = seedFoo();
 			const { backend } = createStubBackend([
-				{ gameOutput: helloRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
+				{
+					gameOutput: helloRaw,
+					jestOutput: passingResult(),
+					pkg: "@halcyon/foo",
+				},
 			]);
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({
 					gameOutput: aggregateFile,
 					silent: true,
 					workspaceGameOutput: true,
 				}),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
-			expect(vol.existsSync(aggregateFile)).toBeTrue();
-			expect(vol.existsSync(perPackageFile)).toBeTrue();
+			expect(volume.existsSync(aggregateFile)).toBeTrue();
+			expect(volume.existsSync(perPackageFile)).toBeTrue();
 		});
 
 		it("should announce only the aggregate to humans when both sinks are active", async () => {
 			expect.assertions(2);
 
-			seedFoo();
-			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			const { backend } = createStubBackend([
-				{ gameOutput: helloRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({
-					formatters: ["default"],
-					gameOutput: aggregateFile,
-					workspaceGameOutput: true,
-				}),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const errorSpy = await announceAsync({
+				formatters: ["default"],
+				gameOutput: aggregateFile,
+				workspaceGameOutput: true,
 			});
 
 			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(aggregateFile));
@@ -4328,23 +3105,10 @@ describe(runWorkspaceAsync, () => {
 		it("should announce per-package files to agents when both sinks are active", async () => {
 			expect.assertions(2);
 
-			seedFoo();
-			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			const { backend } = createStubBackend([
-				{ gameOutput: helloRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({
-					formatters: ["agent"],
-					gameOutput: aggregateFile,
-					workspaceGameOutput: true,
-				}),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const errorSpy = await announceAsync({
+				formatters: ["agent"],
+				gameOutput: aggregateFile,
+				workspaceGameOutput: true,
 			});
 
 			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(perPackageFile));
@@ -4354,19 +3118,9 @@ describe(runWorkspaceAsync, () => {
 		it("should announce per-package paths to humans when only per-package is active", async () => {
 			expect.assertions(1);
 
-			seedFoo();
-			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			const { backend } = createStubBackend([
-				{ gameOutput: helloRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ formatters: ["default"], workspaceGameOutput: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const errorSpy = await announceAsync({
+				formatters: ["default"],
+				workspaceGameOutput: true,
 			});
 
 			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(perPackageFile));
@@ -4375,19 +3129,9 @@ describe(runWorkspaceAsync, () => {
 		it("should announce the aggregate to agents when only the aggregate is active", async () => {
 			expect.assertions(1);
 
-			seedFoo();
-			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			const { backend } = createStubBackend([
-				{ gameOutput: helloRaw, jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ formatters: ["agent"], gameOutput: aggregateFile }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const errorSpy = await announceAsync({
+				formatters: ["agent"],
+				gameOutput: aggregateFile,
 			});
 
 			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(aggregateFile));
@@ -4396,23 +3140,22 @@ describe(runWorkspaceAsync, () => {
 		it("should not announce the aggregate when it captured zero entries", async () => {
 			expect.assertions(2);
 
-			seedFoo();
+			const { fileSystem, volume } = seedFoo();
 			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ formatters: ["default"], gameOutput: aggregateFile }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+				runOptions: makeRunOptions({
+					formatters: ["default"],
+					gameOutput: aggregateFile,
+				}),
 			});
 
 			// File still written (empty group), but no notice for zero entries.
-			expect(vol.existsSync(aggregateFile)).toBeTrue();
+			expect(volume.existsSync(aggregateFile)).toBeTrue();
 			expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining(aggregateFile));
 		});
 	});
@@ -4421,32 +3164,22 @@ describe(runWorkspaceAsync, () => {
 		it("should write the merged result to runOptions.outputFile", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
+			const { fileSystem, volume } = stageWorkspace(seedSpec(FOO_INFO, "src/foo.spec.luau"), {
+				[FOO_DIR]: rooted(FOO_DIR),
 			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
 
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
+			const { backend } = createStubBackend(passingEntries("@halcyon/foo"));
 			const outputFile = path.join(ROOT, "jest-output.log");
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ outputFile, silent: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
-			expect(vol.existsSync(outputFile)).toBeTrue();
-			expect(JSON.parse(vol.readFileSync(outputFile, "utf-8").toString())).toMatchObject({
+			expect(volume.existsSync(outputFile)).toBeTrue();
+			expect(JSON.parse(volume.readFileSync(outputFile, "utf-8").toString())).toMatchObject({
 				numPassedTests: 1,
 				success: true,
 			});
@@ -4455,84 +3188,41 @@ describe(runWorkspaceAsync, () => {
 		it("should not write a result file when runOptions.outputFile is unset", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({ [FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR } });
-
-			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo" },
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO],
-				runOptions: makeRunOptions({ silent: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
+			const { volume } = await runScenarioAsync({
+				configs: {
+					[FOO_DIR]: rooted(FOO_DIR),
+				},
+				entries: passingEntries("@halcyon/foo"),
+				files: seedSpec(FOO_INFO, "src/foo.spec.luau"),
+				run: {
+					packageInfos: [FOO_INFO],
+					runOptions: makeRunOptions({ silent: true }),
+				},
 			});
 
-			expect(vol.existsSync(path.join(ROOT, "jest-output.log"))).toBeFalse();
+			expect(volume.existsSync(path.join(ROOT, "jest-output.log"))).toBeFalse();
 		});
 
 		it("should write the type test result to runOptions.outputFile under --typecheckOnly", async () => {
 			expect.assertions(2);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: {
-						[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-						[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-					},
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
-					rootDir: FOO_DIR,
-					testMatch: ["**/*.spec.ts"],
-					typecheck: { enabled: true },
-				},
-			});
-			vi.mocked(runTypecheckAsync).mockResolvedValue(
-				makeTypeResult({
-					testResults: [
-						{
-							numFailingTests: 0,
-							numPassingTests: 1,
-							numPendingTests: 0,
-							testFilePath: "src/foo.spec-d.ts",
-							testResults: [],
-						},
-					],
-				}),
-			);
+			const { fileSystem, volume } = stagePassingTypecheckFoo();
 
 			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+				passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 			]);
 			const outputFile = path.join(ROOT, "jest-output.log");
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
 				cli: makeCli({ typecheckOnly: true }),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ outputFile, silent: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
-			expect(vol.existsSync(outputFile)).toBeTrue();
-			expect(JSON.parse(vol.readFileSync(outputFile, "utf-8").toString())).toMatchObject({
+			expect(volume.existsSync(outputFile)).toBeTrue();
+			expect(JSON.parse(volume.readFileSync(outputFile, "utf-8").toString())).toMatchObject({
 				testResults: [{ testFilePath: "@halcyon/foo/src/foo.spec-d.ts" }],
 			});
 		});
@@ -4540,54 +3230,21 @@ describe(runWorkspaceAsync, () => {
 		it("should merge the type test result into runOptions.outputFile alongside runtime results", async () => {
 			expect.assertions(1);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: {
-						[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-						[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-					},
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-			setLoadedConfigPerPackage({
-				[FOO_DIR]: {
-					...DEFAULT_CONFIG,
-					rootDir: FOO_DIR,
-					testMatch: ["**/*.spec.ts"],
-					typecheck: { enabled: true },
-				},
-			});
-			vi.mocked(runTypecheckAsync).mockResolvedValue(
-				makeTypeResult({
-					testResults: [
-						{
-							numFailingTests: 0,
-							numPassingTests: 1,
-							numPendingTests: 0,
-							testFilePath: "src/foo.spec-d.ts",
-							testResults: [],
-						},
-					],
-				}),
-			);
+			const { fileSystem, volume } = stagePassingTypecheckFoo();
 
 			const { backend } = createStubBackend([
-				{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+				passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 			]);
 			const outputFile = path.join(ROOT, "jest-output.log");
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO],
 				runOptions: makeRunOptions({ outputFile, silent: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
-			expect(JSON.parse(vol.readFileSync(outputFile, "utf-8").toString())).toMatchObject({
+			expect(JSON.parse(volume.readFileSync(outputFile, "utf-8").toString())).toMatchObject({
 				numPassedTests: 2,
 				testResults: [{ testFilePath: "@halcyon/foo/src/foo.spec-d.ts" }],
 			});
@@ -4598,65 +3255,49 @@ describe(runWorkspaceAsync, () => {
 		it("should route each package's envelope snapshotWrites to its own package directory without cross-package leak", async () => {
 			expect.assertions(4);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR, silent: true },
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, silent: true },
-			});
-
-			const { backend } = createStubBackend([
-				{
-					jestOutput: passingResult(),
-					pkg: "@halcyon/foo",
-					snapshotWrites: {
-						"ReplicatedStorage/Pkg/__snapshots__/foo.spec.snap.luau":
-							"foo-snap-content",
-					},
+			const { volume } = await runScenarioAsync({
+				configs: {
+					[BAR_DIR]: rooted(BAR_DIR, { silent: true }),
+					[FOO_DIR]: rooted(FOO_DIR, { silent: true }),
 				},
-				{
-					jestOutput: passingResult(),
-					pkg: "@halcyon/bar",
-					snapshotWrites: {
-						"ReplicatedStorage/Pkg/__snapshots__/bar.spec.snap.luau":
-							"bar-snap-content",
+				entries: [
+					{
+						jestOutput: passingResult(),
+						pkg: "@halcyon/foo",
+						snapshotWrites: {
+							"ReplicatedStorage/Pkg/__snapshots__/foo.spec.snap.luau":
+								"foo-snap-content",
+						},
 					},
+					{
+						jestOutput: passingResult(),
+						pkg: "@halcyon/bar",
+						snapshotWrites: {
+							"ReplicatedStorage/Pkg/__snapshots__/bar.spec.snap.luau":
+								"bar-snap-content",
+						},
+					},
+				],
+				files: fooBarFiles(),
+				run: {
+					packageInfos: [FOO_INFO, BAR_INFO],
+					runOptions: makeRunOptions({ silent: true }),
 				},
-			]);
-
-			await runWorkspaceAsync({
-				backend,
-				cli: makeCli(),
-				packageInfos: [FOO_INFO, BAR_INFO],
-				runOptions: makeRunOptions({ silent: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
 			const fooSnap = path.join(FOO_DIR, "src/__snapshots__/foo.spec.snap.luau");
 			const barSnap = path.join(BAR_DIR, "src/__snapshots__/bar.spec.snap.luau");
 
-			expect(vol.readFileSync(fooSnap, "utf8")).toBe("foo-snap-content");
-			expect(vol.readFileSync(barSnap, "utf8")).toBe("bar-snap-content");
+			expect(volume.readFileSync(fooSnap, "utf8")).toBe("foo-snap-content");
+			expect(volume.readFileSync(barSnap, "utf8")).toBe("bar-snap-content");
 
 			// No cross-package leak: foo's snapshot path does not appear under
 			// bar's tree, and vice versa.
 			expect(
-				vol.existsSync(path.join(BAR_DIR, "src/__snapshots__/foo.spec.snap.luau")),
+				volume.existsSync(path.join(BAR_DIR, "src/__snapshots__/foo.spec.snap.luau")),
 			).toBeFalse();
 			expect(
-				vol.existsSync(path.join(FOO_DIR, "src/__snapshots__/bar.spec.snap.luau")),
+				volume.existsSync(path.join(FOO_DIR, "src/__snapshots__/bar.spec.snap.luau")),
 			).toBeFalse();
 		});
 
@@ -4671,22 +3312,9 @@ describe(runWorkspaceAsync, () => {
 		it("should still write sibling snapshots and per-package outputs when one entry's envelope is a failure", async () => {
 			expect.assertions(5);
 
-			vol.reset();
-			vol.fromJSON({
-				...seedPackage(FOO_DIR, {
-					name: "@halcyon/foo",
-					specFiles: { [path.join(FOO_DIR, "src/foo.spec.luau")]: "" },
-				}),
-				...seedPackage(BAR_DIR, {
-					name: "@halcyon/bar",
-					specFiles: { [path.join(BAR_DIR, "src/bar.spec.luau")]: "" },
-				}),
-				[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-			});
-
-			setLoadedConfigPerPackage({
-				[BAR_DIR]: { ...DEFAULT_CONFIG, rootDir: BAR_DIR, silent: true },
-				[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, silent: true },
+			const { fileSystem, volume } = stageWorkspace(fooBarFiles(), {
+				[BAR_DIR]: rooted(BAR_DIR, { silent: true }),
+				[FOO_DIR]: rooted(FOO_DIR, { silent: true }),
 			});
 
 			const failureEnvelope = JSON.stringify({
@@ -4709,18 +3337,16 @@ describe(runWorkspaceAsync, () => {
 				},
 			]);
 
-			await runWorkspaceAsync({
+			await runStagedWorkspaceAsync({
 				backend,
-				cli: makeCli(),
+				fileSystem,
 				packageInfos: [FOO_INFO, BAR_INFO],
 				runOptions: makeRunOptions({ silent: true, workspaceOutputFile: true }),
-				version: "0.0.0-test",
-				workspaceRoot: ROOT,
 			});
 
 			// bar's snapshot lands even though foo's envelope failed.
 			expect(
-				vol.readFileSync(
+				volume.readFileSync(
 					path.join(BAR_DIR, "src/__snapshots__/bar.spec.snap.luau"),
 					"utf8",
 				),
@@ -4741,12 +3367,12 @@ describe(runWorkspaceAsync, () => {
 				"@halcyon-bar--@halcyon-bar.jest-output.log",
 			);
 
-			expect(vol.existsSync(fooOutput)).toBeTrue();
-			expect(vol.existsSync(barOutput)).toBeTrue();
-			expect(JSON.parse(vol.readFileSync(fooOutput, "utf-8").toString())).toMatchObject({
+			expect(volume.existsSync(fooOutput)).toBeTrue();
+			expect(volume.existsSync(barOutput)).toBeTrue();
+			expect(JSON.parse(volume.readFileSync(fooOutput, "utf-8").toString())).toMatchObject({
 				success: false,
 			});
-			expect(JSON.parse(vol.readFileSync(barOutput, "utf-8").toString())).toMatchObject({
+			expect(JSON.parse(volume.readFileSync(barOutput, "utf-8").toString())).toMatchObject({
 				numPassedTests: 1,
 				success: true,
 			});
@@ -4771,48 +3397,108 @@ describe("workspace type tests", () => {
 	it("should discover a package's -d type tests via the derived include and return a typecheckResult", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
+		const { fileSystem } = stageWorkspace(
+			seedSpec(FOO_INFO, "src/foo.spec-d.ts", "src/foo.spec.ts"),
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: {
+						enabled: true,
+						ignoreSourceErrors: false,
+						spawnTimeout: 4321,
+					},
+				}),
 			},
-		});
+		);
 
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
+		runTypecheck.mockResolvedValue(makeTypeResult());
 
 		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 		]);
 
-		const result = await runWorkspaceAsync({
+		const result = await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
-		expect(vi.mocked(runTypecheckAsync)).toHaveBeenCalledWith(
+		expect(runTypecheck).toHaveBeenCalledWith(
 			expect.objectContaining({
 				files: expect.arrayContaining([expect.stringMatching(/foo\.spec-d\.ts$/)]),
+				ignoreSourceErrors: false,
+				spawnTimeout: 4321,
 			}),
 		);
 		expect(result!.typecheckResult).toBeDefined();
+	});
+
+	it("should reject typescript type tests in the standalone binary before staging or dispatch", async () => {
+		expect.assertions(4);
+
+		vi.stubEnv("JEST_ROBLOX_SEA", "true");
+		const { fileSystem } = stageWorkspace(
+			seedSpec(FOO_INFO, "src/foo.spec-d.ts", "src/foo.spec.ts"),
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true },
+				}),
+			},
+		);
+
+		const { backend } = createStubBackend([
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
+		]);
+		const runTests = vi.spyOn(backend, "runTestsAsync");
+
+		const error: unknown = await runStagedWorkspaceAsync({
+			backend,
+			fileSystem,
+			packageInfos: [FOO_INFO],
+		}).catch((err: unknown) => err);
+
+		expect(error).toStrictEqual(
+			configErrorLike(
+				"--typecheck is not available in the standalone binary. Install via npm instead.",
+				undefined,
+			),
+		);
+		expect(fileSystem.existsSync(SYNTHESIZED_PROJECT)).toBeFalse();
+		expect(runTests).not.toHaveBeenCalled();
+		expect(runTypecheck).not.toHaveBeenCalled();
+	});
+
+	it("should skip discovered type test files when typechecking is disabled", async () => {
+		expect.assertions(2);
+
+		const { fileSystem } = stageWorkspace(
+			seedSpec(FOO_INFO, "src/foo.spec-d.ts", "src/foo.spec.ts"),
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: false },
+				}),
+			},
+		);
+
+		runTypecheck.mockResolvedValue(makeTypeResult());
+
+		const { backend } = createStubBackend([
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
+		]);
+
+		const result = await runStagedWorkspaceAsync({
+			backend,
+			fileSystem,
+			packageInfos: [FOO_INFO],
+		});
+
+		assert(result !== undefined);
+
+		expect(runTypecheck).not.toHaveBeenCalled();
+
+		expect(result.typecheckResult).toBeUndefined();
 	});
 
 	// The positional selects the type pass as well, so naming one type test
@@ -4820,41 +3506,28 @@ describe("workspace type tests", () => {
 	it("should check only the type test a positional file names", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/other.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/wanted.spec-d.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
+		const { fileSystem } = stageWorkspace(
+			seedSpec(FOO_INFO, "src/other.spec-d.ts", "src/wanted.spec-d.ts"),
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true },
+				}),
 			},
-		});
+		);
 
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
+		runTypecheck.mockResolvedValue(makeTypeResult());
 
 		const { backend } = createStubBackend([]);
 
-		await runWorkspaceAsync({
+		await runStagedWorkspaceAsync({
 			backend,
 			cli: makeCli({ files: [path.join(FOO_DIR, "src/wanted.spec-d.ts")] }),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
-		const { files } = vi.mocked(runTypecheckAsync).mock.calls[0]![0];
+		const { files } = runTypecheck.mock.calls[0]![0];
 
 		// Absolute and platform-native, the same shape the glob half produces —
 		// the two feed one tsgo group, and the ownership match that selected
@@ -4868,84 +3541,33 @@ describe("workspace type tests", () => {
 	it("should skip the type pass when a positional file names a runtime spec", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
+		await runScenarioAsync({
+			configs: {
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true },
+				}),
+			},
+			entries: [passingProjectEntry("@halcyon/foo", "@halcyon/foo")],
+			files: seedSpec(FOO_INFO, "src/foo.spec-d.ts", "src/foo.spec.ts"),
+			run: {
+				cli: makeCli({ files: [path.join(FOO_DIR, "src/foo.spec.ts")] }),
+				packageInfos: [FOO_INFO],
 			},
 		});
 
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli({ files: [path.join(FOO_DIR, "src/foo.spec.ts")] }),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		expect(vi.mocked(runTypecheckAsync)).not.toHaveBeenCalled();
+		expect(runTypecheck).not.toHaveBeenCalled();
 	});
 
 	it("should use an explicit test.typecheck.include instead of deriving from the runtime include", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-					[path.join(FOO_DIR, "src/types/x.spec-d.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true, include: ["src/types/**/*.spec-d.ts"] },
-			},
-		});
-
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
-
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		const { files } = vi.mocked(runTypecheckAsync).mock.calls[0]![0];
+		const files = await typecheckFooFilesAsync(
+			{ enabled: true, include: ["src/types/**/*.spec-d.ts"] },
+			"src/foo.spec-d.ts",
+			"src/foo.spec.ts",
+			"src/types/x.spec-d.ts",
+		);
 
 		expect(files.some((file) => file.endsWith("x.spec-d.ts"))).toBeTrue();
 		expect(files.some((file) => file.endsWith("foo.spec-d.ts"))).toBeFalse();
@@ -4954,216 +3576,136 @@ describe("workspace type tests", () => {
 	it("should subtract test.typecheck.exclude from the discovered type tests", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/a.gen.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/a.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/a.spec.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true, exclude: ["src/**/*.gen.spec-d.ts"] },
-			},
-		});
-
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
-
-		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-		]);
-
-		await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		const { files } = vi.mocked(runTypecheckAsync).mock.calls[0]![0];
+		const files = await typecheckFooFilesAsync(
+			{ enabled: true, exclude: ["src/**/*.gen.spec-d.ts"] },
+			"src/a.gen.spec-d.ts",
+			"src/a.spec-d.ts",
+			"src/a.spec.ts",
+		);
 
 		expect(files.some((file) => file.endsWith("a.spec-d.ts"))).toBeTrue();
 		expect(files.some((file) => file.endsWith("a.gen.spec-d.ts"))).toBeFalse();
 	});
 
 	it("should collapse multi-project packages sharing a tsconfig into one tsgo group at the package directory", async () => {
-		expect.assertions(3);
-
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "out/Client/a.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "out/Client/a.spec.ts")]: "",
-					[path.join(FOO_DIR, "out/Server/b.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "out/Server/b.spec.ts")]: "",
-				},
-				tree: {
-					$className: "DataModel",
-					ReplicatedStorage: { Client: { $path: "out/Client" } },
-					ServerScriptService: { Server: { $path: "out/Server" } },
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
+		expect.assertions(1);
 
 		const projects = makeProjectEntries([
 			{ test: { displayName: "client", include: ["out/Client/**/*.spec.ts"] } },
 			{ test: { displayName: "server", include: ["out/Server/**/*.spec.ts"] } },
 		]);
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				projects,
-				rootDir: FOO_DIR,
-				typecheck: { enabled: true, tsconfig: "tsconfig.types.json" },
+		const { fileSystem } = stageWorkspace(
+			{
+				...seedPackage(FOO_DIR, {
+					name: "@halcyon/foo",
+					specFiles: {
+						[path.join(FOO_DIR, "out/Client/a.spec-d.ts")]: "",
+						[path.join(FOO_DIR, "out/Client/a.spec.ts")]: "",
+						[path.join(FOO_DIR, "out/Server/b.spec-d.ts")]: "",
+						[path.join(FOO_DIR, "out/Server/b.spec.ts")]: "",
+					},
+					tree: {
+						$className: "DataModel",
+						ReplicatedStorage: { Client: { $path: "out/Client" } },
+						ServerScriptService: { Server: { $path: "out/Server" } },
+					},
+				}),
 			},
-		});
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					projects,
+					typecheck: { enabled: true, tsconfig: "tsconfig.types.json" },
+				}),
+			},
+		);
 
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
+		runTypecheck.mockResolvedValue(makeTypeResult());
 
 		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "client" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "server" },
+			passingProjectEntry("@halcyon/foo", "client"),
+			passingProjectEntry("@halcyon/foo", "server"),
 		]);
 
-		await runWorkspaceAsync({
+		await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
-		expect(vi.mocked(runTypecheckAsync)).toHaveBeenCalledOnce();
-
-		const call = vi.mocked(runTypecheckAsync).mock.calls[0]![0];
-
-		expect(call.rootDir).toBe(FOO_DIR);
-		expect(call.files).toHaveLength(2);
+		expect(runTypecheck).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				files: [expect.any(String), expect.any(String)],
+				rootDir: FOO_DIR,
+			}),
+		);
 	});
 
 	it("should form distinct groups per package even when they share the same relative tsconfig name", async () => {
 		expect.assertions(3);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/index.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/index.spec.ts")]: "",
-				},
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: {
-					[path.join(BAR_DIR, "src/index.spec-d.ts")]: "",
-					[path.join(BAR_DIR, "src/index.spec.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: BAR_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true, tsconfig: "tsconfig.types.json" },
+		const { fileSystem } = stageWorkspace(
+			{
+				...seedSpec(FOO_INFO, "src/index.spec-d.ts", "src/index.spec.ts"),
+				...seedSpec(BAR_INFO, "src/index.spec-d.ts", "src/index.spec.ts"),
 			},
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true, tsconfig: "tsconfig.types.json" },
+			{
+				[BAR_DIR]: rooted(BAR_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true, tsconfig: "tsconfig.types.json" },
+				}),
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true, tsconfig: "tsconfig.types.json" },
+				}),
 			},
-		});
+		);
 
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
+		runTypecheck.mockResolvedValue(makeTypeResult());
 
 		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar", project: "@halcyon/bar" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
+			passingProjectEntry("@halcyon/bar", "@halcyon/bar"),
 		]);
 
-		await runWorkspaceAsync({
+		await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
-		expect(vi.mocked(runTypecheckAsync)).toHaveBeenCalledTimes(2);
+		expect(runTypecheck).toHaveBeenCalledTimes(2);
 
-		const rootDirectories = vi
-			.mocked(runTypecheckAsync)
-			.mock.calls.map((call) => call[0].rootDir)
-			.sort();
+		const rootDirectories = runTypecheck.mock.calls.map((call) => call[0].rootDir).sort();
 
 		expect(rootDirectories).toStrictEqual([BAR_DIR, FOO_DIR].sort());
 		expect(
-			vi
-				.mocked(runTypecheckAsync)
-				.mock.calls.every((call) => call[0].tsconfig === "tsconfig.types.json"),
+			runTypecheck.mock.calls.every((call) => call[0].tsconfig === "tsconfig.types.json"),
 		).toBeTrue();
 	});
 
 	it("should compose package identity onto each merged type test file result", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/index.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/index.spec.ts")]: "",
-				},
-			}),
-			...seedPackage(BAR_DIR, {
-				name: "@halcyon/bar",
-				specFiles: {
-					[path.join(BAR_DIR, "src/index.spec-d.ts")]: "",
-					[path.join(BAR_DIR, "src/index.spec.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[BAR_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: BAR_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
+		const { fileSystem } = stageWorkspace(
+			{
+				...seedSpec(FOO_INFO, "src/index.spec-d.ts", "src/index.spec.ts"),
+				...seedSpec(BAR_INFO, "src/index.spec-d.ts", "src/index.spec.ts"),
 			},
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
+			{
+				[BAR_DIR]: rooted(BAR_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true },
+				}),
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true },
+				}),
 			},
-		});
+		);
 
 		// Each group's tsgo returns the SAME package-relative file path; identity
 		// composition must keep the two packages' results distinguishable.
-		vi.mocked(runTypecheckAsync).mockResolvedValue(
+		runTypecheck.mockResolvedValue(
 			makeTypeResult({
 				testResults: [
 					{
@@ -5178,17 +3720,14 @@ describe("workspace type tests", () => {
 		);
 
 		const { backend } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
-			{ jestOutput: passingResult(), pkg: "@halcyon/bar", project: "@halcyon/bar" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
+			passingProjectEntry("@halcyon/bar", "@halcyon/bar"),
 		]);
 
-		const result = await runWorkspaceAsync({
+		const result = await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO, BAR_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		const paths = result!.typecheckResult!.testResults.map((file) => file.testFilePath);
@@ -5200,26 +3739,15 @@ describe("workspace type tests", () => {
 	it("should run the type pass concurrently with the Open Cloud run", async () => {
 		expect.assertions(1);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
+		const { fileSystem } = stageWorkspace(
+			seedSpec(FOO_INFO, "src/foo.spec-d.ts", "src/foo.spec.ts"),
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true },
+				}),
 			},
-		});
+		);
 
 		// A rendezvous: each side proceeds only once the other has started, so
 		// the run completes only when the two overlap. A strictly-sequential pass
@@ -5234,6 +3762,7 @@ describe("workspace type tests", () => {
 		});
 		const backend: Backend = {
 			kind: "open-cloud",
+			placeInput: "built",
 			runTestsAsync: async (): Promise<BackendResult> => {
 				signalRuntimeStarted();
 				await typecheckStarted;
@@ -5243,19 +3772,16 @@ describe("workspace type tests", () => {
 				};
 			},
 		};
-		vi.mocked(runTypecheckAsync).mockImplementation(async () => {
+		runTypecheck.mockImplementation(async () => {
 			signalTypecheckStarted();
 			await runtimeStarted;
 			return makeTypeResult();
 		});
 
-		const result = await runWorkspaceAsync({
+		const result = await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		expect(result!.typecheckResult).toBeDefined();
@@ -5264,39 +3790,28 @@ describe("workspace type tests", () => {
 	it("should short-circuit --typecheckOnly: no place build, no backend dispatch, only the type pass", async () => {
 		expect.assertions(4);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: {
-					[path.join(FOO_DIR, "src/foo.spec-d.ts")]: "",
-					[path.join(FOO_DIR, "src/foo.spec.ts")]: "",
-				},
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
+		const { fileSystem } = stageWorkspace(
+			seedSpec(FOO_INFO, "src/foo.spec-d.ts", "src/foo.spec.ts"),
+			{
+				[FOO_DIR]: rooted(FOO_DIR, { testMatch: ["**/*.spec.ts"] }),
+			},
+		);
 
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: { ...DEFAULT_CONFIG, rootDir: FOO_DIR, testMatch: ["**/*.spec.ts"] },
-		});
-
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
+		runTypecheck.mockResolvedValue(makeTypeResult());
 
 		const { backend, captured } = createStubBackend([
-			{ jestOutput: passingResult(), pkg: "@halcyon/foo", project: "@halcyon/foo" },
+			passingProjectEntry("@halcyon/foo", "@halcyon/foo"),
 		]);
 
-		const result = await runWorkspaceAsync({
+		const result = await runStagedWorkspaceAsync({
 			backend,
 			cli: makeCli({ typecheckOnly: true }),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		expect(captured.options).toBeUndefined();
-		expect(vi.mocked(buildPlaceAsync)).not.toHaveBeenCalled();
+		expect(fileSystem.existsSync(SYNTHESIZED_PROJECT)).toBeFalse();
 		expect(result!.typecheckResult).toBeDefined();
 		expect(result!.results).toHaveLength(0);
 	});
@@ -5304,78 +3819,32 @@ describe("workspace type tests", () => {
 	it("should report results for a type-test-only package rather than erroring on no runtime specs", async () => {
 		expect.assertions(2);
 
-		vol.reset();
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, {
-				name: "@halcyon/foo",
-				specFiles: { [path.join(FOO_DIR, "src/foo.spec-d.ts")]: "" },
-			}),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
 		// passWithNoTests defaults false; only a `.spec-d.ts` exists, so runtime
 		// discovery finds nothing. The package must not error — its type tests
 		// run.
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
+		const { fileSystem } = stageWorkspace(
+			{
+				...seedSpec(FOO_INFO, "src/foo.spec-d.ts"),
 			},
-		});
+			{
+				[FOO_DIR]: rooted(FOO_DIR, {
+					testMatch: ["**/*.spec.ts"],
+					typecheck: { enabled: true },
+				}),
+			},
+		);
 
-		vi.mocked(runTypecheckAsync).mockResolvedValue(makeTypeResult());
+		runTypecheck.mockResolvedValue(makeTypeResult());
 
 		const { backend } = createStubBackend([]);
 
-		const result = await runWorkspaceAsync({
+		const result = await runStagedWorkspaceAsync({
 			backend,
-			cli: makeCli(),
+			fileSystem,
 			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
 		});
 
 		expect(result).toBeDefined();
 		expect(result!.typecheckResult).toBeDefined();
-	});
-
-	it("should still error for a truly empty package even with typecheck enabled", async () => {
-		expect.assertions(2);
-
-		vol.reset();
-		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-
-		vol.fromJSON({
-			...seedPackage(FOO_DIR, { name: "@halcyon/foo" }),
-			[path.join(ROOT, "pnpm-workspace.yaml")]: "packages:\n  - packages/*\n",
-		});
-
-		setLoadedConfigPerPackage({
-			[FOO_DIR]: {
-				...DEFAULT_CONFIG,
-				rootDir: FOO_DIR,
-				testMatch: ["**/*.spec.ts"],
-				typecheck: { enabled: true },
-			},
-		});
-
-		const { backend } = createStubBackend([]);
-
-		const result = await runWorkspaceAsync({
-			backend,
-			cli: makeCli(),
-			packageInfos: [FOO_INFO],
-			runOptions: makeRunOptions(),
-			version: "0.0.0-test",
-			workspaceRoot: ROOT,
-		});
-
-		expect(result).toBeUndefined();
-		expect(stderr).toHaveBeenCalledWith(
-			expect.stringMatching(/No test files found in package @halcyon\/foo/),
-		);
 	});
 });

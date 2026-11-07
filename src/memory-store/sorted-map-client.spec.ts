@@ -10,11 +10,7 @@ import { StorageClient } from "@bedrock-rbx/ocale/storage";
 
 import { describe, expect, it, vi } from "vitest";
 
-import {
-	decodeStreamingResult,
-	StreamingResultClient,
-	type StreamingResultEntry,
-} from "./sorted-map-client.ts";
+import { StreamingResultClient, type StreamingResultEntry } from "./sorted-map-client.ts";
 
 interface SortedMapStub {
 	createdRequests: Array<CreateSortedMapItemParameters>;
@@ -178,7 +174,8 @@ describe(StreamingResultClient, () => {
 		it("should throw when sortedMaps.create returns a failure Result", async () => {
 			expect.assertions(1);
 
-			const stub = createSortedMapStub({ createError: new OpenCloudError("rate limited") });
+			const cause = new OpenCloudError("rate limited");
+			const stub = createSortedMapStub({ createError: cause });
 			const client = new StreamingResultClient({
 				credentials: CREDENTIALS,
 				mapId: "m",
@@ -186,7 +183,10 @@ describe(StreamingResultClient, () => {
 			});
 
 			await expect(client.writeAsync(makeEntry())).rejects.toThrow(
-				"Failed to write streaming result: rate limited",
+				expect.objectContaining({
+					cause,
+					message: "Failed to write streaming result: rate limited",
+				}),
 			);
 		});
 	});
@@ -290,7 +290,8 @@ describe(StreamingResultClient, () => {
 		it("should throw when sortedMaps.list returns a failure Result", async () => {
 			expect.assertions(1);
 
-			const stub = createSortedMapStub({ listError: new OpenCloudError("auth failed") });
+			const cause = new OpenCloudError("auth failed");
+			const stub = createSortedMapStub({ listError: cause });
 			const client = new StreamingResultClient({
 				credentials: CREDENTIALS,
 				mapId: "m",
@@ -298,7 +299,10 @@ describe(StreamingResultClient, () => {
 			});
 
 			await expect(client.readAllAsync()).rejects.toThrow(
-				"Failed to read streaming results: auth failed",
+				expect.objectContaining({
+					cause,
+					message: "Failed to read streaming results: auth failed",
+				}),
 			);
 		});
 
@@ -346,7 +350,8 @@ describe(StreamingResultClient, () => {
 		it("should throw when sortedMaps.delete returns a failure Result", async () => {
 			expect.assertions(1);
 
-			const stub = createSortedMapStub({ deleteError: new OpenCloudError("not found") });
+			const cause = new OpenCloudError("not found");
+			const stub = createSortedMapStub({ deleteError: cause });
 			const client = new StreamingResultClient({
 				credentials: CREDENTIALS,
 				mapId: "m",
@@ -354,7 +359,10 @@ describe(StreamingResultClient, () => {
 			});
 
 			await expect(client.deleteAsync("a::p")).rejects.toThrow(
-				"Failed to delete streaming result: not found",
+				expect.objectContaining({
+					cause,
+					message: "Failed to delete streaming result: not found",
+				}),
 			);
 		});
 	});
@@ -385,20 +393,32 @@ describe(StreamingResultClient, () => {
 	});
 });
 
-describe(decodeStreamingResult, () => {
-	it("should throw when wire payload is missing required fields", () => {
+describe("streaming result decoding", () => {
+	async function readOneAsync(value: SortedMapItem["value"]): Promise<unknown> {
+		const stub = createSortedMapStub({
+			listPages: [{ items: [makeItem({ id: "a::b", value })], nextPageToken: undefined }],
+		});
+		const client = new StreamingResultClient({
+			credentials: CREDENTIALS,
+			mapId: "m",
+			storageFactory: () => stub.storage,
+		});
+		return client.readAllAsync();
+	}
+
+	it("should throw when wire payload is missing required fields", async () => {
 		expect.assertions(1);
 
-		expect(() => decodeStreamingResult({ elapsedMs: 0, pkg: "a", project: "b" })).toThrow(
+		await expect(readOneAsync({ elapsedMs: 0, pkg: "a", project: "b" })).rejects.toThrow(
 			"numFailedTests must be a number",
 		);
 	});
 
-	it("should throw when wire payload field has wrong type", () => {
+	it("should throw when wire payload field has wrong type", async () => {
 		expect.assertions(1);
 
-		expect(() => {
-			return decodeStreamingResult({
+		await expect(
+			readOneAsync({
 				elapsedMs: "fast",
 				numFailedTests: 0,
 				numPassedTests: 1,
@@ -406,13 +426,13 @@ describe(decodeStreamingResult, () => {
 				pkg: "a",
 				project: "b",
 				success: true,
-			});
-		}).toThrow("elapsedMs must be a number");
+			}),
+		).rejects.toThrow("elapsedMs must be a number");
 	});
 
-	it("should throw when wire payload is not an object", () => {
+	it("should throw when wire payload is not an object", async () => {
 		expect.assertions(1);
 
-		expect(() => decodeStreamingResult("not-an-object")).toThrow("must be an object");
+		await expect(readOneAsync("not-an-object")).rejects.toThrow("must be an object");
 	});
 });

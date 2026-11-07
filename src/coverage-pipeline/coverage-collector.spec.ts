@@ -1,26 +1,38 @@
 import type { LuauSpan } from "@isentinel/luau-ast/ast";
+import { loadLuauParser } from "@isentinel/luau-ast/parser";
 
 import { assert, describe, expect, it } from "vitest";
 
-import { luauParser } from "../luau/parser.ts";
+import { COLLECTED_FIXTURES } from "#test/mocks/coverage-collected-fixtures.ts";
 import type { CollectorResult } from "./coverage-collector.ts";
 import { collectCoverage } from "./coverage-collector.ts";
 
-function span(
-	beginLine: number,
-	beginColumn: number,
-	endLine: number,
-	endColumn: number,
-): LuauSpan {
+function span({
+	beginColumn,
+	beginLine,
+	endColumn,
+	endLine,
+}: {
+	beginColumn: number;
+	beginLine: number;
+	endColumn: number;
+	endLine: number;
+}): LuauSpan {
 	return { beginColumn, beginLine, endColumn, endLine };
 }
 
-/** Parse real source and run the collector over it. */
-function collect(source: string): CollectorResult {
+/**
+ * Parse real source and run the collector over it.
+ * @param source - Luau source text.
+ * @returns The collected coverage records.
+ */
+function collect(source: string): CollectorResult<LuauSpan> {
 	const parsed = luauParser.parse(source);
 	assert(parsed.ok);
-	return collectCoverage(parsed.root, source);
+	return collectCoverage(parsed, source);
 }
+
+const luauParser = loadLuauParser();
 
 describe(collectCoverage, () => {
 	describe("statements", () => {
@@ -44,11 +56,11 @@ describe(collectCoverage, () => {
 			expect(result.statements).toHaveLength(2);
 			expect(result.statements[0]).toStrictEqual({
 				index: 1,
-				location: span(1, 1, 1, 12),
+				location: span({ beginColumn: 1, beginLine: 1, endColumn: 12, endLine: 1 }),
 			});
 			expect(result.statements[1]).toStrictEqual({
 				index: 2,
-				location: span(2, 1, 2, 9),
+				location: span({ beginColumn: 1, beginLine: 2, endColumn: 9, endLine: 2 }),
 			});
 		});
 
@@ -74,7 +86,7 @@ describe(collectCoverage, () => {
 				bodyFirstColumn: 2,
 				bodyFirstLine: 2,
 				index: 1,
-				location: span(1, 1, 3, 4),
+				location: span({ beginColumn: 1, beginLine: 1, endColumn: 4, endLine: 3 }),
 			});
 		});
 
@@ -206,12 +218,12 @@ describe(collectCoverage, () => {
 			expect(result.wrapProbes[0]).toStrictEqual({
 				armIndex: 1,
 				branchIndex: 1,
-				exprLocation: span(1, 21, 1, 22),
+				exprLocation: span({ beginColumn: 21, beginLine: 1, endColumn: 22, endLine: 1 }),
 			});
 			expect(result.wrapProbes[1]).toStrictEqual({
 				armIndex: 2,
 				branchIndex: 1,
-				exprLocation: span(1, 28, 1, 29),
+				exprLocation: span({ beginColumn: 28, beginLine: 1, endColumn: 29, endLine: 1 }),
 			});
 		});
 
@@ -240,12 +252,30 @@ describe(collectCoverage, () => {
 			expect(result.branches[0]!.branchType).toBe("binary-expr");
 			expect(result.branches[0]!.arms).toHaveLength(2);
 			expect(result.branches[0]!.arms.map((arm) => arm.location)).toStrictEqual([
-				span(1, 11, 1, 12),
-				span(1, 17, 1, 18),
+				span({ beginColumn: 11, beginLine: 1, endColumn: 12, endLine: 1 }),
+				span({ beginColumn: 17, beginLine: 1, endColumn: 18, endLine: 1 }),
 			]);
 			expect(result.wrapProbes).toStrictEqual([
-				{ armIndex: 1, branchIndex: 1, exprLocation: span(1, 11, 1, 12) },
-				{ armIndex: 2, branchIndex: 1, exprLocation: span(1, 17, 1, 18) },
+				{
+					armIndex: 1,
+					branchIndex: 1,
+					exprLocation: span({
+						beginColumn: 11,
+						beginLine: 1,
+						endColumn: 12,
+						endLine: 1,
+					}),
+				},
+				{
+					armIndex: 2,
+					branchIndex: 1,
+					exprLocation: span({
+						beginColumn: 17,
+						beginLine: 1,
+						endColumn: 18,
+						endLine: 1,
+					}),
+				},
 			]);
 		});
 
@@ -277,13 +307,162 @@ describe(collectCoverage, () => {
 
 			expect(result.branches.map((branch) => branch.index)).toStrictEqual([1, 2]);
 			expect(result.branches[0]!.arms.map((arm) => arm.location)).toStrictEqual([
-				span(1, 11, 1, 18),
-				span(1, 23, 1, 24),
+				span({ beginColumn: 11, beginLine: 1, endColumn: 18, endLine: 1 }),
+				span({ beginColumn: 23, beginLine: 1, endColumn: 24, endLine: 1 }),
 			]);
 			expect(result.branches[1]!.arms.map((arm) => arm.location)).toStrictEqual([
-				span(1, 11, 1, 12),
-				span(1, 17, 1, 18),
+				span({ beginColumn: 11, beginLine: 1, endColumn: 12, endLine: 1 }),
+				span({ beginColumn: 17, beginLine: 1, endColumn: 18, endLine: 1 }),
 			]);
 		});
+	});
+
+	describe("ignore directives", () => {
+		it("should drop the next statement and every site inside it", () => {
+			expect.assertions(3);
+
+			const result = collect(
+				[
+					"-- cov ignore next",
+					"local function f()",
+					"\tif a and b then",
+					"\t\tg()",
+					"\tend",
+					"end",
+					"local y = 1",
+				].join("\n"),
+			);
+
+			expect(result.statements).toStrictEqual([
+				{
+					index: 1,
+					location: span({ beginColumn: 1, beginLine: 7, endColumn: 12, endLine: 7 }),
+				},
+			]);
+			expect(result.functions).toBeEmpty();
+			expect(result.branches).toBeEmpty();
+		});
+
+		it("should drop a function statement and keep the next one", () => {
+			expect.assertions(1);
+
+			const result = collect(
+				["-- cov ignore next", "function Obj.a()", "end", "function Obj.b()", "end"].join(
+					"\n",
+				),
+			);
+
+			expect(result.functions.map((func) => func.name)).toStrictEqual(["Obj.b"]);
+		});
+
+		it("should keep indices contiguous around a dropped statement", () => {
+			expect.assertions(1);
+
+			const result = collect(
+				["local a = 1", "-- cov ignore next", "local b = 2", "local c = 3"].join("\n"),
+			);
+
+			expect(result.statements).toStrictEqual([
+				{
+					index: 1,
+					location: span({ beginColumn: 1, beginLine: 1, endColumn: 12, endLine: 1 }),
+				},
+				{
+					index: 2,
+					location: span({ beginColumn: 1, beginLine: 4, endColumn: 12, endLine: 4 }),
+				},
+			]);
+		});
+
+		it("should drop a function expression the directive precedes", () => {
+			expect.assertions(2);
+
+			const result = collect("f(--[[ cov ignore next ]] function()\n\treturn 1\nend)");
+
+			expect(result.functions).toBeEmpty();
+			expect(result.statements).toStrictEqual([
+				{
+					index: 1,
+					location: span({ beginColumn: 1, beginLine: 1, endColumn: 5, endLine: 3 }),
+				},
+			]);
+		});
+
+		it("should drop the then arm and its body with ignore if", () => {
+			expect.assertions(3);
+
+			const result = collect(
+				["-- cov ignore if", "if not x then", '\terror("x")', "end"].join("\n"),
+			);
+
+			expect(result.statements).toStrictEqual([
+				{
+					index: 1,
+					location: span({ beginColumn: 1, beginLine: 2, endColumn: 4, endLine: 4 }),
+				},
+			]);
+			expect(result.branches[0]!.arms).toStrictEqual([
+				{
+					bodyFirstColumn: 0,
+					bodyFirstLine: 0,
+					location: span({ beginColumn: 1, beginLine: 2, endColumn: 1, endLine: 2 }),
+				},
+			]);
+			expect(result.implicitElseProbes).toStrictEqual([
+				{ armIndex: 1, branchIndex: 1, endColumn: 1, endLine: 4 },
+			]);
+		});
+
+		it("should drop the else arm and its body with ignore else", () => {
+			expect.assertions(2);
+
+			const result = collect(
+				[
+					"-- cov ignore else",
+					"if a then",
+					"\tf()",
+					"elseif b then",
+					"\tg()",
+					"else",
+					"\th()",
+					"end",
+				].join("\n"),
+			);
+
+			expect(
+				result.statements.map((statement) => statement.location.beginLine),
+			).toStrictEqual([2, 3, 5]);
+			expect(result.branches[0]!.arms.map((arm) => arm.bodyFirstLine)).toStrictEqual([3, 5]);
+		});
+
+		it("should drop the implicit else arm with ignore else", () => {
+			expect.assertions(2);
+
+			const result = collect(["-- cov ignore else", "if a then", "\tf()", "end"].join("\n"));
+
+			expect(result.branches[0]!.arms.map((arm) => arm.bodyFirstLine)).toStrictEqual([3]);
+			expect(result.implicitElseProbes).toBeEmpty();
+		});
+
+		it("should drop the whole branch when ignore if and ignore else both apply", () => {
+			expect.assertions(2);
+
+			const result = collect(
+				["-- cov ignore if", "-- cov ignore else", "if a then", "\tf()", "end"].join("\n"),
+			);
+
+			expect(result.branches).toBeEmpty();
+			expect(result.statements).toHaveLength(1);
+		});
+	});
+});
+
+describe("collected fixtures", () => {
+	it.for(Object.keys(COLLECTED_FIXTURES))("should collect %s as recorded", (name) => {
+		expect.assertions(1);
+
+		const fixture = COLLECTED_FIXTURES[name]!;
+
+		expect(collect(fixture.source)).toStrictEqual(fixture.result);
 	});
 });

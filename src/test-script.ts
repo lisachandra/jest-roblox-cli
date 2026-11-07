@@ -2,14 +2,13 @@ import type { Argv } from "@rbxts/jest/src/config";
 
 import process from "node:process";
 
-import {
-	JEST_ARGV_EXCLUDED_KEYS,
-	type ResolvedConfig,
-	type SnapshotFormatOptions,
-} from "./config/schema.ts";
+import { JEST_ARGV_EXCLUDED_KEYS } from "./config/config-keys.ts";
+import type { ResolvedConfig, SnapshotFormatOptions } from "./config/schema.ts";
 import template from "./test-runner.bundled.luau";
-
-const TS_OR_LUAU_EXTENSION = /\.(tsx?|luau?)$/;
+import {
+	toRobloxTestMatch,
+	toRobloxTestPathIgnorePatterns,
+} from "./typecheck/type-test-pattern.ts";
 
 /**
  * Jest's argv plus the four keys our own runner reads, declared here so the
@@ -32,17 +31,26 @@ export type JestArgv = Argv & {
 	testMatch: Array<string>;
 };
 
+/** Input to `buildJestArgv`. */
 export interface JestArgvInput {
+	/** Resolved config to translate. */
 	config: ResolvedConfig;
+	/** Test files the run covers. */
 	testFiles: Array<string>;
 }
 
+/**
+ * Translate a resolved config into the argv jest-roblox runs with.
+ * @param options - Resolved config and the test files to run.
+ * @returns Argv with Roblox-form test patterns and the Jest passthrough keys.
+ */
 export function buildJestArgv(options: JestArgvInput): JestArgv {
 	// Jest passthrough keys are copied by name, so they land via `Reflect.set`
 	// on an already-typed argv rather than being asserted onto one afterwards.
-	const { testMatch, ...config } = options.config;
+	const { testMatch, testPathIgnorePatterns, ...config } = options.config;
 	const argv: JestArgv = {
-		testMatch: testMatch.map((pattern) => pattern.replace(TS_OR_LUAU_EXTENSION, "")),
+		testMatch: toRobloxTestMatch(testMatch),
+		testPathIgnorePatterns: toRobloxTestPathIgnorePatterns(testPathIgnorePatterns),
 	};
 	for (const [key, value] of Object.entries(config)) {
 		if (value !== undefined && !JEST_ARGV_EXCLUDED_KEYS.has(key)) {
@@ -84,21 +92,10 @@ export function buildJestArgv(options: JestArgvInput): JestArgv {
  * The Luau task script for one bucket of configs.
  *
  * @param options - The configs to run, and the test files each selects.
- * @param testProgressMapId - Where the runtime heartbeats the test it is on,
- *   so a run that never comes back can still be told which test it died
- *   inside. Omitted rather than nulled when there is none, so a run without
- *   one generates the byte-for-byte script it always did.
  * @returns The script to submit.
  */
-export function generateTestScript(
-	options: Array<JestArgvInput> | JestArgvInput,
-	testProgressMapId?: string,
-): string {
+export function generateTestScript(options: Array<JestArgvInput> | JestArgvInput): string {
 	const inputs = Array.isArray(options) ? options : [options];
 	const configs = inputs.map((input) => buildJestArgv(input));
-	const payload =
-		testProgressMapId === undefined
-			? { configs }
-			: { configs, progress: { mapId: testProgressMapId } };
-	return template.replace("__CONFIG_JSON__", () => JSON.stringify(payload));
+	return template.replace("__CONFIG_JSON__", () => JSON.stringify({ configs }));
 }

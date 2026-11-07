@@ -1,42 +1,53 @@
-import type { LuauSpan } from "@isentinel/luau-ast/ast";
+import type { LuauSpan, Utf16Span } from "@isentinel/luau-ast/ast";
 
 /**
- * Columns here are UTF-16, not the UTF-8 bytes {@link LuauSpan} arrives in:
- * `collectCoverage` runs the whole result through `toUtf16Columns` before
- * returning it. A new column-bearing field needs adding there too — the spread
- * that copies each record would otherwise carry it through in bytes.
+ * Columns here are UTF-16 by default; the accumulator produces the
+ * {@link LuauSpan} form in bytes, and `collectCoverage` runs it through
+ * `toUtf16Columns` before returning it. A new column-bearing field that is not
+ * a span needs adding there too — the spread that copies each record would
+ * otherwise carry it through in bytes.
+ * @template Span - Column unit of every span.
  */
-export interface CollectorResult {
-	branches: Array<BranchInfo>;
-	functions: Array<FunctionInfo>;
+export interface CollectorResult<Span extends LuauSpan = Utf16Span> {
+	/** Branch records, in index order. */
+	branches: Array<BranchInfo<Span>>;
+	/** Function records, in index order. */
+	functions: Array<FunctionInfo<Span>>;
+	/** Probes for the synthetic arm of each `if` with no `else`. */
 	implicitElseProbes: Array<ImplicitElseProbe>;
-	statements: Array<StatementInfo>;
-	wrapProbes: Array<WrapProbe>;
+	/** Statement records, in index order. */
+	statements: Array<StatementInfo<Span>>;
+	/** Operand expressions to wrap with `__cov_br`. */
+	wrapProbes: Array<WrapProbe<Span>>;
 }
 
 /** A line/column pair in the original Luau source. */
 export interface SourcePosition {
+	/** Column on that line. */
 	column: number;
+	/** Source line. */
 	line: number;
 }
 
 /** One arm of a statement branch, carrying the real position of its body. */
 export interface StatementBranchArm {
+	/** Start of the arm's body, where its point probe goes. */
 	bodyFirst: SourcePosition;
+	/** Span of the whole arm. */
 	location: LuauSpan;
 }
 
-interface StatementInfo {
+interface StatementInfo<Span extends LuauSpan> {
 	index: number;
-	location: LuauSpan;
+	location: Span;
 }
 
-interface FunctionInfo {
+interface FunctionInfo<Span extends LuauSpan> {
 	name: string;
 	bodyFirstColumn: number;
 	bodyFirstLine: number;
 	index: number;
-	location: LuauSpan;
+	location: Span;
 }
 
 /**
@@ -48,15 +59,16 @@ interface FunctionInfo {
  * point probes for any arm with `bodyFirstLine === 0`. Both `binary-expr`
  * (`and`/`or`) and `expr-if` arms use this convention; statement-`if` arms
  * carry real body positions.
+ * @template Span - Column unit of the span.
  */
-interface BranchArmInfo {
+interface BranchArmInfo<Span extends LuauSpan> {
 	bodyFirstColumn: number;
 	bodyFirstLine: number;
-	location: LuauSpan;
+	location: Span;
 }
 
-interface BranchInfo {
-	arms: Array<BranchArmInfo>;
+interface BranchInfo<Span extends LuauSpan> {
+	arms: Array<BranchArmInfo<Span>>;
 	branchType: string;
 	index: number;
 }
@@ -73,11 +85,12 @@ interface ImplicitElseProbe {
  * expression-`if` arms and `and`/`or` operands — both are instrumented by
  * wrapping the original expression so its value flows through unchanged while a
  * branch counter is bumped, preserving short-circuit semantics.
+ * @template Span - Column unit of the span.
  */
-interface WrapProbe {
+interface WrapProbe<Span extends LuauSpan> {
 	armIndex: number;
 	branchIndex: number;
-	exprLocation: LuauSpan;
+	exprLocation: Span;
 }
 
 /** Placement data for the synthetic arm of an `if` with no `else` block. */
@@ -95,11 +108,11 @@ interface ImplicitElse {
  * the 1..N `armIndex` pairing between a branch's arms and their probes.
  */
 class CoverageAccumulator {
-	private readonly branches: Array<BranchInfo> = [];
-	private readonly functions: Array<FunctionInfo> = [];
+	private readonly branches: Array<BranchInfo<LuauSpan>> = [];
+	private readonly functions: Array<FunctionInfo<LuauSpan>> = [];
 	private readonly implicitElseProbes: Array<ImplicitElseProbe> = [];
-	private readonly statements: Array<StatementInfo> = [];
-	private readonly wrapProbes: Array<WrapProbe> = [];
+	private readonly statements: Array<StatementInfo<LuauSpan>> = [];
+	private readonly wrapProbes: Array<WrapProbe<LuauSpan>> = [];
 
 	private branchIndex = 1;
 	private functionIndex = 1;
@@ -132,7 +145,15 @@ class CoverageAccumulator {
 		}
 	}
 
-	public addFunction(name: string, location: LuauSpan, { column, line }: SourcePosition): void {
+	public addFunction({
+		name,
+		location,
+		start: { column, line },
+	}: {
+		location: LuauSpan;
+		name: string;
+		start: SourcePosition;
+	}): void {
 		this.functions.push({
 			name,
 			bodyFirstColumn: column,
@@ -175,7 +196,7 @@ class CoverageAccumulator {
 		this.branches.push({ arms: branchArms, branchType: "if", index });
 	}
 
-	public result(): CollectorResult {
+	public result(): CollectorResult<LuauSpan> {
 		return {
 			branches: this.branches,
 			functions: this.functions,
@@ -188,15 +209,19 @@ class CoverageAccumulator {
 
 export type { CoverageAccumulator };
 
+/**
+ * Start an empty accumulator for one file.
+ * @returns An accumulator with every counter at index zero.
+ */
 export function createCoverageAccumulator(): CoverageAccumulator {
 	return new CoverageAccumulator();
 }
 
-function makeWrapArm(location: LuauSpan): BranchArmInfo {
+function makeWrapArm(location: LuauSpan): BranchArmInfo<LuauSpan> {
 	return { bodyFirstColumn: 0, bodyFirstLine: 0, location: { ...location } };
 }
 
-function makeStatementArm({ bodyFirst, location }: StatementBranchArm): BranchArmInfo {
+function makeStatementArm({ bodyFirst, location }: StatementBranchArm): BranchArmInfo<LuauSpan> {
 	return {
 		bodyFirstColumn: bodyFirst.column,
 		bodyFirstLine: bodyFirst.line,
@@ -204,7 +229,7 @@ function makeStatementArm({ bodyFirst, location }: StatementBranchArm): BranchAr
 	};
 }
 
-function makeImplicitElseArm({ column, line }: SourcePosition): BranchArmInfo {
+function makeImplicitElseArm({ column, line }: SourcePosition): BranchArmInfo<LuauSpan> {
 	return {
 		bodyFirstColumn: 0,
 		bodyFirstLine: 0,

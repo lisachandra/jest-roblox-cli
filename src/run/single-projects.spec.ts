@@ -1,20 +1,14 @@
 import { fromAny } from "@total-typescript/shoehorn";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import { ConfigError } from "../config/errors.ts";
-import { DEFAULT_CONFIG, type ResolvedConfig } from "../config/schema.ts";
-import { deriveCoverageFromIncludes } from "../coverage-pipeline/derive-coverage-from.ts";
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
+import { configErrorLike } from "#test/mocks/run-config-error.ts";
+import type { ResolvedConfig } from "../config/schema.ts";
 import type { RojoTreeNode } from "../types/rojo.ts";
-import { toPosixRoot } from "../utils/normalize-windows-path.ts";
-import { buildImplicitProject, deriveProjectMounts } from "./single-projects.ts";
-
-vi.mock(import("../coverage-pipeline/prepare.ts"), async (importOriginal) => {
-	const actual = await importOriginal();
-	return { ...actual, resolveLuauRoots: vi.fn<typeof actual.resolveLuauRoots>() };
-});
-
-const { resolveLuauRoots } = await import("../coverage-pipeline/prepare.ts");
+import type { BuildImplicitProjectOptions } from "./single-projects.ts";
+import { buildImplicitProject } from "./single-projects.ts";
 
 const tree: RojoTreeNode = fromAny({
 	$className: "DataModel",
@@ -22,21 +16,34 @@ const tree: RojoTreeNode = fromAny({
 	ServerScriptService: { Server: { $path: "out/server" } },
 });
 
+function emptySeams(): Pick<BuildImplicitProjectOptions, "fileSystem" | "tsconfigReader"> {
+	return { fileSystem: createMemoryFileSystem().fileSystem, tsconfigReader: () => null };
+}
+
 function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
 	return fromAny({
+		luauRoots: ["out/shared"],
 		rootDir: "/pkg",
 		testMatch: ["**/*.spec.ts", "**/*.spec.tsx"],
 		...overrides,
 	});
 }
 
-describe(deriveProjectMounts, () => {
+function mountsFor(
+	luauRoots: Array<string>,
+): ReturnType<typeof buildImplicitProject>["rojoMounts"] {
+	return buildImplicitProject({
+		config: makeConfig({ luauRoots }),
+		...emptySeams(),
+		rojoTree: tree,
+	}).rojoMounts;
+}
+
+describe("implicit project mounts", () => {
 	it("should map each luau root to its Rojo mount", () => {
 		expect.assertions(1);
 
-		expect(
-			deriveProjectMounts(["out/shared", "out/server"].map(toPosixRoot), tree),
-		).toStrictEqual([
+		expect(mountsFor(["out/shared", "out/server"])).toStrictEqual([
 			{ dataModelPath: "ReplicatedStorage/Shared", fsPath: "out/shared" },
 			{ dataModelPath: "ServerScriptService/Server", fsPath: "out/server" },
 		]);
@@ -45,17 +52,17 @@ describe(deriveProjectMounts, () => {
 	it("should skip luau roots that do not map to the rojo tree", () => {
 		expect.assertions(1);
 
-		expect(
-			deriveProjectMounts(["out/shared", "out/missing"].map(toPosixRoot), tree),
-		).toStrictEqual([{ dataModelPath: "ReplicatedStorage/Shared", fsPath: "out/shared" }]);
+		expect(mountsFor(["out/shared", "out/missing"])).toStrictEqual([
+			{ dataModelPath: "ReplicatedStorage/Shared", fsPath: "out/shared" },
+		]);
 	});
 
 	it("should dedupe roots that resolve to the same DataModel path", () => {
 		expect.assertions(1);
 
-		expect(
-			deriveProjectMounts(["out/shared", "out/shared"].map(toPosixRoot), tree),
-		).toStrictEqual([{ dataModelPath: "ReplicatedStorage/Shared", fsPath: "out/shared" }]);
+		expect(mountsFor(["out/shared", "out/shared"])).toStrictEqual([
+			{ dataModelPath: "ReplicatedStorage/Shared", fsPath: "out/shared" },
+		]);
 	});
 });
 
@@ -63,10 +70,12 @@ describe(buildImplicitProject, () => {
 	it("should build one project from the mapped luau roots", () => {
 		expect.assertions(2);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
 		const config = makeConfig({ displayName: "shared" });
-		const { config: projectConfig, ...rest } = buildImplicitProject(config, tree);
+		const { config: projectConfig, ...rest } = buildImplicitProject({
+			config,
+			...emptySeams(),
+			rojoTree: tree,
+		});
 
 		expect(projectConfig).toBe(config);
 		expect(rest).toStrictEqual({
@@ -85,47 +94,58 @@ describe(buildImplicitProject, () => {
 	it("should exclude type-test (-d) globs from include so a coverage run does not throw", () => {
 		expect.assertions(3);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
-		const project = buildImplicitProject(
-			makeConfig({ testMatch: DEFAULT_CONFIG.testMatch }),
-			tree,
-		);
+		const project = buildImplicitProject({
+			config: makeConfig({ testMatch: createResolvedConfig().testMatch }),
+			...emptySeams(),
+			rojoTree: tree,
+		});
 
 		expect(project.include).not.toContain("**/*.spec-d.ts");
 		expect(project.include).not.toContain("**/*.test-d.ts");
-		// `deriveCoverageFromIncludes` runs `inferSourceExtension` on every
-		// include entry; a leaked `-d` glob has no `.spec`/`.test` source
-		// extension and throws, crashing a `--coverage` run. Guards that.
-		expect(() => deriveCoverageFromIncludes([project])).not.toThrow();
+		expect(project.include).toStrictEqual([
+			"**/*.spec.ts",
+			"**/*.spec.tsx",
+			"**/*.test.ts",
+			"**/*.test.tsx",
+			"**/*.spec.lua",
+			"**/*.spec.luau",
+			"**/*.test.lua",
+			"**/*.test.luau",
+		]);
 	});
 
 	it("should qualify a bare testMatch glob with **/ so it matches at any depth", () => {
 		expect.assertions(1);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
 		expect(
-			buildImplicitProject(makeConfig({ testMatch: ["*.spec.ts"] }), tree).testMatch,
+			buildImplicitProject({
+				config: makeConfig({ testMatch: ["*.spec.ts"] }),
+				...emptySeams(),
+				rojoTree: tree,
+			}).testMatch,
 		).toStrictEqual(["**/*.spec"]);
 	});
 
 	it("should forward the config's exclude globs", () => {
 		expect.assertions(1);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
 		expect(
-			buildImplicitProject(makeConfig({ exclude: ["**/*.gen.spec.ts"] }), tree).exclude,
+			buildImplicitProject({
+				config: makeConfig({ exclude: ["**/*.gen.spec.ts"] }),
+				...emptySeams(),
+				rojoTree: tree,
+			}).exclude,
 		).toStrictEqual(["**/*.gen.spec.ts"]);
 	});
 
 	it("should leave outDir undefined when the project spans multiple mounts", () => {
 		expect.assertions(2);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared", "out/server"].map(toPosixRoot));
-
-		const project = buildImplicitProject(makeConfig({ displayName: "all" }), tree);
+		const project = buildImplicitProject({
+			config: makeConfig({ displayName: "all", luauRoots: ["out/shared", "out/server"] }),
+			...emptySeams(),
+			rojoTree: tree,
+		});
 
 		expect(project.outDir).toBeUndefined();
 		expect(project.projects).toStrictEqual([
@@ -137,33 +157,35 @@ describe(buildImplicitProject, () => {
 	it("should derive displayName from rootDir when none is configured", () => {
 		expect.assertions(1);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
 		expect(
-			buildImplicitProject(makeConfig({ rootDir: "/path/to/my-pkg/" }), tree).displayName,
+			buildImplicitProject({
+				config: makeConfig({ rootDir: "/path/to/my-pkg/" }),
+				...emptySeams(),
+				rojoTree: tree,
+			}).displayName,
 		).toBe("my-pkg");
 	});
 
 	it("should fall back to rootDir for an empty-string displayName", () => {
 		expect.assertions(1);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
 		expect(
-			buildImplicitProject(makeConfig({ displayName: "", rootDir: "/x/pkg" }), tree)
-				.displayName,
+			buildImplicitProject({
+				config: makeConfig({ displayName: "", rootDir: "/x/pkg" }),
+				...emptySeams(),
+				rojoTree: tree,
+			}).displayName,
 		).toBe("pkg");
 	});
 
 	it("should carry the name and color from a DisplayName object", () => {
 		expect.assertions(2);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
-		const project = buildImplicitProject(
-			makeConfig({ displayName: { name: "tinted", color: "magenta" } }),
-			tree,
-		);
+		const project = buildImplicitProject({
+			config: makeConfig({ displayName: { name: "tinted", color: "magenta" } }),
+			...emptySeams(),
+			rojoTree: tree,
+		});
 
 		expect(project.displayName).toBe("tinted");
 		expect(project.displayColor).toBe("magenta");
@@ -172,28 +194,45 @@ describe(buildImplicitProject, () => {
 	it("should throw a ConfigError when no luau root maps to the rojo tree", () => {
 		expect.assertions(1);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/missing"].map(toPosixRoot));
-
-		expect(() => buildImplicitProject(makeConfig(), tree)).toThrow(ConfigError);
+		expect(() => {
+			buildImplicitProject({
+				config: makeConfig({ luauRoots: ["out/missing"] }),
+				...emptySeams(),
+				rojoTree: tree,
+			});
+		}).toThrow(
+			configErrorLike(
+				"No test projects could be derived: none of the resolved luauRoots map to a $path mount in your Rojo project.",
+				'Set "projects" in your test config (e.g. ["ReplicatedStorage/shared"]), or point "luauRoots" at a compiled-output directory your Rojo project mounts.',
+			),
+		);
 	});
 
 	// `--typecheckOnly` is host-local tsgo, so the collapse hands over no Rojo
-	// tree at all — nothing is mounted and no luau roots are resolved.
 	it("should build a project with no mounts when no rojo tree is supplied", () => {
-		expect.assertions(4);
+		expect.assertions(3);
 
-		const project = buildImplicitProject(makeConfig(), undefined);
+		const project = buildImplicitProject({
+			config: fromAny({ rootDir: "/pkg", testMatch: ["**/*.spec.ts"] }),
+			...emptySeams(),
+			rojoTree: undefined,
+		});
 
 		expect(project.rojoMounts).toStrictEqual([]);
 		expect(project.projects).toStrictEqual([]);
 		expect(project.outDir).toBeUndefined();
-		expect(resolveLuauRoots).not.toHaveBeenCalled();
 	});
 
 	it("should not throw the no-mounts ConfigError when no rojo tree is supplied", () => {
 		expect.assertions(1);
 
-		expect(() => buildImplicitProject(makeConfig(), undefined)).not.toThrow();
+		expect(() => {
+			return buildImplicitProject({
+				config: makeConfig(),
+				...emptySeams(),
+				rojoTree: undefined,
+			});
+		}).not.toThrow();
 	});
 
 	// `include` strips `-d` globs and the multi pipeline derives Type Tests from
@@ -202,10 +241,11 @@ describe(buildImplicitProject, () => {
 	it("should seed typecheck.include from the -d globs in testMatch", () => {
 		expect.assertions(1);
 
-		const project = buildImplicitProject(
-			makeConfig({ testMatch: ["**/*.spec.ts", "**/*.spec-d.ts", "**/*.test-d.ts"] }),
-			undefined,
-		);
+		const project = buildImplicitProject({
+			config: makeConfig({ testMatch: ["**/*.spec.ts", "**/*.spec-d.ts", "**/*.test-d.ts"] }),
+			...emptySeams(),
+			rojoTree: undefined,
+		});
 
 		expect(project.typecheck!.include).toStrictEqual(["**/*.spec-d.ts", "**/*.test-d.ts"]);
 	});
@@ -213,22 +253,27 @@ describe(buildImplicitProject, () => {
 	it("should keep an explicit typecheck.include over the derived -d globs", () => {
 		expect.assertions(1);
 
-		const project = buildImplicitProject(
-			makeConfig({
+		const project = buildImplicitProject({
+			config: makeConfig({
 				testMatch: ["**/*.spec.ts", "**/*.spec-d.ts"],
 				typecheck: { enabled: true, include: ["types/**/*.spec-d.ts"] },
 			}),
-			undefined,
-		);
+			...emptySeams(),
+			rojoTree: undefined,
+		});
 
-		expect(project.typecheck!.include).toStrictEqual(["types/**/*.spec-d.ts"]);
+		expect(project.typecheck).toStrictEqual({
+			enabled: true,
+			include: ["types/**/*.spec-d.ts"],
+		});
 	});
 
 	it("should leave typecheck unset when testMatch carries no -d globs", () => {
 		expect.assertions(1);
 
-		vi.mocked(resolveLuauRoots).mockReturnValue(["out/shared"].map(toPosixRoot));
-
-		expect(buildImplicitProject(makeConfig(), tree).typecheck).toBeUndefined();
+		expect(
+			buildImplicitProject({ config: makeConfig(), ...emptySeams(), rojoTree: tree })
+				.typecheck,
+		).toBeUndefined();
 	});
 });

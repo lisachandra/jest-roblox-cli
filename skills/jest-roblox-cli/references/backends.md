@@ -1,67 +1,99 @@
-# Backend Selection
+# Backends
 
-`--backend auto` (default) resolves like this:
+| Backend    | Flag                   | Requirements                                                         | Coverage |
+| ---------- | ---------------------- | -------------------------------------------------------------------- | -------- |
+| Auto       | `--backend auto`       | (default) see below                                                  | —        |
+| studio-cli | `--backend studio-cli` | Roblox Studio installed and logged in, `rojo` on PATH                | yes      |
+| Open Cloud | `--backend open-cloud` | `ROBLOX_OPEN_CLOUD_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID` | yes      |
+| Studio     | `--backend studio`     | Studio open with the jest-roblox plugin installed                    | no       |
 
-1. Probe for Studio plugins on WebSocket port 3001 (500ms timeout)
-2. If a connection announces this CLI's protocol version → use Studio. If Open
-   Cloud credentials also exist, Studio failures fall back to Open Cloud
-   automatically.
-3. If plugins connected but none announced a matching version → error naming
-   every connection, even when credentials exist. Studio runs every installed
-   copy, so this is usually a stale `JestRobloxRunner.rbxm` left in the plugins
-   folder.
-4. If no plugin → use Open Cloud (requires all three env vars below)
-5. If neither → error: "No backend available"
+## Auto
 
-| Backend    | Flag                   | Requirements                                                         |
-| ---------- | ---------------------- | -------------------------------------------------------------------- |
-| Auto       | `--backend auto`       | (default)                                                            |
-| Open Cloud | `--backend open-cloud` | `ROBLOX_OPEN_CLOUD_API_KEY`, `ROBLOX_UNIVERSE_ID`, `ROBLOX_PLACE_ID` |
-| Studio     | `--backend studio`     | Studio open with jest-roblox plugin installed                        |
+`auto` picks `studio-cli` when Studio is installed, otherwise `open-cloud`.
+Studio counts as installed when `studioPath` (or `--studioPath`,
+`JEST_ROBLOX_STUDIO_PATH`) is set or discovery finds it. Discovery covers
+Windows and macOS only; on Linux or WSL, `auto` picks `open-cloud` unless a path
+is set.
+
+The pick is made once, before the run. A failed `studio-cli` run fails the run,
+and a wrong `studioPath` fails at launch: neither moves to Open Cloud. `auto`
+never picks the attached `studio` backend.
+
+## studio-cli
+
+Owns the whole Studio lifecycle: builds its own place, launches an isolated
+hidden Studio, runs the tests, and quits. No API key, no upload, no plugin to
+install: it builds and installs its own plugin on first use after an upgrade.
+Studio windows already open stay untouched.
+
+- Serial: one session, `--parallel` ignored.
+- `--coverage` works and matches Open Cloud's report semantics.
+- `timeout` starts once Studio has opened the place, so a slow launch does not
+  eat the test budget. The launch has its own window, raised with
+  `JEST_ROBLOX_STUDIO_BOOT_TIMEOUT` (ms).
+- `--headed` shows the Studio window to watch a hang. CLI-only.
+- When Studio loads local plugins from a folder other than the per-OS default,
+  set `pluginsDirectory` or `JEST_ROBLOX_PLUGINS_DIR` to its absolute path.
+- A CI machine with Studio installed would pick this backend; pass
+  `--backend open-cloud` to keep CI remote.
 
 ## Open Cloud
 
-Requires three environment variables. The CLI uploads the place file to Roblox
-via the Open Cloud API, creates a Luau execution task, polls for completion, and
-parses the JSON result.
+Uploads the place file and runs it as a Luau execution task. Prefix any of the
+three env vars with `JEST_` (e.g. `JEST_ROBLOX_PLACE_ID`) to override the
+unprefixed value when other tooling claims the generic names. `--apiKey`,
+`--universeId`, and `--placeId` also work, but leak into process listings.
 
-An invocation uploads the place file only when its bytes changed. The version a
-set of bytes got is recorded in `.jest-roblox/upload-cache.json`, and an
-unchanged build reuses it — an upload is the only thing measured to precede a
-cold place boot (~22s against ~3s), so skipping it keeps the fast path.
-`--no-upload-cache` forces the upload.
+The upload is skipped when the place bytes are unchanged
+(`.jest-roblox/upload-cache.json`); `--no-upload-cache` forces it. Each new
+version is proved by a boot probe before any test task; a version that cannot
+boot exits 2 rather than failing tests; raise `bootProbeTimeout` (default 90s)
+for a slow boot.
 
-Execution tasks then run _unpinned_ so they can land on a warm server holding
-the latest saved version; an injected guard compares `game.PlaceVersion` against
-the version this run uploaded or reused, and bails with a sentinel naming the
-version it booted instead. Raced tasks are retried once pinned to that version —
-correct by construction, but a cold place boot. This guard is also what makes
-the upload cache safe: a stale entry can only cause the sentinel, never a run
-against the wrong source. The poll cadence for task completion is managed
-internally by the Open Cloud client and is not user-configurable.
+### API key scopes
 
-The version the sentinel names is the only way to tell a stale cache entry from
-a genuine concurrent upload — Open Cloud will not say which version is head. A
-task booting past a _reused_ version proves the entry is behind head, so the run
-deletes it from `.jest-roblox/upload-cache.json` and the next run uploads again.
-Without that, the entry would be stuck: a cache hit never uploads, so the
-version it names could never become head again, and every later run would pay a
-pinned cold boot. A raced run therefore mutates the cache file, and the upload
-that follows on the next run is expected, not a cache fault.
+A missing scope surfaces as a `PermissionError` naming it.
+
+| Scope                                              | When                                                     |
+| -------------------------------------------------- | -------------------------------------------------------- |
+| `universe-places:write`                            | Always                                                   |
+| `universe.place.luau-execution-session:write`      | Always                                                   |
+| `memory-store.queue:add` / `:dequeue` / `:discard` | Sharded `--workspace` run (`--parallel auto` or above 1) |
+| `memory-store.sorted-map:read` / `:write`          | Live result streaming (default; see below)               |
+
+Without the queue scopes a sharded run warns and falls back to static buckets.
+Streaming is off for `--silent`, `--formatters json`, and `--formatters agent`
+(unless `--verbose`); `--formatters github-actions` streams.
+
+`--parallel [n]` runs `n` concurrent sessions (`auto` = `min(jobs, 3)`). Each
+costs one task create against Roblox's create limit.
 
 ## Studio
 
-Connects to a locally running Roblox Studio instance via WebSocket. Requires the
-jest-roblox Studio plugin to be installed. The plugin listens on the configured
-port (default: 3001) and executes tests when the CLI connects.
+Attaches to an open Studio over WebSocket (`port`, default `3001`) through the
+jest-roblox plugin. Studio exposes no open-place identity, so run one repo at a
+time.
 
-Studio runs every plugin in the plugins folder, so several installed copies open
-several connections. Each announces
-`{ protocolVersion, pluginVersion, pluginName }` on open, and the CLI dispatches
-`run_tests` to the one whose protocol matches — never to all of them.
-Broadcasting is what used to let a stale copy decide the run: refusing a version
-costs nothing while running the suite takes seconds, so the refusal always
-arrived first.
+Every installed copy of the plugin opens its own connection; the CLI dispatches
+to the one announcing a matching protocol version. When none matches, the run
+stops and names every connection, even with Open Cloud credentials set. Remove
+the stale `JestRobloxRunner.rbxm` copies from the Studio plugins folder.
 
-If Studio is busy (e.g. a previous play session is still running), and Open
-Cloud credentials are available, the CLI automatically falls back to Open Cloud.
+## Experimental VM parallelism
+
+`--experimental-vm-parallel [n]` runs a multi-project suite across `n` Luau VMs
+(`Actor` hosts) inside one Studio session. Bare, it uses one VM per project. The
+plugin ships four hosts; an explicit `n` above four is rejected. Both Studio
+backends support it; Open Cloud rejects it (use `--parallel` there).
+
+In workspace mode packages still run in turn; a package's projects split across
+the VMs. Single-project packages gain nothing.
+
+- **Shared DataModel.** Projects that mutate `Workspace`, `ReplicatedStorage`,
+  `Players`, or a DataStore mock conflict when they overlap. Enable it only for
+  DataModel-disjoint suites.
+- **Batch-scoped game output.** Overlapping projects cannot be told apart in
+  `LogService`, so `--gameOutput` writes one group labelled
+  `"project": "(all projects)"`, `"scope": "batch"`.
+- Projects whose mounts nest (`ReplicatedStorage` and `ReplicatedStorage/Foo`)
+  share a host and run in turn.

@@ -9,10 +9,13 @@ import {
 	rootPrefix,
 	toPosixRoot,
 } from "../utils/normalize-windows-path.ts";
-import type { MappedCoverageResult } from "./mapper.ts";
+import type { MappedCoverageResult } from "./mapper-types.ts";
 
 // cspell:ignore nonegate
 
+/**
+ * Include globs and ignore patterns that decide the coverage universe.
+ */
 export interface CoverageUniverseFilter {
 	/**
 	 * `coveragePathIgnorePatterns` — matched against the TS source path with
@@ -50,6 +53,8 @@ export interface CoverageUniverseFilter {
  * `D:/repo/packages/foo` as a relative filename off Linux and would hang the
  * whole universe under `<cwd>/D:/...` — an anchor no candidate path starts
  * with, so nothing matches and the digest names a directory that never existed.
+ * @param rootDirectory - The config's `rootDir`; defaults to cwd.
+ * @returns Canonical POSIX anchor directory.
  */
 export function resolveUniverseAnchor(rootDirectory?: string): PosixRoot {
 	const cwd = normalizeWindowsPath(process.cwd());
@@ -60,12 +65,13 @@ export function resolveUniverseAnchor(rootDirectory?: string): PosixRoot {
  * The universe decision for one source path, split out so instrumentation can
  * ask the same question ahead of the run that the report asks after it — see
  * `instrument-universe.ts`. Accepts absolute or cwd-relative paths.
+ * @param filter - Include globs, ignore patterns and their anchor.
+ * @returns Predicate that is true for a source path in the universe.
  */
 export function createCoverageUniverseMatcher(
 	filter: CoverageUniverseFilter,
 ): (filePath: string) => boolean {
 	const include = filter.include ?? [];
-	const ignore = filter.ignore ?? [];
 
 	const includePatterns = include.filter((pattern) => !pattern.startsWith("!"));
 	const excludePatterns = include
@@ -76,7 +82,7 @@ export function createCoverageUniverseMatcher(
 	const isExcluded = createGlobMatcher(excludePatterns);
 	// `contains: true` so a bare `index.ts` matches `src/foo/index.ts`, the same
 	// way the instrument-time root matcher treats `coveragePathIgnorePatterns`.
-	const isIgnored = picomatch(ignore, { contains: true, nonegate: true });
+	const isIgnored = createIgnoreMatcher(filter.ignore);
 
 	const anchor = resolveUniverseAnchor(filter.rootDir);
 	// Both sides are canonical POSIX by here, so a file under the anchor — the
@@ -89,13 +95,14 @@ export function createCoverageUniverseMatcher(
 	const cwd = normalizeWindowsPath(process.cwd());
 	return (filePath) => {
 		const absolute = toAnchorNamespace(filePath, cwd);
+		// Stryker disable next-line MethodExpression: same path
 		const relativePath = absolute.startsWith(anchorPrefix)
 			? absolute.slice(anchorPrefix.length)
 			: normalizeWindowsPath(path.relative(anchor, absolute));
 		return (
 			(isIncluded === undefined || isIncluded(relativePath)) &&
 			!isExcluded(relativePath) &&
-			!isIgnored(relativePath)
+			isIgnored?.(relativePath) !== true
 		);
 	};
 }
@@ -108,6 +115,9 @@ export function createCoverageUniverseMatcher(
  * include globs and ignore patterns cannot drift across call sites. A file
  * survives when it is included by `collectCoverageFrom` AND not matched by any
  * `coveragePathIgnorePatterns` entry.
+ * @param mapped - Mapped coverage keyed by source path.
+ * @param filter - Include globs, ignore patterns and their anchor.
+ * @returns `mapped` itself when the filter is empty, else the surviving files.
  */
 export function filterCoverageUniverse(
 	mapped: MappedCoverageResult,
@@ -132,6 +142,9 @@ export function filterCoverageUniverse(
  * A candidate path in the anchor's namespace. A relative one is still
  * cwd-relative — single mode's manifest keys its files that way — so it is
  * joined onto cwd rather than read as if it were already anchored.
+ * @param filePath - Absolute or cwd-relative candidate path.
+ * @param cwd - Normalized working directory.
+ * @returns Normalized absolute POSIX path.
  */
 function toAnchorNamespace(filePath: string, cwd: string): string {
 	const normalized = normalizeWindowsPath(filePath);
@@ -140,16 +153,16 @@ function toAnchorNamespace(filePath: string, cwd: string): string {
 	);
 }
 
+function createIgnoreMatcher(
+	patterns?: Array<string>,
+): ((filePath: string) => boolean) | undefined {
+	return patterns === undefined
+		? undefined
+		: picomatch(patterns, { contains: true, nonegate: true });
+}
+
 function createGlobMatcher(patterns: Array<string>): (filePath: string) => boolean {
-	// Split by whether the pattern is path-anchored. A slash-free pattern like
-	// `player.ts` must match at any depth, which needs picomatch's `matchBase`;
-	// a path-containing glob like `src/**/*.ts` is matched as-is (`matchBase`
-	// would be a no-op there, and applying it could mask an over-broad basename
-	// match).
-	const withPath = patterns.filter((pattern) => pattern.includes("/"));
-	const withoutPath = patterns.filter((pattern) => !pattern.includes("/"));
-
-	const matchers = [picomatch(withPath), picomatch(withoutPath, { matchBase: true })];
-
-	return (filePath) => matchers.some((matcher) => matcher(filePath));
+	const matchPath = picomatch(patterns, { nonegate: true });
+	const matchBase = picomatch(patterns, { matchBase: true, nonegate: true });
+	return (filePath) => matchPath(filePath) || matchBase(filePath);
 }

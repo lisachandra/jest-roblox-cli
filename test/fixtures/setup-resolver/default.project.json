@@ -1,0 +1,4 @@
+{
+	"name": "setup",
+	"tree": { "$className": "DataModel", "ReplicatedStorage": { "$path": "test-setup.luau" } }
+}

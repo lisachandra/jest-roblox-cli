@@ -1,10 +1,27 @@
 import { buildJestArgv, type JestArgv } from "../test-script.ts";
-import { isWorkspaceRun, type ParallelOption, type ProjectJob } from "./interface.ts";
+import type { DecodedEnvelope } from "./envelope.ts";
+import {
+	type BackendResult,
+	isWorkspaceRun,
+	type ParallelOption,
+	type ProjectJob,
+} from "./interface.ts";
 import { resolveVmHostCount } from "./vm-parallel.ts";
 
+/** Payload the Run-mode runner reads: a configs run or a workspace run. */
 export type RunPayload = ConfigRunPayload | WorkspaceRunPayload;
 
+/**
+ * The runner's default result budget holds Open Cloud's 4 MiB return cap, which
+ * no Studio transport has.
+ */
+const UNBOUNDED_RESULT_BUDGET_BYTES = Number.MAX_SAFE_INTEGER;
+
+/** What a Studio run payload is built from. */
 export interface RunPayloadRequest {
+	/** Workspace runs only: stop on the first failing package. */
+	bail?: boolean | undefined;
+	/** Jobs the run holds, in request order. */
 	jobs: Array<ProjectJob>;
 	/** The transport's own run timeout, in milliseconds. */
 	runBudgetMs: number;
@@ -40,7 +57,19 @@ interface WorkspaceEntry {
 }
 
 interface WorkspaceRunPayload {
-	workspace: { entries: Array<WorkspaceEntry> };
+	workspace: {
+		bail?: boolean | undefined;
+		entries: Array<WorkspaceEntry>;
+		resultBudgetBytes: number;
+		/** As on {@link ConfigRunPayload}: sent only alongside `vmParallel`. */
+		runBudgetMs?: number;
+		/**
+		 * Experimental: how many Luau VMs one package's projects split across.
+		 * Packages still run one after another; only a package's own projects
+		 * share its staged DataModel at the same time.
+		 */
+		vmParallel?: number;
+	};
 }
 
 interface ConfigEntries {
@@ -52,10 +81,27 @@ interface ConfigEntries {
  * Build the runner payload shared by both Studio transports. The transports
  * add their own protocol envelope, while this seam owns the config/workspace
  * dispatch shape consumed by the Run-mode runner.
+ *
+ * @param request - Jobs, bail flag, run budget, and VM parallelism.
+ * @returns The workspace payload, or the configs payload when the run is not a
+ *   workspace run.
+ * @throws {@link Error} When a workspace job has no package name.
  */
-export function buildRunPayload({ jobs, runBudgetMs, vmParallel }: RunPayloadRequest): RunPayload {
+export function buildRunPayload({
+	bail,
+	jobs,
+	runBudgetMs,
+	vmParallel,
+}: RunPayloadRequest): RunPayload {
 	if (isWorkspaceRun(jobs)) {
-		return { workspace: { entries: buildWorkspaceEntries(jobs) } };
+		const entries = buildWorkspaceEntries(jobs);
+		const workspace = { bail, entries, resultBudgetBytes: UNBOUNDED_RESULT_BUDGET_BYTES };
+		const hostCount = resolveVmHostCount(vmParallel, largestPackageSize(entries));
+		if (hostCount === undefined) {
+			return { workspace };
+		}
+
+		return { workspace: { ...workspace, runBudgetMs, vmParallel: hostCount } };
 	}
 
 	const { configs, runtimeStubMounts } = buildConfigEntries(jobs);
@@ -68,11 +114,62 @@ export function buildRunPayload({ jobs, runBudgetMs, vmParallel }: RunPayloadReq
 }
 
 /**
+ * Pair a Studio run's envelope entries with its jobs, in request order.
+ *
+ * The run-mode runner walks its entries in order and stops on a bail, so a
+ * bailed envelope carries a prefix of the jobs and the rest never ran.
+ *
+ * @param envelope - The decoded run envelope.
+ * @param context - Backend name for errors, run game output, and job count.
+ * @returns The raw results, plus the indices of jobs a bail skipped.
+ * @throws {@link Error} When the envelope deferred jobs, or its entry count
+ *   does not match the job count.
+ */
+export function pairPluginEntries(
+	{ bailed, deferred: wasDeferred, entries, gameOutputScope }: DecodedEnvelope,
+	{
+		backendName,
+		gameOutput,
+		jobCount,
+	}: { backendName: string; gameOutput: string | undefined; jobCount: number },
+): Pick<BackendResult, "bailedJobIndices" | "rawResults"> {
+	if (wasDeferred) {
+		throw new Error(
+			`${backendName} deferred ${(jobCount - entries.length).toString()} of ${jobCount.toString()} jobs: the runner's result budget filled before they ran`,
+		);
+	}
+
+	const rawResults = entries.map((entry) => {
+		return { entry, fallbackGameOutput: gameOutput, gameOutputScope };
+	});
+
+	if (bailed && entries.length < jobCount) {
+		const bailedJobIndices = Array.from(
+			{ length: jobCount - entries.length },
+			(_, offset) => entries.length + offset,
+		);
+		return { bailedJobIndices, rawResults };
+	}
+
+	if (entries.length !== jobCount) {
+		throw new Error(
+			`${backendName} returned ${entries.length.toString()} entries but request had ${jobCount.toString()} jobs`,
+		);
+	}
+
+	return { rawResults };
+}
+
+/**
  * The per-(package, project) entries the plugin's Run-mode runner feeds to its
  * embedded materializer for a workspace run. Shared by both Studio backends —
  * studio-cli writes them into the bootstrap payload, the WebSocket studio
  * backend sends them in the `run_tests` message — so the entry shape can't
  * drift between the two transports.
+ *
+ * @param jobs - Jobs of a workspace run.
+ * @returns One entry per job.
+ * @throws {@link Error} When a job has no package name.
  */
 function buildWorkspaceEntries(jobs: Array<ProjectJob>): Array<WorkspaceEntry> {
 	return jobs.map((job) => {
@@ -91,10 +188,32 @@ function buildWorkspaceEntries(jobs: Array<ProjectJob>): Array<WorkspaceEntry> {
 }
 
 /**
+ * The most projects one staging of a package runs. The runner stages a package
+ * once per consecutive run of its entries (`packageBatches` in
+ * `embedded-runner.luau`), so that run is what its VMs split.
+ *
+ * @param entries - Workspace entries, in run order.
+ * @returns The longest run of consecutive entries for one package.
+ */
+function largestPackageSize(entries: Array<WorkspaceEntry>): number {
+	let largest = 0;
+	let run = 0;
+	for (const [index, { pkg }] of entries.entries()) {
+		run = pkg === entries[index - 1]?.pkg ? run + 1 : 1;
+		largest = Math.max(largest, run);
+	}
+
+	return largest;
+}
+
+/**
  * The configs + filtered injection mounts the single-/multi-project configs
  * path consumes (`Runner.runProjects`). `runtimeStubMounts[i]` is parallel to
  * `configs[i]`: the DataModel paths the runner injects `jest.config` into,
  * excluding mounts where Rojo already syncs a user-authored config.
+ *
+ * @param jobs - Jobs of the run.
+ * @returns The configs and their injection mounts.
  */
 function buildConfigEntries(jobs: Array<ProjectJob>): ConfigEntries {
 	return {

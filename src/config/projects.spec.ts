@@ -1,69 +1,107 @@
 // cspell:words includ
-import type { PathClassifier, PathKind } from "@isentinel/rojo-utils";
+import type { PathKind } from "@isentinel/rojo-utils";
 import { fromAny } from "@total-typescript/shoehorn";
 
-import type { ResolvedConfig as C12ResolvedConfig, LoadConfigOptions } from "c12";
-import { assert, describe, expect, it, vi } from "vitest";
+import * as path from "node:path";
+import { describe, expect, it } from "vitest";
 
+import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
+import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
+import { createProjectSeams } from "#test/mocks/spec-project-seams.ts";
 import type { RojoTreeNode } from "../types/rojo.ts";
-import { toPosixRoot } from "../utils/normalize-windows-path.ts";
-import { ConfigError } from "./errors.ts";
-import {
-	createFsClassifier,
-	extractProjectRoots,
-	extractStaticRoot,
-	loadProjectConfigFile,
-	mapFsRootToDataModel,
-	resolveAllProjects,
-	resolveProjectConfig,
-	stripTsExtension,
-	validateProjects,
-} from "./projects.ts";
-import { DEFAULT_CONFIG } from "./schema.ts";
+import type { ResolvedProjectConfig } from "./projects.ts";
+import { extractStaticRoot, resolveAllProjects } from "./projects.ts";
 import type { ProjectTestConfig, ResolvedConfig } from "./schema.ts";
 
-function allDirectories(): PathKind {
-	return "directory";
+const CWD = "/project";
+
+const SRC_HINT =
+	'Path starts with "src/" — if using roblox-ts, set "outDir" in your project config to the compiled output directory (e.g. "out/client")';
+
+type MountKinds = Record<string, PathKind>;
+
+function mountKinds(kinds: MountKinds): MountKinds {
+	return kinds;
 }
 
-function makeClassifier(kinds: Record<string, PathKind>): PathClassifier {
-	function classify(fsPath: string): PathKind {
-		return kinds[fsPath] ?? "missing";
+function treePaths(node: unknown): Array<string> {
+	if (typeof node !== "object" || node === null) {
+		return [];
 	}
 
-	return classify;
+	return Object.entries(node).flatMap(([key, value]: [string, unknown]) => {
+		if (key === "$path") {
+			return [
+				typeof value === "string"
+					? value
+					: fromAny<{ optional: string }, unknown>(value).optional,
+			];
+		}
+
+		return key.startsWith("$") ? [] : treePaths(value);
+	});
 }
 
-vi.mock<typeof import("c12")>(import("c12"), async (importOriginal) => {
-	const actual = await importOriginal();
+function seedFor(kinds: MountKinds): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(kinds).flatMap(([fsPath, kind]) => {
+			if (kind === "missing") {
+				return [];
+			}
 
-	return {
-		...actual,
-		loadConfig: fromAny(vi.fn<(options: LoadConfigOptions) => Promise<C12ResolvedConfig>>()),
-	};
-});
+			const target = path.posix.join(CWD, fsPath);
+			return [[kind === "directory" ? `${target}/.keep` : target, ""]];
+		}),
+	);
+}
 
-vi.mock<typeof import("../executor.ts")>(import("../executor.ts"), async (importOriginal) => {
-	const actual = await importOriginal();
-	return {
-		...actual,
-		resolveTsconfigDirectories: vi
-			.fn<typeof actual.resolveTsconfigDirectories>()
-			.mockReturnValue({ outDir: "out", rootDir: "src" }),
-	};
-});
+async function resolveProjects({
+	kinds,
+	projects,
+	rojoTree,
+	rootConfig,
+}: {
+	kinds?: MountKinds;
+	projects: Array<ProjectTestConfig>;
+	rojoTree: RojoTreeNode;
+	rootConfig: ResolvedConfig;
+}): Promise<Array<ResolvedProjectConfig>> {
+	const directories =
+		kinds ??
+		Object.fromEntries(treePaths(rojoTree).map((fsPath) => [fsPath, "directory" as const]));
+	const { fileSystem } = createMemoryFileSystem(seedFor(directories), CWD);
 
-vi.mock<typeof import("./luau-config-loader.ts")>(
-	import("./luau-config-loader.ts"),
-	async (importOriginal) => {
-		const actual = await importOriginal();
-		return {
-			...actual,
-			findLuauConfigFile: vi.fn<typeof actual.findLuauConfigFile>(),
-			loadLuauConfig: vi.fn<typeof actual.loadLuauConfig>(),
-		};
-	},
-);
+	return resolveAllProjects({
+		cwd: CWD,
+		entries: projects.map((test) => ({ test })),
+		fileSystem,
+		rojoTree,
+		rootConfig,
+	});
+}
+
+async function resolveProject({
+	project,
+	...rest
+}: {
+	kinds?: MountKinds;
+	project: ProjectTestConfig;
+	rojoTree: RojoTreeNode;
+	rootConfig: ResolvedConfig;
+}): Promise<ResolvedProjectConfig> {
+	const [resolved] = await resolveProjects({ ...rest, projects: [project] });
+	return resolved!;
+}
+
+async function captureRejection(promise: Promise<unknown>): Promise<unknown> {
+	try {
+		await promise;
+	} catch (err) {
+		return err;
+	}
+
+	throw new Error("expected a rejection");
+}
 
 const simpleRojoTree: RojoTreeNode = {
 	$className: "DataModel",
@@ -155,289 +193,201 @@ describe(extractStaticRoot, () => {
 	});
 });
 
-describe(stripTsExtension, () => {
-	it("should strip .ts extension", () => {
-		expect.assertions(1);
+describe("include roots", () => {
+	const rootConfig = createResolvedConfig();
 
-		expect(stripTsExtension("**/*.spec.ts")).toBe("**/*.spec");
-	});
-
-	it("should strip .tsx extension", () => {
-		expect.assertions(1);
-
-		expect(stripTsExtension("**/*.test.tsx")).toBe("**/*.test");
-	});
-
-	it("should strip .lua extension", () => {
-		expect.assertions(1);
-
-		expect(stripTsExtension("**/*.spec.lua")).toBe("**/*.spec");
-	});
-
-	it("should strip .luau extension", () => {
-		expect.assertions(1);
-
-		expect(stripTsExtension("**/*.spec.luau")).toBe("**/*.spec");
-	});
-
-	it("should not change pattern without known extension", () => {
-		expect.assertions(1);
-
-		expect(stripTsExtension("**/*.spec")).toBe("**/*.spec");
-	});
-
-	it("should not change pattern with .js extension", () => {
-		expect.assertions(1);
-
-		expect(stripTsExtension("**/*.spec.js")).toBe("**/*.spec.js");
-	});
-});
-
-describe(extractProjectRoots, () => {
-	it("should extract single root with single pattern", () => {
-		expect.assertions(1);
-
-		const result = extractProjectRoots(["src/client/**/*.spec.ts"]);
-
-		expect(result).toStrictEqual([{ root: "src/client", testMatch: ["**/*.spec"] }]);
-	});
-
-	it("should group multiple patterns under same root", () => {
-		expect.assertions(1);
-
-		const result = extractProjectRoots(["src/client/**/*.spec.ts", "src/client/**/*.test.ts"]);
-
-		expect(result).toStrictEqual([
-			{ root: "src/client", testMatch: ["**/*.spec", "**/*.test"] },
-		]);
-	});
-
-	it("should separate different roots", () => {
-		expect.assertions(2);
-
-		const result = extractProjectRoots(["src/client/**/*.spec.ts", "src/server/**/*.spec.ts"]);
-
-		expect(result).toHaveLength(2);
-		expect(result).toStrictEqual([
-			{ root: "src/client", testMatch: ["**/*.spec"] },
-			{ root: "src/server", testMatch: ["**/*.spec"] },
-		]);
-	});
-
-	it("should prepend **/ to testMatch without path separator", () => {
-		expect.assertions(1);
-
-		const result = extractProjectRoots(["src/*.spec.ts"]);
-
-		expect(result).toStrictEqual([{ root: "src", testMatch: ["**/*.spec"] }]);
-	});
-
-	it("should not prepend **/ to testMatch with path separator", () => {
-		expect.assertions(1);
-
-		const result = extractProjectRoots(["src/**/*.spec.ts"]);
-
-		expect(result).toStrictEqual([{ root: "src", testMatch: ["**/*.spec"] }]);
-	});
-
-	it("should handle mixed roots and patterns", () => {
-		expect.assertions(1);
-
-		const result = extractProjectRoots([
-			"src/client/**/*.spec.ts",
-			"src/client/**/*.test.tsx",
-			"src/server/**/*.spec.ts",
-		]);
-
-		expect(result).toStrictEqual([
-			{ root: "src/client", testMatch: ["**/*.spec", "**/*.test"] },
-			{ root: "src/server", testMatch: ["**/*.spec"] },
-		]);
-	});
-});
-
-describe(mapFsRootToDataModel, () => {
-	it("should map outDir to DataModel path via Rojo tree", () => {
-		expect.assertions(1);
-
-		const result = mapFsRootToDataModel(toPosixRoot("out/client"), simpleRojoTree);
-
-		expect(result).toBe("ReplicatedStorage/client");
-	});
-
-	it("should map server outDir to DataModel path", () => {
-		expect.assertions(1);
-
-		const result = mapFsRootToDataModel(toPosixRoot("out/server"), simpleRojoTree);
-
-		expect(result).toBe("ServerScriptService/server");
-	});
-
-	it("should handle nested tree structures", () => {
-		expect.assertions(1);
-
-		const nestedTree: RojoTreeNode = {
+	function rootsTree(...fsPaths: Array<string>): RojoTreeNode {
+		return {
 			$className: "DataModel",
-			ReplicatedStorage: {
-				shared: {
-					lib: { $path: "out/shared/lib" },
-				},
-			},
+			...Object.fromEntries(
+				fsPaths.map((fsPath, index) => [`Root${index}`, { $path: fsPath }]),
+			),
 		};
+	}
 
-		const result = mapFsRootToDataModel(toPosixRoot("out/shared/lib"), nestedTree);
+	async function resolveInclude(include: Array<string>, ...fsPaths: Array<string>) {
+		return resolveProject({
+			project: makeProject({ include }),
+			rojoTree: rootsTree(...fsPaths),
+			rootConfig,
+		});
+	}
 
-		expect(result).toBe("ReplicatedStorage/shared/lib");
-	});
-
-	it("should handle path nested under a $path entry", () => {
+	it.for([
+		["**/*.spec.ts", "**/*.spec"],
+		["**/*.test.tsx", "**/*.test"],
+		["**/*.spec.lua", "**/*.spec"],
+		["**/*.spec.luau", "**/*.spec"],
+		["**/*.spec", "**/*.spec"],
+		["**/*.spec.js", "**/*.spec.js"],
+	] as const)("should derive testMatch %s as %s", async ([glob, testMatch]) => {
 		expect.assertions(1);
 
-		const result = mapFsRootToDataModel(toPosixRoot("out/client/ui"), simpleRojoTree);
+		const result = await resolveInclude([`src/${glob}`], "src");
 
-		expect(result).toBe("ReplicatedStorage/client/ui");
+		expect(result.testMatch).toStrictEqual([testMatch]);
 	});
 
-	it("should throw ConfigError when no mapping found", () => {
+	it("should extract single root with single pattern", async () => {
 		expect.assertions(2);
 
-		expect(() => mapFsRootToDataModel(toPosixRoot("out/unknown"), simpleRojoTree)).toThrow(
-			ConfigError,
+		const result = await resolveInclude(["src/client/**/*.spec.ts"], "src/client");
+
+		expect(result.testMatch).toStrictEqual(["**/*.spec"]);
+		expect(result.rojoMounts).toStrictEqual([{ dataModelPath: "Root0", fsPath: "src/client" }]);
+	});
+
+	it("should group multiple patterns under same root", async () => {
+		expect.assertions(2);
+
+		const result = await resolveInclude(
+			["src/client/**/*.spec.ts", "src/client/**/*.test.ts"],
+			"src/client",
 		);
-		expect(() => mapFsRootToDataModel(toPosixRoot("out/unknown"), simpleRojoTree)).toThrow(
-			/No Rojo tree mapping found for path: out\/unknown\n\nAvailable \$path entries: out\/client, out\/server/,
+
+		expect(result.testMatch).toStrictEqual(["**/*.spec", "**/*.test"]);
+		expect(result.rojoMounts).toStrictEqual([{ dataModelPath: "Root0", fsPath: "src/client" }]);
+	});
+
+	it("should separate different roots", async () => {
+		expect.assertions(2);
+
+		const result = await resolveInclude(
+			["src/client/**/*.spec.ts", "src/server/**/*.spec.ts"],
+			"src/client",
+			"src/server",
+		);
+
+		expect(result.testMatch).toStrictEqual(["**/*.spec"]);
+		expect(result.rojoMounts).toStrictEqual([
+			{ dataModelPath: "Root0", fsPath: "src/client" },
+			{ dataModelPath: "Root1", fsPath: "src/server" },
+		]);
+	});
+
+	it("should prepend **/ to testMatch without path separator", async () => {
+		expect.assertions(1);
+
+		const result = await resolveInclude(["src/*.spec.ts"], "src");
+
+		expect(result.testMatch).toStrictEqual(["**/*.spec"]);
+	});
+
+	it("should not prepend **/ to testMatch with path separator", async () => {
+		expect.assertions(1);
+
+		const result = await resolveInclude(["src/**/*.spec.ts"], "src");
+
+		expect(result.testMatch).toStrictEqual(["**/*.spec"]);
+	});
+
+	it("should handle mixed roots and patterns", async () => {
+		expect.assertions(2);
+
+		const result = await resolveInclude(
+			["src/client/**/*.spec.ts", "src/client/**/*.test.tsx", "src/server/**/*.spec.ts"],
+			"src/client",
+			"src/server",
+		);
+
+		expect(result.testMatch).toStrictEqual(["**/*.spec", "**/*.test"]);
+		expect(result.rojoMounts).toStrictEqual([
+			{ dataModelPath: "Root0", fsPath: "src/client" },
+			{ dataModelPath: "Root1", fsPath: "src/server" },
+		]);
+	});
+});
+
+describe("project validation", () => {
+	const rootConfig = createResolvedConfig();
+
+	async function validate(projects: Array<ProjectTestConfig>) {
+		return resolveProjects({ projects, rojoTree: simpleRojoTree, rootConfig });
+	}
+
+	function mappable(overrides: Partial<ProjectTestConfig>): ProjectTestConfig {
+		return makeProject({ outDir: "out/client", ...overrides });
+	}
+
+	it("should accept valid projects", async () => {
+		expect.assertions(1);
+
+		await expect(
+			validate([mappable({ displayName: "client" }), mappable({ displayName: "server" })]),
+		).resolves.toHaveLength(2);
+	});
+
+	it("should throw on empty displayName string", async () => {
+		expect.assertions(1);
+
+		await expect(validate([mappable({ displayName: "" })])).rejects.toThrow(
+			"Project must have a non-empty displayName",
 		);
 	});
 
-	it("should include hint when path starts with src/", () => {
+	it("should throw on empty displayName object", async () => {
 		expect.assertions(1);
 
-		let caught: unknown;
-		try {
-			mapFsRootToDataModel(toPosixRoot("src/client"), simpleRojoTree);
-		} catch (err) {
-			caught = err;
-		}
-
-		assert(caught instanceof ConfigError);
-
-		expect(caught.hint).toMatch(/set "outDir"/);
+		await expect(
+			validate([mappable({ displayName: { name: "", color: "blue" } })]),
+		).rejects.toThrow("Project must have a non-empty displayName");
 	});
 
-	it("should omit hint when path does not start with src/", () => {
+	it("should throw on duplicate displayName", async () => {
 		expect.assertions(1);
 
-		let caught: unknown;
-		try {
-			mapFsRootToDataModel(toPosixRoot("out/unknown"), simpleRojoTree);
-		} catch (err) {
-			caught = err;
-		}
-
-		assert(caught instanceof ConfigError);
-
-		expect(caught.hint).toBeUndefined();
+		await expect(
+			validate([mappable({ displayName: "client" }), mappable({ displayName: "client" })]),
+		).rejects.toThrow("Duplicate project displayName: client");
 	});
 
-	it("should omit available paths line when tree has no $path entries", () => {
+	it("should throw on empty include array", async () => {
 		expect.assertions(1);
 
-		const emptyTree: RojoTreeNode = { $className: "DataModel" };
-
-		expect(() => {
-			mapFsRootToDataModel(toPosixRoot("out/foo"), emptyTree);
-		}).toThrowWithMessage(Error, "No Rojo tree mapping found for path: out/foo");
+		await expect(validate([mappable({ displayName: "client", include: [] })])).rejects.toThrow(
+			'Project "client" must have at least one include pattern',
+		);
 	});
 
-	it("should strip trailing slash before lookup", () => {
+	it("should throw when include was never derived", async () => {
 		expect.assertions(1);
 
-		const result = mapFsRootToDataModel(toPosixRoot("out/client/"), simpleRojoTree);
-
-		expect(result).toBe("ReplicatedStorage/client");
-	});
-
-	it("should look up source path directly for pure Luau", () => {
-		expect.assertions(1);
-
-		const tree: RojoTreeNode = {
-			$className: "DataModel",
-			ReplicatedStorage: {
-				shared: { $path: "shared" },
-			},
-		};
-
-		const result = mapFsRootToDataModel(toPosixRoot("shared"), tree);
-
-		expect(result).toBe("ReplicatedStorage/shared");
+		await expect(validate([fromAny({ displayName: "client" })])).rejects.toThrow(
+			'Project "client" must have at least one include pattern',
+		);
 	});
 });
 
-describe(validateProjects, () => {
-	it("should accept valid projects", () => {
-		expect.assertions(1);
-
-		expect(() => {
-			validateProjects([
-				makeProject({ displayName: "client" }),
-				makeProject({ displayName: "server" }),
-			]);
-		}).not.toThrow();
-	});
-
-	it("should throw on empty displayName string", () => {
-		expect.assertions(1);
-
-		expect(() => {
-			validateProjects([makeProject({ displayName: "" })]);
-		}).toThrow("Project must have a non-empty displayName");
-	});
-
-	it("should throw on empty displayName object", () => {
-		expect.assertions(1);
-
-		expect(() => {
-			validateProjects([makeProject({ displayName: { name: "", color: "blue" } })]);
-		}).toThrow("Project must have a non-empty displayName");
-	});
-
-	it("should throw on duplicate displayName", () => {
-		expect.assertions(1);
-
-		expect(() => {
-			validateProjects([
-				makeProject({ displayName: "client" }),
-				makeProject({ displayName: "client" }),
-			]);
-		}).toThrow("Duplicate project displayName: client");
-	});
-
-	it("should throw on empty include array", () => {
-		expect.assertions(1);
-
-		expect(() => {
-			validateProjects([makeProject({ displayName: "client", include: [] })]);
-		}).toThrow('Project "client" must have at least one include pattern');
-	});
-
-	it("should throw when include was never derived", () => {
-		expect.assertions(1);
-
-		expect(() => {
-			validateProjects([{ displayName: "client" }]);
-		}).toThrow('Project "client" must have at least one include pattern');
-	});
-});
-
-describe(resolveProjectConfig, () => {
+describe("project resolution", () => {
 	const rootConfig: ResolvedConfig = {
-		...DEFAULT_CONFIG,
+		...createResolvedConfig(),
 		rootDir: "/project",
 		silent: false,
 		verbose: true,
 	};
 
-	it("should resolve DataModel path from outDir", () => {
+	async function resolveCoreClient(
+		overrides: Partial<ProjectTestConfig> = {},
+	): Promise<ResolvedProjectConfig> {
+		return resolveProject({
+			project: makeProject({
+				displayName: "client",
+				include: ["src/client/**/*.spec.ts"],
+				outDir: "out/client",
+				root: "packages/core",
+				...overrides,
+			}),
+			rojoTree: {
+				$className: "DataModel",
+				ReplicatedStorage: {
+					client: { $path: "packages/core/out/client" },
+				},
+			},
+			rootConfig,
+		});
+	}
+
+	it("should resolve DataModel path from outDir", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -446,12 +396,16 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/client",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.projects).toStrictEqual(["ReplicatedStorage/client"]);
 	});
 
-	it("should fall back to static root from include when outDir is not set", () => {
+	it("should fall back to static root from include when outDir is not set", async () => {
 		expect.assertions(1);
 
 		const tree: RojoTreeNode = {
@@ -466,34 +420,24 @@ describe(resolveProjectConfig, () => {
 			include: ["src/shared/**/*.spec.luau"],
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: tree,
+			rootConfig,
+		});
 
 		expect(result.projects).toStrictEqual(["ReplicatedStorage/shared"]);
 	});
 
-	it("should combine root and outDir for DataModel lookup", () => {
+	it("should combine root and outDir for DataModel lookup", async () => {
 		expect.assertions(1);
 
-		const rojoTree: RojoTreeNode = {
-			$className: "DataModel",
-			ReplicatedStorage: {
-				client: { $path: "packages/core/out/client" },
-			},
-		};
-
-		const project = makeProject({
-			displayName: "client",
-			include: ["src/client/**/*.spec.ts"],
-			outDir: "out/client",
-			root: "packages/core",
-		});
-
-		const result = resolveProjectConfig(project, rootConfig, rojoTree, allDirectories);
+		const result = await resolveCoreClient();
 
 		expect(result.projects).toStrictEqual(["ReplicatedStorage/client"]);
 	});
 
-	it("should store resolved outDir on result", () => {
+	it("should store resolved outDir on result", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -502,34 +446,24 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/client",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.outDir).toBe("out/client");
 	});
 
-	it("should store resolved outDir with root prefix", () => {
+	it("should store resolved outDir with root prefix", async () => {
 		expect.assertions(1);
 
-		const rojoTree: RojoTreeNode = {
-			$className: "DataModel",
-			ReplicatedStorage: {
-				client: { $path: "packages/core/out/client" },
-			},
-		};
-
-		const project = makeProject({
-			displayName: "client",
-			include: ["src/client/**/*.spec.ts"],
-			outDir: "out/client",
-			root: "packages/core",
-		});
-
-		const result = resolveProjectConfig(project, rootConfig, rojoTree, allDirectories);
+		const result = await resolveCoreClient();
 
 		expect(result.outDir).toBe("packages/core/out/client");
 	});
 
-	it("should extract testMatch from include patterns with stripped extensions", () => {
+	it("should extract testMatch from include patterns with stripped extensions", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -538,34 +472,46 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/client",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.testMatch).toStrictEqual(["**/*.spec", "**/*.test"]);
 	});
 
-	it("should inherit non-ROOT_ONLY fields from root config", () => {
+	it("should inherit non-ROOT_ONLY fields from root config", async () => {
 		expect.assertions(2);
 
 		const project = makeProject({ displayName: "client", outDir: "out/client" });
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.config.verbose).toBeTrue();
 		expect(result.config.silent).toBeFalse();
 	});
 
-	it("should keep ROOT_ONLY keys from root config", () => {
+	it("should keep ROOT_ONLY keys from root config", async () => {
 		expect.assertions(2);
 
 		const project = makeProject({ displayName: "client", outDir: "out/client" });
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.config.backend).toBe(rootConfig.backend);
 		expect(result.config.rootDir).toBe(rootConfig.rootDir);
 	});
 
-	it("should allow project to override non-ROOT_ONLY fields", () => {
+	it("should allow project to override non-ROOT_ONLY fields", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -574,12 +520,16 @@ describe(resolveProjectConfig, () => {
 			testTimeout: 5000,
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.config.testTimeout).toBe(5000);
 	});
 
-	it("should keep every project-structural field out of the runtime config", () => {
+	it("should keep every project-structural field out of the runtime config", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -591,7 +541,11 @@ describe(resolveProjectConfig, () => {
 			typecheck: { enabled: true },
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect({
 			displayName: Reflect.get(result.config, "displayName"),
@@ -610,7 +564,7 @@ describe(resolveProjectConfig, () => {
 		});
 	});
 
-	it("should skip undefined project override values", () => {
+	it("should skip undefined project override values", async () => {
 		expect.assertions(1);
 
 		// `testTimeout: undefined` cannot be expressed under
@@ -621,17 +575,16 @@ describe(resolveProjectConfig, () => {
 			testTimeout: undefined,
 		});
 
-		const result = resolveProjectConfig(
+		const result = await resolveProject({
 			project,
-			{ ...rootConfig, testTimeout: 12_345 },
-			simpleRojoTree,
-			allDirectories,
-		);
+			rojoTree: simpleRojoTree,
+			rootConfig: { ...rootConfig, testTimeout: 12_345 },
+		});
 
 		expect(result.config.testTimeout).toBe(12_345);
 	});
 
-	it("should extract displayName string from DisplayName object", () => {
+	it("should extract displayName string from DisplayName object", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -639,70 +592,32 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/client",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.displayName).toBe("client-tests");
 	});
 
-	it("should prepend root to resolved include patterns for filesystem discovery", () => {
+	it("should prepend root to resolved include patterns for filesystem discovery", async () => {
 		expect.assertions(1);
 
-		const rojoTree: RojoTreeNode = {
-			$className: "DataModel",
-			ReplicatedStorage: {
-				client: { $path: "packages/core/out/client" },
-			},
-		};
-
-		const project = makeProject({
-			displayName: "client",
-			include: ["src/client/**/*.spec.ts"],
-			outDir: "out/client",
-			root: "packages/core",
-		});
-
-		const result = resolveProjectConfig(project, rootConfig, rojoTree, allDirectories);
+		const result = await resolveCoreClient();
 
 		expect(result.include).toStrictEqual(["packages/core/src/client/**/*.spec.ts"]);
 	});
 
-	it("should prepend root to resolved exclude patterns for filesystem discovery", () => {
+	it("should prepend root to resolved exclude patterns for filesystem discovery", async () => {
 		expect.assertions(1);
 
-		const rojoTree: RojoTreeNode = {
-			$className: "DataModel",
-			ReplicatedStorage: {
-				client: { $path: "packages/core/out/client" },
-			},
-		};
-
-		const project = makeProject({
-			displayName: "client",
-			exclude: ["src/client/**/*.gen.spec.ts"],
-			include: ["src/client/**/*.spec.ts"],
-			outDir: "out/client",
-			root: "packages/core",
-		});
-
-		const result = resolveProjectConfig(project, rootConfig, rojoTree, allDirectories);
+		const result = await resolveCoreClient({ exclude: ["src/client/**/*.gen.spec.ts"] });
 
 		expect(result.exclude).toStrictEqual(["packages/core/src/client/**/*.gen.spec.ts"]);
 	});
 
-	it("should return empty projects when no outDir and no include roots", () => {
-		expect.assertions(1);
-
-		const project = makeProject({
-			displayName: "empty",
-			include: [],
-		});
-
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
-
-		expect(result.projects).toBeEmpty();
-	});
-
-	it("should populate rojoMounts with a single mount when outDir is set", () => {
+	it("should populate rojoMounts with a single mount when outDir is set", async () => {
 		expect.assertions(2);
 
 		const project = makeProject({
@@ -711,7 +626,11 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/client",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.rojoMounts).toStrictEqual([
 			{ dataModelPath: "ReplicatedStorage/client", fsPath: "out/client" },
@@ -719,7 +638,7 @@ describe(resolveProjectConfig, () => {
 		expect(result.outDir).toBe("out/client");
 	});
 
-	it("should auto-expand multi-root includes via tree walk", () => {
+	it("should auto-expand multi-root includes via tree walk", async () => {
 		expect.assertions(4);
 
 		const tree = {
@@ -738,7 +657,11 @@ describe(resolveProjectConfig, () => {
 			include: ["src/**/*.spec.luau"],
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: tree,
+			rootConfig,
+		});
 
 		expect(result.projects).toStrictEqual([
 			"ReplicatedStorage/Client",
@@ -754,7 +677,7 @@ describe(resolveProjectConfig, () => {
 		expect(result.exclude).toStrictEqual([]);
 	});
 
-	it("should respect segment boundaries during auto-expand", () => {
+	it("should respect segment boundaries during auto-expand", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -770,15 +693,47 @@ describe(resolveProjectConfig, () => {
 			include: ["src/Cli/**/*.spec.luau"],
 		});
 
-		expect(() => {
-			return resolveProjectConfig(project, rootConfig, tree, allDirectories);
-		}).toThrowWithMessage(
-			ConfigError,
-			/include root "src\/Cli" did not match any Rojo \$path entry/,
-		);
+		await expect(
+			resolveProject({
+				project,
+				rojoTree: tree,
+				rootConfig,
+			}),
+		).rejects.toMatchObject({
+			hint: SRC_HINT,
+			message: expect.stringMatching(
+				/include root "src\/Cli" did not match any Rojo \$path entry/,
+			),
+		});
 	});
 
-	it("should skip file-valued $path entries during auto-expand", () => {
+	it("should map an include root under an optional $path", async () => {
+		expect.assertions(1);
+
+		const tree = {
+			$className: "DataModel",
+			ReplicatedStorage: {
+				tests: { $path: { optional: "src/tests" } },
+			},
+		} satisfies RojoTreeNode;
+
+		const project = makeProject({
+			displayName: "optional",
+			include: ["src/tests/**/*.spec.luau"],
+		});
+
+		const result = await resolveProject({
+			project,
+			rojoTree: tree,
+			rootConfig,
+		});
+
+		expect(result.rojoMounts).toStrictEqual([
+			{ dataModelPath: "ReplicatedStorage/tests", fsPath: "src/tests" },
+		]);
+	});
+
+	it("should skip file-valued $path entries during auto-expand", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -794,12 +749,12 @@ describe(resolveProjectConfig, () => {
 			include: ["src/shared/**/*.spec.luau"],
 		});
 
-		const classify = makeClassifier({
+		const kinds = mountKinds({
 			"src/shared": "directory",
 			"src/shared/Constants.luau": "file",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, classify);
+		const result = await resolveProject({ kinds, project, rojoTree: tree, rootConfig });
 
 		// The file-valued Constants.luau is not eligible; the exact-lookup
 		// match on src/shared wins.
@@ -808,7 +763,7 @@ describe(resolveProjectConfig, () => {
 		]);
 	});
 
-	it("should skip missing paths during auto-expand without throwing", () => {
+	it("should skip missing paths during auto-expand without throwing", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -824,18 +779,18 @@ describe(resolveProjectConfig, () => {
 			include: ["src/**/*.spec.luau"],
 		});
 
-		const classify = makeClassifier({
+		const kinds = mountKinds({
 			"src/Client": "directory",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, classify);
+		const result = await resolveProject({ kinds, project, rojoTree: tree, rootConfig });
 
 		expect(result.rojoMounts).toStrictEqual([
 			{ dataModelPath: "ReplicatedStorage/Client", fsPath: "src/Client" },
 		]);
 	});
 
-	it("should prune descendant mounts when ancestor is present", () => {
+	it("should prune descendant mounts when ancestor is present", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -850,17 +805,21 @@ describe(resolveProjectConfig, () => {
 
 		const project = makeProject({
 			displayName: "client",
-			include: ["src/Client/**/*.spec.luau"],
+			include: ["src/Client/**/*.spec.luau", "src/Client/Systems/**/*.spec.luau"],
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: tree,
+			rootConfig,
+		});
 
 		expect(result.rojoMounts).toStrictEqual([
 			{ dataModelPath: "ReplicatedStorage/Client", fsPath: "src/Client" },
 		]);
 	});
 
-	it("should dedupe mounts when two include roots expand to the same mount", () => {
+	it("should dedupe mounts when two include roots expand to the same mount", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -876,14 +835,18 @@ describe(resolveProjectConfig, () => {
 			include: ["src/**/*.spec.luau", "src/Shared/**/*.test.luau"],
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: tree,
+			rootConfig,
+		});
 
 		expect(result.rojoMounts).toStrictEqual([
 			{ dataModelPath: "ReplicatedStorage/Shared", fsPath: "src/Shared" },
 		]);
 	});
 
-	it("should produce deterministic order across roots that expand to disjoint mounts", () => {
+	it("should produce deterministic order across roots that expand to disjoint mounts", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -899,12 +862,16 @@ describe(resolveProjectConfig, () => {
 			include: ["src/a/**/*.spec.luau", "src/b/**/*.spec.luau"],
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: tree,
+			rootConfig,
+		});
 
 		expect(result.projects).toStrictEqual(["ReplicatedStorage/A", "ReplicatedStorage/B"]);
 	});
 
-	it("should use exact lookup when outDir is set even with multiple include roots", () => {
+	it("should use exact lookup when outDir is set even with multiple include roots", async () => {
 		expect.assertions(2);
 
 		const project = makeProject({
@@ -913,7 +880,11 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/client",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.rojoMounts).toHaveLength(1);
 		expect(result.rojoMounts).toStrictEqual([
@@ -921,7 +892,7 @@ describe(resolveProjectConfig, () => {
 		]);
 	});
 
-	it("should throw when outDir is set but maps to no DataModel path", () => {
+	it("should throw when outDir is set but maps to no DataModel path", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -930,12 +901,19 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/nonexistent",
 		});
 
-		expect(() => {
-			return resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
-		}).toThrowWithMessage(ConfigError, /No Rojo tree mapping found for path: out\/nonexistent/);
+		await expect(
+			resolveProject({
+				project,
+				rojoTree: simpleRojoTree,
+				rootConfig,
+			}),
+		).rejects.toMatchObject({
+			hint: undefined,
+			message: expect.stringMatching(/No Rojo tree mapping found for path: out\/nonexistent/),
+		});
 	});
 
-	it("should apply project root before extracting include roots", () => {
+	it("should apply project root before extracting include roots", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -951,7 +929,11 @@ describe(resolveProjectConfig, () => {
 			root: "packages/friends",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, tree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: tree,
+			rootConfig,
+		});
 
 		expect(result.rojoMounts).toStrictEqual([
 			{
@@ -961,7 +943,7 @@ describe(resolveProjectConfig, () => {
 		]);
 	});
 
-	it("should throw with nearby $path suggestions when include root is unmappable", () => {
+	it("should throw with nearby $path suggestions when include root is unmappable", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -977,12 +959,19 @@ describe(resolveProjectConfig, () => {
 			include: ["ghost/**/*.spec.luau"],
 		});
 
-		expect(() => {
-			return resolveProjectConfig(project, rootConfig, tree, allDirectories);
-		}).toThrowWithMessage(ConfigError, /Available \$path entries: out\/Client, out\/Shared/);
+		await expect(
+			resolveProject({
+				project,
+				rojoTree: tree,
+				rootConfig,
+			}),
+		).rejects.toMatchObject({
+			hint: undefined,
+			message: expect.stringMatching(/Available \$path entries: out\/Client, out\/Shared/),
+		});
 	});
 
-	it("should omit available-entries line when rojo tree has no $path entries", () => {
+	it("should omit available-entries line when rojo tree has no $path entries", async () => {
 		expect.assertions(1);
 
 		const emptyTree = { $className: "DataModel" } satisfies RojoTreeNode;
@@ -992,12 +981,21 @@ describe(resolveProjectConfig, () => {
 			include: ["ghost/**/*.spec.luau"],
 		});
 
-		expect(() => {
-			resolveProjectConfig(project, rootConfig, emptyTree, allDirectories);
-		}).not.toThrow(/Available \$path entries/);
+		const caught = await captureRejection(
+			resolveProject({
+				project,
+				rojoTree: emptyTree,
+				rootConfig,
+			}),
+		);
+
+		expect(caught).toHaveProperty(
+			"message",
+			expect.not.stringMatching(/Available \$path entries/),
+		);
 	});
 
-	it("should hint about outDir when unmappable root starts with src/", () => {
+	it("should hint about outDir when unmappable root starts with src/", async () => {
 		expect.assertions(1);
 
 		const tree = {
@@ -1012,21 +1010,36 @@ describe(resolveProjectConfig, () => {
 			include: ["src/ghost/**/*.spec.ts"],
 		});
 
-		let caught: unknown;
-		try {
-			resolveProjectConfig(project, rootConfig, tree, allDirectories);
-		} catch (err) {
-			caught = err;
-		}
+		const caught = await captureRejection(
+			resolveProject({ project, rojoTree: tree, rootConfig }),
+		);
 
-		assert(caught instanceof ConfigError);
-
-		expect(caught.hint).toBe(
+		expect(caught).toHaveProperty(
+			"hint",
 			'Path starts with "src/" — if using roblox-ts, set "outDir" in your project config to the compiled output directory (e.g. "out/client")',
 		);
 	});
 
-	it("should resolve includes from cwd when root is not set", () => {
+	it("should omit the outDir hint when an unmappable root is outside src", async () => {
+		expect.assertions(1);
+
+		const project = makeProject({
+			displayName: "no-hint",
+			include: ["packages/ghost/**/*.spec.ts"],
+		});
+
+		const caught = await captureRejection(
+			resolveProject({
+				project,
+				rojoTree: simpleRojoTree,
+				rootConfig,
+			}),
+		);
+
+		expect(caught).toHaveProperty("hint", undefined);
+	});
+
+	it("should resolve includes from cwd when root is not set", async () => {
 		expect.assertions(1);
 
 		const project = makeProject({
@@ -1035,568 +1048,189 @@ describe(resolveProjectConfig, () => {
 			outDir: "out/client",
 		});
 
-		const result = resolveProjectConfig(project, rootConfig, simpleRojoTree, allDirectories);
+		const result = await resolveProject({
+			project,
+			rojoTree: simpleRojoTree,
+			rootConfig,
+		});
 
 		expect(result.include).toStrictEqual(["src/client/**/*.spec.ts"]);
 	});
 });
 
-describe(loadProjectConfigFile, () => {
-	it("should load and return project config via c12", async () => {
-		expect.assertions(3);
+describe("multi-root layouts", () => {
+	const rootConfig: ResolvedConfig = { ...createResolvedConfig(), rootDir: CWD };
 
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "client",
-				include: ["src/client/**/*.spec.ts"],
+	const friendsPackageTree = {
+		$className: "DataModel",
+		ReplicatedStorage: {
+			FriendsClient: {
+				Components: { $path: "packages/friends-package/src/Client/Components" },
+				Systems: { $path: "packages/friends-package/src/Client/Systems" },
 			},
-			configFile: "jest-project.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("./client.config.ts", "/project");
-
-		expect(result.displayName).toBe("client");
-		expect(result.include).toStrictEqual(["src/client/**/*.spec.ts"]);
-		expect(mockLoadConfig).toHaveBeenCalledExactlyOnceWith({
-			name: "jest-project",
-			configFile: "./client.config.ts",
-			configFileRequired: true,
-			cwd: "/project",
-			dotenv: false,
-			globalRc: false,
-			omit$Keys: true,
-			packageJson: false,
-			rcFile: false,
-		});
-	});
-
-	it("should unwrap project configs exported with defineProject shape", async () => {
-		expect.assertions(2);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				test: {
-					displayName: "client",
-					include: ["src/client/**/*.spec.ts"],
-				},
+			FriendsIntegration: {
+				$path: "packages/friends-package/test",
 			},
-			configFile: "jest-project.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("./client.config.ts", "/project");
-
-		expect(result.displayName).toBe("client");
-		expect(result.include).toStrictEqual(["src/client/**/*.spec.ts"]);
-	});
-
-	it("should throw when config file not found", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockRejectedValueOnce(new Error("File not found"));
-
-		await expect(loadProjectConfigFile("./missing.config.ts", "/project")).rejects.toThrow(
-			"Failed to load project config file ./missing.config.ts: File not found",
-		);
-	});
-
-	it("should stringify non-Error thrown values", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockRejectedValueOnce("raw string rejection");
-
-		await expect(loadProjectConfigFile("./bad.config.ts", "/project")).rejects.toThrow(
-			"Failed to load project config file ./bad.config.ts: raw string rejection",
-		);
-	});
-
-	it("should preserve original error message for non-ENOENT errors", async () => {
-		expect.assertions(3);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		const cause = new Error("Syntax error in config");
-		mockLoadConfig.mockRejectedValueOnce(cause);
-
-		const promise = loadProjectConfigFile("./broken.config.ts", "/project");
-
-		await expect(promise).rejects.toThrow(
-			"Failed to load project config file ./broken.config.ts: Syntax error in config",
-		);
-		await expect(promise).rejects.toHaveProperty("cause", cause);
-		expect(mockLoadConfig).toHaveBeenCalledOnce();
-	});
-
-	it("should extract displayName from object-style displayName", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: { name: "client", color: "cyan" },
-				include: ["src/client/**/*.spec.ts"],
+			FriendsShared: {
+				Network: { $path: "packages/friends-package/src/Shared/Network" },
+				Types: { $path: "packages/friends-package/src/Shared/Types" },
 			},
-			configFile: "jest-project.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("./client.config.ts", "/project");
-
-		expect(result.displayName).toStrictEqual({ name: "client", color: "cyan" });
-	});
-
-	it("should throw when config has no displayName", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "",
-				include: ["src/**/*.spec.ts"],
-			},
-			configFile: "jest-project.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		await expect(loadProjectConfigFile("./no-name.config.ts", "/project")).rejects.toThrow(
-			'Project config file "./no-name.config.ts" must have a displayName',
-		);
-	});
-
-	it("should throw when config omits displayName entirely", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: { include: ["src/**/*.spec.ts"] },
-			configFile: "jest-project.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		await expect(loadProjectConfigFile("./no-name.config.ts", "/project")).rejects.toThrow(
-			/Invalid project config file "\.\/no-name\.config\.ts"/,
-		);
-	});
-
-	it("should reject an unknown key in a project config file", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: { displayName: "client", includ: ["src/**/*.spec.ts"] },
-			configFile: "jest-project.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		await expect(loadProjectConfigFile("./typo.config.ts", "/project")).rejects.toThrow(
-			/Invalid project config file "\.\/typo\.config\.ts".*includ/,
-		);
-	});
-
-	it("should derive include from testMatch when include is missing", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "shared",
-				testMatch: ["**/__tests__/**/*.test"],
-			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("./shared/jest.config.ts", "/project");
-
-		expect(result.include).toStrictEqual([
-			"shared/**/__tests__/**/*.test.ts",
-			"shared/**/__tests__/**/*.test.tsx",
-		]);
-	});
-
-	it("should leave include undefined when neither include nor testMatch is set", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "minimal",
-			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("./minimal.config.ts", "/project");
-
-		expect(result).not.toHaveProperty("include");
-	});
-
-	it("should derive outDir from config path for roblox-ts projects", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "shared",
-				testMatch: ["**/__tests__/**/*.test"],
-			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("src/shared/jest.config.ts", "/project");
-
-		expect(result.outDir).toBe("out/shared");
-	});
-
-	it("should not derive outDir when tsconfig has no rootDir/outDir", async () => {
-		expect.assertions(1);
-
-		const { resolveTsconfigDirectories } = await import("../executor.ts");
-		vi.mocked(resolveTsconfigDirectories).mockReturnValueOnce({
-			outDir: undefined,
-			rootDir: undefined,
-		});
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "luau-only",
-				testMatch: ["**/*.spec"],
-			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("src/shared/jest.config.ts", "/project");
-
-		expect(result.outDir).toBeUndefined();
-	});
-
-	it.for([
-		{ outDir: "out", rootDir: undefined },
-		{ outDir: undefined, rootDir: "src" },
-	])(
-		"should not derive outDir when only one tsconfig directory is available",
-		async (directories) => {
-			expect.assertions(1);
-
-			const { resolveTsconfigDirectories } = await import("../executor.ts");
-			vi.mocked(resolveTsconfigDirectories).mockReturnValueOnce(directories);
-
-			const { loadConfig } = await import("c12");
-			vi.mocked(loadConfig).mockResolvedValueOnce({
-				config: { displayName: "partial", testMatch: ["**/*.spec"] },
-				configFile: "jest.config.ts",
-				cwd: "/project",
-				layers: [],
-			});
-
-			const result = await loadProjectConfigFile("src/shared/jest.config.ts", "/project");
-
-			expect(result).not.toHaveProperty("outDir");
 		},
-	);
-
-	it("should preserve an explicit outDir when tsconfig directories are available", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		vi.mocked(loadConfig).mockResolvedValueOnce({
-			config: { displayName: "custom", outDir: "custom-output", testMatch: ["**/*.spec"] },
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("src/shared/jest.config.ts", "/project");
-
-		expect(result.outDir).toBe("custom-output");
-	});
-
-	it("should not derive outDir when config path is not under src/", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "lib",
-				testMatch: ["**/*.spec"],
+		ServerScriptService: {
+			FriendsServer: {
+				Components: { $path: "packages/friends-package/src/Server/Components" },
+				Systems: { $path: "packages/friends-package/src/Server/Systems" },
 			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
+		},
+	} satisfies RojoTreeNode;
+
+	const friendsInclude = [
+		"packages/friends-package/src/**/*.spec.luau",
+		"packages/friends-package/test/**/*.spec.luau",
+	];
+
+	const splitServicesTree = {
+		$className: "DataModel",
+		ReplicatedStorage: {
+			$className: "ReplicatedStorage",
+			PkgShared: { $path: "pkg/src/Shared" },
+		},
+		ServerScriptService: {
+			$className: "ServerScriptService",
+			PkgServer: { $path: "pkg/src/Server" },
+		},
+	} satisfies RojoTreeNode;
+
+	it("should resolve rojoMounts for every touched service branch", async () => {
+		expect.assertions(2);
+
+		const resolved = await resolveProject({
+			project: { displayName: "friends-package", include: friendsInclude },
+			rojoTree: friendsPackageTree,
+			rootConfig,
 		});
 
-		const result = await loadProjectConfigFile("packages/lib/jest.config.ts", "/project");
-
-		expect(result.outDir).toBeUndefined();
-	});
-
-	it("should keep testMatch patterns that already have source extensions", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "mixed",
-				testMatch: ["**/*.spec.ts", "**/*.test"],
+		expect(resolved.rojoMounts).toStrictEqual([
+			{
+				dataModelPath: "ReplicatedStorage/FriendsClient/Components",
+				fsPath: "packages/friends-package/src/Client/Components",
 			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("./shared/mixed.config.ts", "/project");
-
-		expect(result.include).toStrictEqual([
-			"shared/**/*.spec.ts",
-			"shared/**/*.test.ts",
-			"shared/**/*.test.tsx",
+			{
+				dataModelPath: "ReplicatedStorage/FriendsClient/Systems",
+				fsPath: "packages/friends-package/src/Client/Systems",
+			},
+			{
+				dataModelPath: "ReplicatedStorage/FriendsShared/Network",
+				fsPath: "packages/friends-package/src/Shared/Network",
+			},
+			{
+				dataModelPath: "ReplicatedStorage/FriendsShared/Types",
+				fsPath: "packages/friends-package/src/Shared/Types",
+			},
+			{
+				dataModelPath: "ServerScriptService/FriendsServer/Components",
+				fsPath: "packages/friends-package/src/Server/Components",
+			},
+			{
+				dataModelPath: "ServerScriptService/FriendsServer/Systems",
+				fsPath: "packages/friends-package/src/Server/Systems",
+			},
+			{
+				dataModelPath: "ReplicatedStorage/FriendsIntegration",
+				fsPath: "packages/friends-package/test",
+			},
+		]);
+		expect(resolved.projects).toStrictEqual([
+			"ReplicatedStorage/FriendsClient/Components",
+			"ReplicatedStorage/FriendsClient/Systems",
+			"ReplicatedStorage/FriendsShared/Network",
+			"ReplicatedStorage/FriendsShared/Types",
+			"ServerScriptService/FriendsServer/Components",
+			"ServerScriptService/FriendsServer/Systems",
+			"ReplicatedStorage/FriendsIntegration",
 		]);
 	});
 
-	it("should keep Lua and Luau testMatch extensions without adding TypeScript variants", async () => {
+	it("should pin a multi-root include to a single mount when outDir is set", async () => {
 		expect.assertions(1);
 
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "luau",
-				testMatch: ["**/*.spec.lua", "**/*.test.luau"],
+		const resolved = await resolveProject({
+			project: {
+				displayName: "friends-client-only",
+				include: friendsInclude,
+				outDir: "packages/friends-package/src/Client/Components",
 			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
+			rojoTree: friendsPackageTree,
+			rootConfig,
 		});
 
-		const result = await loadProjectConfigFile("./shared/luau.config.ts", "/project");
-
-		expect(result.include).toStrictEqual(["shared/**/*.spec.lua", "shared/**/*.test.luau"]);
-	});
-
-	it("should only recognize source extensions at the end of a testMatch pattern", async () => {
-		expect.assertions(1);
-
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "suffix",
-				testMatch: ["**/*.spec.ts.fixture"],
+		expect(resolved.rojoMounts).toStrictEqual([
+			{
+				dataModelPath: "ReplicatedStorage/FriendsClient/Components",
+				fsPath: "packages/friends-package/src/Client/Components",
 			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
-		});
-
-		const result = await loadProjectConfigFile("./shared/suffix.config.ts", "/project");
-
-		expect(result.include).toStrictEqual([
-			"shared/**/*.spec.ts.fixture.ts",
-			"shared/**/*.spec.ts.fixture.tsx",
 		]);
 	});
 
-	it("should not override include when already provided", async () => {
+	it("should resolve exact-match roots when no mount exists on disk", async () => {
 		expect.assertions(1);
 
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
-			config: {
-				displayName: "client",
-				include: ["src/client/**/*.spec.ts"],
-				testMatch: ["**/*.spec"],
+		const resolved = await resolveProject({
+			kinds: mountKinds({}),
+			project: {
+				displayName: "friends-test-only",
+				include: ["packages/friends-package/test/**/*.spec.luau"],
 			},
-			configFile: "jest.config.ts",
-			cwd: "/project",
-			layers: [],
+			rojoTree: friendsPackageTree,
+			rootConfig,
 		});
 
-		const result = await loadProjectConfigFile("./client.config.ts", "/project");
-
-		expect(result.include).toStrictEqual(["src/client/**/*.spec.ts"]);
+		expect(resolved.rojoMounts).toStrictEqual([
+			{
+				dataModelPath: "ReplicatedStorage/FriendsIntegration",
+				fsPath: "packages/friends-package/test",
+			},
+		]);
 	});
 
-	it("should load Luau config when jest.config.luau exists", async () => {
-		expect.assertions(2);
+	it("should span services, mirror mounts in projects and leave outDir unset", async () => {
+		expect.assertions(3);
 
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce(
-			"/project/packages/shared/jest.config.luau",
-		);
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({
-			displayName: "shared-luau",
-			testMatch: ["**/*.spec"],
+		const resolved = await resolveProjects({
+			projects: [{ displayName: "multi-root-e2e", include: ["pkg/src/**/*.spec.luau"] }],
+			rojoTree: splitServicesTree,
+			rootConfig,
 		});
 
-		const result = await loadProjectConfigFile("packages/shared", "/project");
-
-		expect(result.displayName).toBe("shared-luau");
-		expect(result.include).toContain("packages/shared/**/*.spec.luau");
+		expect(resolved.map((project) => project.rojoMounts)).toStrictEqual([
+			[
+				{ dataModelPath: "ReplicatedStorage/PkgShared", fsPath: "pkg/src/Shared" },
+				{ dataModelPath: "ServerScriptService/PkgServer", fsPath: "pkg/src/Server" },
+			],
+		]);
+		expect(resolved[0]!.projects).toStrictEqual([
+			"ReplicatedStorage/PkgShared",
+			"ServerScriptService/PkgServer",
+		]);
+		expect(resolved[0]!.outDir).toBeUndefined();
 	});
 
-	it("should throw when Luau config has empty displayName", async () => {
+	it("should pin a service-spanning include to the outDir mount", async () => {
 		expect.assertions(1);
 
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/lib/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({ displayName: "" });
-
-		await expect(loadProjectConfigFile("lib", "/project")).rejects.toThrowWithMessage(
-			Error,
-			/must have a displayName string/,
-		);
-	});
-
-	it("should throw when Luau config has no displayName", async () => {
-		expect.assertions(1);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/lib/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({});
-
-		await expect(loadProjectConfigFile("lib", "/project")).rejects.toThrowWithMessage(
-			Error,
-			/must have a displayName string/,
-		);
-	});
-
-	it("should derive default include pattern when Luau config has no testMatch", async () => {
-		expect.assertions(1);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/shared/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({ displayName: "shared" });
-
-		const result = await loadProjectConfigFile("shared", "/project");
-
-		expect(result.include).toStrictEqual(["shared/**/*.spec.luau"]);
-	});
-
-	it("should set testMatch on config when Luau config provides testMatch", async () => {
-		expect.assertions(1);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/shared/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({
-			displayName: "shared",
-			testMatch: ["**/*.spec", "**/*.test"],
+		const resolved = await resolveProject({
+			project: {
+				displayName: "shared-only",
+				include: ["pkg/src/**/*.spec.luau"],
+				outDir: "pkg/src/Shared",
+			},
+			rojoTree: splitServicesTree,
+			rootConfig,
 		});
 
-		const result = await loadProjectConfigFile("shared", "/project");
-
-		expect(result.testMatch).toStrictEqual(["**/*.spec", "**/*.test"]);
-	});
-
-	it("should copy boolean optional fields from Luau config", async () => {
-		expect.assertions(2);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/shared/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({
-			clearMocks: true,
-			displayName: "shared",
-			resetMocks: false,
-		});
-
-		const result = await loadProjectConfigFile("shared", "/project");
-
-		expect(result.clearMocks).toBeTrue();
-		expect(result.resetMocks).toBeFalse();
-	});
-
-	it("should copy number optional fields from Luau config", async () => {
-		expect.assertions(1);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/shared/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({
-			displayName: "shared",
-			testTimeout: 5000,
-		});
-
-		const result = await loadProjectConfigFile("shared", "/project");
-
-		expect(result.testTimeout).toBe(5000);
-	});
-
-	it("should copy string optional fields from Luau config", async () => {
-		expect.assertions(1);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/shared/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({
-			displayName: "shared",
-			testEnvironment: "jest-environment-jsdom",
-		});
-
-		const result = await loadProjectConfigFile("shared", "/project");
-
-		expect(result.testEnvironment).toBe("jest-environment-jsdom");
-	});
-
-	it("should copy string array optional fields from Luau config", async () => {
-		expect.assertions(1);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/shared/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({
-			displayName: "shared",
-			setupFiles: ["setup.luau"],
-		});
-
-		const result = await loadProjectConfigFile("shared", "/project");
-
-		expect(result.setupFiles).toStrictEqual(["setup.luau"]);
-	});
-
-	it("should reject fields with wrong types in Luau config", async () => {
-		expect.assertions(1);
-
-		const { findLuauConfigFile, loadLuauConfig } = await import("./luau-config-loader.ts");
-		vi.mocked(findLuauConfigFile).mockReturnValueOnce("/project/shared/jest.config.luau");
-		vi.mocked(loadLuauConfig).mockReturnValueOnce({
-			clearMocks: "yes",
-			displayName: "shared",
-			setupFiles: "not-an-array",
-			testTimeout: "fast",
-		});
-
-		await expect(loadProjectConfigFile("shared", "/project")).rejects.toThrow(
-			/clearMocks must be boolean.*setupFiles must be an array.*testTimeout must be a number/s,
-		);
+		expect(resolved.rojoMounts).toStrictEqual([
+			{ dataModelPath: "ReplicatedStorage/PkgShared", fsPath: "pkg/src/Shared" },
+		]);
 	});
 });
 
@@ -1614,12 +1248,12 @@ describe(resolveAllProjects, () => {
 			},
 		];
 
-		const result = await resolveAllProjects(
+		const result = await resolveAllProjects({
+			cwd: "/project",
 			entries,
-			DEFAULT_CONFIG,
-			simpleRojoTree,
-			"/project",
-		);
+			rojoTree: simpleRojoTree,
+			rootConfig: createResolvedConfig(),
+		});
 
 		expect(result).toHaveLength(1);
 		expect(result[0]!.displayName).toBe("client");
@@ -1628,9 +1262,8 @@ describe(resolveAllProjects, () => {
 	it("should load string entries via c12", async () => {
 		expect.assertions(2);
 
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
+		const { configLoader, seams } = createProjectSeams();
+		configLoader.mockResolvedValueOnce({
 			config: {
 				displayName: "server",
 				include: ["src/server/**/*.spec.ts"],
@@ -1643,12 +1276,13 @@ describe(resolveAllProjects, () => {
 
 		const entries = ["./server.config.ts"];
 
-		const result = await resolveAllProjects(
+		const result = await resolveAllProjects({
+			cwd: "/project",
 			entries,
-			DEFAULT_CONFIG,
-			simpleRojoTree,
-			"/project",
-		);
+			rojoTree: simpleRojoTree,
+			rootConfig: createResolvedConfig(),
+			...seams,
+		});
 
 		expect(result).toHaveLength(1);
 		expect(result[0]!.displayName).toBe("server");
@@ -1657,9 +1291,8 @@ describe(resolveAllProjects, () => {
 	it("should handle mixed inline and string entries", async () => {
 		expect.assertions(3);
 
-		const { loadConfig } = await import("c12");
-		const mockLoadConfig = vi.mocked(loadConfig);
-		mockLoadConfig.mockResolvedValueOnce({
+		const { configLoader, seams } = createProjectSeams();
+		configLoader.mockResolvedValueOnce({
 			config: {
 				displayName: "server",
 				include: ["src/server/**/*.spec.ts"],
@@ -1681,12 +1314,13 @@ describe(resolveAllProjects, () => {
 			"./server.config.ts",
 		];
 
-		const result = await resolveAllProjects(
+		const result = await resolveAllProjects({
+			cwd: "/project",
 			entries,
-			DEFAULT_CONFIG,
-			simpleRojoTree,
-			"/project",
-		);
+			rojoTree: simpleRojoTree,
+			rootConfig: createResolvedConfig(),
+			...seams,
+		});
 
 		expect(result).toHaveLength(2);
 		expect(result[0]!.displayName).toBe("client");
@@ -1713,7 +1347,12 @@ describe(resolveAllProjects, () => {
 			},
 		];
 
-		const result = await resolveAllProjects(entries, DEFAULT_CONFIG, tree, "/project");
+		const result = await resolveAllProjects({
+			cwd: "/project",
+			entries,
+			rojoTree: tree,
+			rootConfig: createResolvedConfig(),
+		});
 
 		expect(result[0]!.testMatch).toStrictEqual(["**/*.spec"]);
 	});
@@ -1739,72 +1378,12 @@ describe(resolveAllProjects, () => {
 		];
 
 		await expect(
-			resolveAllProjects(entries, DEFAULT_CONFIG, simpleRojoTree, "/project"),
+			resolveAllProjects({
+				cwd: "/project",
+				entries,
+				rojoTree: simpleRojoTree,
+				rootConfig: createResolvedConfig(),
+			}),
 		).rejects.toThrow("Duplicate project displayName: client");
-	});
-});
-
-describe(createFsClassifier, () => {
-	it("should return 'directory' when statSync reports a directory", async () => {
-		expect.assertions(1);
-
-		const fs = await import("node:fs");
-		vi.spyOn(fs.default, "statSync").mockReturnValueOnce(fromAny({ isDirectory: () => true }));
-
-		const classify = createFsClassifier("/root");
-
-		expect(classify("some/directory")).toBe("directory");
-	});
-
-	it("should return 'file' when statSync reports a non-directory", async () => {
-		expect.assertions(1);
-
-		const fs = await import("node:fs");
-		vi.spyOn(fs.default, "statSync").mockReturnValueOnce(fromAny({ isDirectory: () => false }));
-
-		const classify = createFsClassifier("/root");
-
-		expect(classify("some/file.txt")).toBe("file");
-	});
-
-	it("should return 'missing' when statSync returns undefined", async () => {
-		expect.assertions(1);
-
-		const fs = await import("node:fs");
-		vi.spyOn(fs.default, "statSync").mockReturnValueOnce(undefined);
-
-		const classify = createFsClassifier("/root");
-
-		expect(classify("missing/path")).toBe("missing");
-	});
-
-	it("should resolve relative paths against the given root directory", async () => {
-		expect.assertions(1);
-
-		const fs = await import("node:fs");
-		const spy = vi
-			.spyOn(fs.default, "statSync")
-			.mockReturnValueOnce(fromAny({ isDirectory: () => true }));
-
-		const classify = createFsClassifier("/workspace/root");
-		classify("src/Client");
-
-		expect(spy).toHaveBeenCalledWith(expect.stringMatching(/src[/\\]Client$/), {
-			throwIfNoEntry: false,
-		});
-	});
-
-	it("should pass absolute paths through without resolution", async () => {
-		expect.assertions(1);
-
-		const fs = await import("node:fs");
-		const spy = vi
-			.spyOn(fs.default, "statSync")
-			.mockReturnValueOnce(fromAny({ isDirectory: () => true }));
-
-		const classify = createFsClassifier("/workspace/root");
-		classify("/absolute/path");
-
-		expect(spy).toHaveBeenCalledWith("/absolute/path", { throwIfNoEntry: false });
 	});
 });

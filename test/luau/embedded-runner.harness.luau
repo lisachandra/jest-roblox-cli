@@ -1,4 +1,5 @@
 --!nocheck
+local activeScheduling = 0
 -- Lute-driven test for the embedded workspace runner's per-package Game
 -- Output capture. The runner and the capture module it shares with runner.luau
 -- are inlined into the placeholders below by embedded-runner.spec.ts; the fake
@@ -215,6 +216,9 @@ local jestMissing = {}
 -- What a package writes to Jest's own stdout on its way out, the way the real
 -- "No tests found, exiting with code 1" is written.
 local jestBanners = {}
+-- Every materialize and reset, in order, so a fanned-out run can be checked
+-- for staging each package once.
+local stagingCalls = {}
 -- Stands the RobloxShared package down, so the output tap cannot be installed.
 local sharedIsMissing = false
 local silent = {}
@@ -237,11 +241,6 @@ end
 local liveRecords: any = nil
 local jestSawConfig: any = nil
 
--- Every heartbeat a run would have written, and the map it named, plus the
--- sink the shared result builder armed the run with.
-local publishedProgress: { any } = {}
-local progressSink: any = nil
-
 local function makeInstance(name: string, children: any?): any
 	local instance = { Name = name, children = children or {} }
 
@@ -254,6 +253,60 @@ local function makeInstance(name: string, children: any?): any
 	end
 
 	return instance
+end
+
+-- A service-rooted spec file, for the last-seen record to name a test in. The
+-- topmost fake (Parent = nil) stands in for `game` and is left off the path.
+local function makeSpecFile(name: string): any
+	local root = { Name = "game", Parent = nil }
+	local replicatedStorage = { Name = "ReplicatedStorage", Parent = root }
+
+	return { Name = name, Parent = replicatedStorage }
+end
+
+-- Expect's matcher state, which is where both per-file hooks read the running
+-- test's identity from. Shared across the run the way `_G` shares it.
+local matcherState: any = { currentTestName = nil, testPath = nil }
+
+-- jest-runtime's shared class table. Handed back by identity rather than
+-- rebuilt per require, because the circus hook patches `setGlobalsForRuntime`
+-- on it and a fresh table each time would drop the patch.
+local RuntimeClass: any = {}
+
+function RuntimeClass.setGlobalsForRuntime() end
+
+-- One test file's own circus dispatch list, the way jest's per-file module
+-- registry gives each file a list of its own.
+local function makeCircusState()
+	local handlers: { any } = {}
+
+	return {
+		addEventHandler = function(handler: any)
+			table.insert(handlers, handler)
+		end,
+		dispatch = function(name: string)
+			for _, handler in handlers do
+				handler(nil, { name = name })
+			end
+		end,
+	}
+end
+
+-- What jest does around one test file: a fresh runtime whose registry holds
+-- that file's circus state, the `setGlobalsForRuntime` callback circus's
+-- `initialize` makes, then the file's cases.
+local function reachTest(fileName: string, caseName: string)
+	local circusState = makeCircusState()
+	local runtime = {
+		requireInternalModule = function()
+			return circusState
+		end,
+	}
+
+	matcherState.testPath = makeSpecFile(fileName)
+	RuntimeClass.setGlobalsForRuntime(runtime, {})
+	matcherState.currentTestName = caseName
+	circusState.dispatch("test_start")
 end
 
 local JestModule = makeInstance("Jest")
@@ -280,14 +333,45 @@ local RobloxSharedExports = {
 	nodeUtils = { process = { stderr = makeWriteable(), stdout = makeWriteable() } },
 }
 local RuntimeModule = makeInstance("JestRuntime")
+
+-- `print` reaches `MessageOut` deferred: the engine hands the line to the
+-- listeners a scheduler turn later, which for an abandoned package is already
+-- inside the NEXT package's capture window. Queued here and flushed as the next
+-- package's Jest starts, so this file reproduces the ordering that files a real
+-- run's record under the wrong package.
+local writeStdout = print
+local deferredPrints = {}
+local flushedPrints = {}
+
+local function print(message: string)
+	table.insert(deferredPrints, message)
+end
+
+local function flushPrints()
+	local queued = deferredPrints
+	deferredPrints = {}
+	for _, message in queued do
+		table.insert(flushedPrints, message)
+		emit(message, OUTPUT)
+	end
+end
+
 local Jest = {
 	runCLI = function(_, config)
+		check(activeScheduling == 1, "Jest starts with one scheduling owner")
 		return {
 			expect = function()
+				-- The scheduler turn the previous package never got: whatever
+				-- it printed on its way out arrives now, inside this capture.
+				flushPrints()
 				local pkg = config.pkg
 				jestSawConfig = config
 				say(pkg, "jest:" .. pkg, OUTPUT)
 				say(pkg, "warn:" .. pkg, WARNING)
+				-- Stands in for circus reaching a test: the per-file hook goes
+				-- in from the runtime callback, and the record then names the
+				-- case that is running if this package is abandoned.
+				reachTest(pkg .. ".spec", pkg .. " wedges")
 				local banner = jestBanners[pkg]
 				if banner then
 					RobloxSharedExports.nodeUtils.process.stdout:write(banner)
@@ -330,6 +414,17 @@ local Jest = {
 }
 
 local stubs = {
+	["./cooperative-scheduler"] = {
+		arm = function()
+			check(activeScheduling == 0, "previous package did not disarm scheduling")
+			activeScheduling += 1
+			return function()
+				check(activeScheduling == 1, "scheduling stopped more than once")
+				activeScheduling -= 1
+				return nil
+			end
+		end,
+	},
 	["../instance-resolver"] = {
 		getJest = function(config)
 			if jestMissing[config.pkg] then
@@ -352,15 +447,21 @@ local stubs = {
 
 			return if name == "JestRuntime" then RuntimeModule else ExpectModule
 		end,
+		findCircusModule = function(circusPackage, name: string)
+			local circus = circusPackage:FindFirstChild("circus")
+			return if circus then circus:FindFirstChild(name) else nil
+		end,
 	},
 	["./materializer"] = {
 		materialize = function(pkg)
+			table.insert(stagingCalls, "materialize:" .. pkg)
 			say(pkg, "materialize:" .. pkg, OUTPUT)
 			if materializeFails[pkg] then
 				error("no stage for " .. pkg, 0)
 			end
 		end,
 		reset = function()
+			table.insert(stagingCalls, "reset")
 			emit("reset", WARNING)
 		end,
 	},
@@ -389,20 +490,8 @@ local stubs = {
 		end,
 		unpatch = function() end,
 	},
-	-- The heartbeat's SortedMap sink needs a live MemoryStore, so the module is
-	-- stood in for and `publishedProgress` records what a run would have
-	-- written.
-	["../test-progress"] = {
-		arm = function(options: any)
-			progressSink = options.publish
-			return { failure = nil }
-		end,
-		disarmCurrent = function() end,
-		sortedMapPublisher = function(mapId: string)
-			return function(entry: any)
-				table.insert(publishedProgress, { entry = entry, mapId = mapId })
-			end
-		end,
+	["../circus-state-release"] = {
+		patch = function() end,
 	},
 	-- Reached through the shared runner-result module, which resolves the
 	-- run's own jest-circus / Expect / jest-runtime packages before arming.
@@ -435,13 +524,13 @@ local function require(target)
 	if target == ExpectModule then
 		return {
 			getState = function()
-				return {}
+				return matcherState
 			end,
 		}
 	end
 
 	if target == RuntimeModule then
-		return { setGlobalsForRuntime = function() end }
+		return RuntimeClass
 	end
 
 	local stub = stubs[target]
@@ -461,15 +550,20 @@ stubs["../process-capture"] = __PROCESS_CAPTURE_MODULE__
 -- The real capture module, so the window under test is the one production
 -- runs. Its own `require("./intercept-writeable")` only wants the type.
 stubs["../game-output-capture"] = __CAPTURE_MODULE__
+stubs["./game-output-capture"] = stubs["../game-output-capture"]
 -- The real bail module too: it decides when a loop stops taking packages,
 -- which is what the bail assertions below are about.
 stubs["./bail"] = __BAIL_MODULE__
+-- The real last-seen record, which the result seam below arms: what the abort
+-- says about the test it died in is the subject of the assertions below, so a
+-- stub here would only assert that a string was concatenated.
+stubs["../last-seen"] = __LAST_SEEN_MODULE__
+stubs["./last-seen"] = stubs["../last-seen"]
 -- The real result builder as well: it is the seam both runners assemble their
 -- `runner` envelope through, so a workspace run must reach the same fields a
 -- multi run does. Its instance-resolver sits at the luau root, not beside the
 -- staging runner, so it asks under the path aliased above rather than the one
 -- the staging runner asks under.
-stubs["./test-progress"] = stubs["../test-progress"]
 stubs["../runner-result"] = __RUNNER_RESULT_MODULE__
 -- The real watchdog too: what it does to a package that parks is the subject of
 -- the infinite-yield assertion below.
@@ -499,6 +593,18 @@ end
 local function has(messages, wanted: string): boolean
 	for _, message in messages do
 		if message == wanted then
+			return true
+		end
+	end
+
+	return false
+end
+
+-- The last-seen line carries an elapsed time this file does not fix, so it is
+-- matched on the part that names the test.
+local function hasPart(messages, wanted: string): boolean
+	for _, message in messages do
+		if string.find(message, wanted, 1, true) ~= nil then
 			return true
 		end
 	end
@@ -576,8 +682,7 @@ end
 -- T1: the capture opens before the package is materialized and spans its run,
 -- and two packages that each print distinct messages get only their own —
 -- including the reset between them, which belongs to neither capture.
-local function 
-testWindowAndNoBleedAcrossPackages()
+local function testWindowAndNoBleedAcrossPackages()
 	local results = run({ "a", "b" })
 	local a = messagesOf(results[1])
 	local b = messagesOf(results[2])
@@ -776,43 +881,6 @@ local function testCoverageWithoutAttribution()
 	check(runner.perTestCoverage == nil, "T13: no attribution means no field")
 end
 
--- T15: a task given a progress map arms every package it runs against one
--- sink, so the record the host reads back is the last test the whole task
--- reached rather than one per package.
-local function testProgressPublishesUnderOneKeyPerTask()
-	publishedProgress = {}
-	progressSink = nil
-
-	local entries = {}
-	for _, pkg in { "a", "b" } do
-		table.insert(entries, entryFor(pkg))
-	end
-
-	EmbeddedRunner.runEmbedded({}, {
-		entries = entries,
-		progress = { mapId = "progress-uuid", ttlSeconds = 30 },
-	})
-	check(progressSink ~= nil, "T15: the run armed a heartbeat")
-
-	progressSink({ elapsedMs = 1, state = "started", testFilePath = "f", testName = "t" })
-
-	check(#publishedProgress == 1, "T15: the sink writes")
-	check(publishedProgress[1].mapId == "progress-uuid", "T15: into the map the payload named")
-	check(publishedProgress[1].entry.testName == "t", "T15: carrying the record")
-end
-
--- T16: a run the CLI asked for no map from arms nothing, so an ordinary
--- workspace run spends no MemoryStore quota on a diagnostic nobody reads.
-local function testNoProgressMapPublishesNothing()
-	publishedProgress = {}
-	progressSink = nil
-
-	run({ "a" })
-
-	check(progressSink == nil, "T16: nothing is armed without a map")
-	check(#publishedProgress == 0, "T16: and nothing is written")
-end
-
 -- T14: a package that parks on a yield nothing will ever resolve fails on its
 -- own and the batch runs on. Unguarded the task holds that thread until Roblox
 -- ends it on the deadline, which names neither the package nor the yield.
@@ -828,6 +896,15 @@ local function testInfiniteYieldFailsOnlyItsPackage()
 	check(
 		string.find(parked.err, "Infinite yield detected", 1, true) ~= nil,
 		"T14: the failure names the infinite yield"
+	)
+	check(
+		string.find(
+			parked.err,
+			'Last test seen: "a wedges" in ReplicatedStorage/a.spec (running for',
+			1,
+			true
+		) ~= nil,
+		"T14: and the test the package was in, got " .. parked.err
 	)
 	check(has(messagesOf(results[1]), YIELD_WARNING), "T14: the warning is kept as its output")
 
@@ -866,6 +943,15 @@ local function testElapsedBudgetAbandonsOnlyItsPackage()
 		string.find(abandoned.err, "Timed out after 5s", 1, true) ~= nil,
 		"T15: the failure names the budget"
 	)
+	check(
+		string.find(
+			abandoned.err,
+			'Last test seen: "a wedges" in ReplicatedStorage/a.spec (running for',
+			1,
+			true
+		) ~= nil,
+		"T15: and the test the package was in, got " .. abandoned.err
+	)
 
 	-- The stage is torn down inside the abandoned package's own capture, so
 	-- the reset belongs to it rather than to whatever runs next.
@@ -877,6 +963,37 @@ local function testElapsedBudgetAbandonsOnlyItsPackage()
 	check(
 		has(messagesOf(results[2]), "materialize:b"),
 		"T15: the next package stages itself afresh"
+	)
+end
+
+-- T15b: the record is filed under the package it is about. Left to the print
+-- alone it is not: `MessageOut` delivers deferred, so the line arrives after
+-- the abandoned package's capture has closed and inside the next package's,
+-- which is where a real run put it.
+local function testTheRecordLandsInTheAbandonedPackagesOutput()
+	deferredPrints = {}
+	flushedPrints = {}
+	jestParks.a = true
+
+	local outcome = runInThread(function()
+		return EmbeddedRunner.runEmbedded({}, {
+			entries = { budgetedEntryFor("a", 5000), budgetedEntryFor("b", 5000) },
+		})
+	end)
+
+	elapse()
+	jestParks.a = nil
+
+	local results = outcome.results
+	local note = 'Last test seen: "a wedges" in ReplicatedStorage/a.spec'
+	check(hasPart(flushedPrints, note), "T15b: the run still prints the record")
+	check(
+		hasPart(messagesOf(results[1]), note),
+		"T15b: the abandoned package's own Game Output carries it"
+	)
+	check(
+		not hasPart(messagesOf(results[2]), note),
+		"T15b: and the package that ran next carries it nowhere"
 	)
 end
 
@@ -1114,10 +1231,12 @@ local function testJestStdoutReachesBannerOutput()
 
 	local banner = results[1].bannerOutput
 	check(banner ~= nil, "T29: a package that wrote to stdout has Banner Output")
-	check(
-		string.find(banner, "No tests found in a", 1, true) ~= nil,
-		"T29: carrying what Jest wrote"
-	)
+	local written = {}
+	for _, record in HttpService:JSONDecode(banner) do
+		table.insert(written, record.message)
+	end
+
+	check(has(written, "No tests found in a"), "T29: carrying what Jest wrote")
 end
 
 -- T30: and the tap puts it back where it found it, so the next package's
@@ -1130,6 +1249,131 @@ local function testTheTapIsPutBack()
 	jestBanners.a = nil
 	check(first[1].bannerOutput ~= nil, "T30: the package that wrote has Banner Output")
 	check(second[1].bannerOutput == nil, "T30: the package that did not write has none")
+end
+
+local function projectEntry(pkg: string, project: string)
+	return { pkg = pkg, project = project, config = { pkg = pkg } }
+end
+
+-- Stands in for the plugin's VM hosts: each entry runs as a host would run it,
+-- against the package the coordinator already staged. Records every batch so a
+-- test can see which entries were fanned out together.
+local fanOutBatches = {}
+
+local function fanOut(entries)
+	local keys = {}
+	local results = {}
+	for _, entry in entries do
+		table.insert(keys, entry.pkg .. "/" .. entry.project)
+		table.insert(results, EmbeddedRunner.runStagedEntry({}, entry))
+	end
+
+	table.insert(fanOutBatches, table.concat(keys, ","))
+	return results
+end
+
+local function runFannedOut(entries, payload)
+	stagingCalls = {}
+	fanOutBatches = {}
+	local full = { entries = entries }
+	for key, value in payload or {} do
+		full[key] = value
+	end
+
+	return EmbeddedRunner.runEmbedded({}, full, fanOut)
+end
+
+-- T31: a package's projects go out together, against one staging of it, and
+-- come back in request order.
+local function testFanOutStagesEachPackageOnce()
+	local results = runFannedOut({
+		projectEntry("a", "client"),
+		projectEntry("a", "server"),
+		projectEntry("b", "unit"),
+	})
+
+	check(#fanOutBatches == 2, "T31: one fan-out per package")
+	check(fanOutBatches[1] == "a/client,a/server", "T31: a's projects fan out together")
+	check(fanOutBatches[2] == "b/unit", "T31: b fans out alone")
+	check(
+		table.concat(stagingCalls, ",") == "materialize:a,reset,materialize:b,reset",
+		"T31: each package is staged once and torn down after"
+	)
+	check(#results == 3, "T31: every entry comes back")
+	check(results[2].project == "server" and results[3].pkg == "b", "T31: in request order")
+end
+
+-- T32: the package's Game Output is one capture, filed under its first entry:
+-- once projects overlap, a line cannot be told apart by project.
+local function testFanOutFilesThePackageOutputOnce()
+	local results = runFannedOut({ projectEntry("a", "client"), projectEntry("a", "server") })
+	local first = messagesOf(results[1])
+
+	check(has(first, "materialize:a"), "T32: the capture spans staging")
+	check(has(first, "jest:a"), "T32: the capture spans the projects' runs")
+	check(results[2].gameOutput == nil, "T32: no second copy under a sibling project")
+end
+
+-- T33: a package that cannot be staged fails every one of its entries and is
+-- never fanned out; the next package still runs.
+local function testFanOutStageFailureFailsThePackage()
+	materializeFails.a = true
+	local results = runFannedOut({
+		projectEntry("a", "client"),
+		projectEntry("a", "server"),
+		projectEntry("b", "unit"),
+	})
+	materializeFails.a = nil
+
+	check(#fanOutBatches == 1 and fanOutBatches[1] == "b/unit", "T33: only b fans out")
+	for index = 1, 2 do
+		local decoded = HttpService:JSONDecode(results[index].jestOutput)
+		check(decoded.success == false, "T33: a's entry " .. index .. " failed")
+	end
+
+	check(results[3].pkg == "b", "T33: b still runs")
+end
+
+-- T34: --bail lets the failing package finish — its projects already ran
+-- together — and takes no further package.
+local function testFanOutBailStopsAtThePackage()
+	jestRedTests.a = true
+	local results, outcome = runFannedOut(
+		{ projectEntry("a", "client"), projectEntry("a", "server"), projectEntry("b", "unit") },
+		{ bail = true }
+	)
+	jestRedTests.a = nil
+
+	check(#results == 2, "T34: the failing package's projects all report")
+	check(outcome.bailed, "T34: the outcome says it bailed")
+	check(#fanOutBatches == 1, "T34: no package after the failing one")
+end
+
+-- T35: a host runs its entry against what is already staged: no staging of its
+-- own, and no Game Output capture of its own.
+local function testStagedEntryLeavesStagingAlone()
+	stagingCalls = {}
+	local result = EmbeddedRunner.runStagedEntry({}, projectEntry("a", "client"))
+
+	check(#stagingCalls == 0, "T35: the host neither materializes nor resets")
+	check(result.gameOutput == nil, "T35: the host captures no Game Output")
+	check(HttpService:JSONDecode(result.jestOutput).success == true, "T35: the entry ran")
+end
+
+-- T36: a host entry that runs out of budget leaves the stage standing: its
+-- sibling projects are still running against it on other hosts.
+local function testAbandonedStagedEntryLeavesTheStage()
+	jestParks.a = true
+	stagingCalls = {}
+	local outcome = runInThread(function()
+		return EmbeddedRunner.runStagedEntry({}, budgetedEntryFor("a", 5000))
+	end)
+
+	elapse()
+	jestParks.a = nil
+
+	check(outcome.done, "T36: the elapsed budget ends the entry")
+	check(#stagingCalls == 0, "T36: the host does not tear the stage down")
 end
 
 testWindowAndNoBleedAcrossPackages()
@@ -1147,6 +1391,7 @@ testRunnerFlagsAreStripped()
 testCoverageWithoutAttribution()
 testInfiniteYieldFailsOnlyItsPackage()
 testElapsedBudgetAbandonsOnlyItsPackage()
+testTheRecordLandsInTheAbandonedPackagesOutput()
 testWithinBudgetLeavesTheReasonAbsent()
 testElapsedBudgetBailsTheBatch()
 testOversizedEntryIsDeferredNotCommitted()
@@ -1157,7 +1402,17 @@ testReplacementTakesTheDroppedItemFirst()
 testRequeueUsesTheSeededTtl()
 testFailedRequeueLeavesTheReadStanding()
 testRefusedRequeueIsRetried()
-testProgressPublishesUnderOneKeyPerTask()
-testNoProgressMapPublishesNothing()
+testFailuresNameTheirPhase()
+testFailureReportsWhetherOutputWasWatched()
+testFailureBeforeTheTapAnswersNothing()
+testJestStdoutReachesBannerOutput()
+testTheTapIsPutBack()
+testFanOutStagesEachPackageOnce()
+testFanOutFilesThePackageOutputOnce()
+testFanOutStageFailureFailsThePackage()
+testFanOutBailStopsAtThePackage()
+testStagedEntryLeavesStagingAlone()
+testAbandonedStagedEntryLeavesTheStage()
 
-print("ALL OK")
+check(activeScheduling == 0, "finished, failed, or abandoned package retained scheduling")
+writeStdout("ALL OK")

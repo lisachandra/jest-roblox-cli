@@ -1,17 +1,18 @@
 --!strict
 local HttpService = game:GetService("HttpService")
 
+local CircusStateRelease = require("./circus-state-release")
 local GameOutputCapture = require("./game-output-capture")
 local InfiniteYield = require("./infinite-yield")
 local InstanceResolver = require("./instance-resolver")
 local InterceptWriteable = require("./intercept-writeable")
+local LastSeen = require("./last-seen")
 local PhaseTiming = require("./phase-timing")
 local ProcessCapture = require("./process-capture")
 local PromiseError = require("./promise-error")
 local RunnerResult = require("./runner-result")
 local SetupTiming = require("./setup-timing")
 local SnapshotPatch = require("./snapshot-patch")
-local TestProgress = require("./test-progress")
 
 type CapturedMessage = InterceptWriteable.CapturedMessage
 
@@ -45,11 +46,7 @@ local module = {}
 	from its own runner, so the host tells an abandoned run from a failed one
 	the same way whichever mode produced the entry.
 ]=]
-function module.run(
-	callingScript: LuaSourceContainer,
-	config: Config,
-	publishProgress: TestProgress.Publish?
-): (string, string, string)
+function module.run(callingScript: LuaSourceContainer, config: Config): (string, string, string)
 	local t0 = os.clock()
 	local timingEnabled = config.runnerTiming
 	local coverageEnabled = config.runnerCoverage
@@ -93,6 +90,7 @@ function module.run(
 
 	local t_patchSnapshot0 = os.clock()
 	local patchState = SnapshotPatch.patch(findValue, snapshotWrites)
+	CircusStateRelease.patch(findValue)
 	local t_patchSnapshot = os.clock()
 
 	local t_requireJest0 = os.clock()
@@ -110,6 +108,10 @@ function module.run(
 	local restoreCapture = ProcessCapture.install(findValue, capturedMessages)
 
 	local pending: any = nil
+	-- Armed inside `runTests`, read from out here by the watchdog. Nil until
+	-- Jest is about to start, which is itself an answer.
+	local lastSeen: LastSeen.Watch? = nil
+	local stopScheduling: (() -> string?)? = nil
 
 	local function runTests()
 		phase = "resolveProjects"
@@ -160,11 +162,13 @@ function module.run(
 		config.runnerCaptureGameOutput = nil :: any
 
 		phase = "run"
+		stopScheduling = RunnerResult.beginScheduling(findValue)
+		lastSeen = RunnerResult.beginLastSeen(findValue)
 		local coverage = RunnerResult.beginCoverage(findValue, {
 			coverage = coverageEnabled,
 			perTest = perTestEnabled,
 		})
-		RunnerResult.beginProgress(findValue, publishProgress)
+
 
 		local t_jestRunCLI0 = os.clock()
 		local runCLIOk, runCLIValue = pcall(function()
@@ -174,6 +178,7 @@ function module.run(
 			return pending:expect()
 		end)
 		local t_jestRunCLI = os.clock()
+
 
 		local setupSeconds = SetupTiming.getSeconds(setupTimingState)
 		SetupTiming.unpatch(setupTimingState)
@@ -208,6 +213,9 @@ function module.run(
 	-- Read before `runTests` strips it off the config for Jest.
 	local budgetMs = config.runnerTimeoutMs
 	local runSuccess, runValue, timedOut = InfiniteYield.guard(runTests, {
+		abandonNote = function()
+			return RunnerResult.noteAbandon(lastSeen)
+		end,
 		onAbandon = function()
 			if pending ~= nil then
 				pending:cancel()
@@ -215,6 +223,7 @@ function module.run(
 		end,
 		timeoutMs = budgetMs,
 	})
+	RunnerResult.finishScheduling(stopScheduling)
 
 	if restoreCapture then
 		restoreCapture()
@@ -224,13 +233,11 @@ function module.run(
 
 	local jestResult
 	if not runSuccess then
-		jestResult = HttpService:JSONEncode(
-			RunnerResult.fail(runValue, {
-				abandon = if timedOut then "timeout" else nil,
-				captureInstalled = restoreCapture ~= nil,
-				phase = phase,
-			})
-		)
+		jestResult = HttpService:JSONEncode(RunnerResult.fail(runValue, {
+			abandon = if timedOut then "timeout" else nil,
+			captureInstalled = restoreCapture ~= nil,
+			phase = phase,
+		}))
 	else
 		jestResult = HttpService:JSONEncode(runValue)
 	end
@@ -275,8 +282,7 @@ type RunHooks = {
 function module.runProjects(
 	callingScript: LuaSourceContainer,
 	configs: { Config },
-	hooks: RunHooks?,
-	publishProgress: TestProgress.Publish?
+	hooks: RunHooks?
 ): { ProjectEntry }
 	local entries: { ProjectEntry } = {}
 
@@ -294,8 +300,7 @@ function module.runProjects(
 		local ok: boolean, jestOutput: any, gameOutput: any, bannerOutput: any =
 			false, nil, nil, nil
 		if beforeOk then
-			ok, jestOutput, gameOutput, bannerOutput =
-				pcall(module.run, callingScript, cfg, publishProgress)
+			ok, jestOutput, gameOutput, bannerOutput = pcall(module.run, callingScript, cfg)
 		else
 			jestOutput = beforeErr
 		end
