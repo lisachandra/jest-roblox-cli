@@ -27,6 +27,7 @@ import {
 	tail,
 	toInstancePattern,
 } from "./emulator-context.ts";
+import { applyCoverageTwins } from "./emulator-coverage.ts";
 import { buildEmulatorHarnessLuau } from "./emulator-harness.luau.ts";
 import type { EmulatorStageResult } from "./emulator-stage.ts";
 import { stageEmulatorMounts } from "./emulator-stage.ts";
@@ -172,6 +173,17 @@ export class EmulatorBackend implements Backend {
 		const harnessPath = `${stage.stageDirectory.replaceAll("\\", "/")}/harness.luau`;
 		this.writeFile(harnessPath, buildEmulatorHarnessLuau(emulatorConfig?.globals ?? {}));
 
+		// Coverage run: swap the staged originals for their instrumented twins
+		// (staging already built the shadow + manifest for every backend); the
+		// harness then reports the probe hits as `runner.coverage`.
+		if (this.config.collectCoverage) {
+			applyCoverageTwins({
+				mappings: stage.mappings,
+				rootDirectory: this.config.rootDir,
+				stageDirectory: stage.stageDirectory,
+			});
+		}
+
 		const mountArgs: Array<string> = [];
 		// ree accepts forward slashes on every platform; mount args stay posix
 		// so the stage path reads identically in CI and locally.
@@ -214,6 +226,7 @@ export class EmulatorBackend implements Backend {
 
 		const context = {
 			ci: false,
+			coverage:  this.config.collectCoverage,
 			ignorePatterns,
 			pattern: job.config.testPathPattern,
 			roots,

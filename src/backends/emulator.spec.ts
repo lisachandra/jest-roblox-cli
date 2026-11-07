@@ -172,7 +172,7 @@ describe("emulatorBackend", () => {
 	});
 
 	it("should build the runner context from the job and stage", async () => {
-		expect.assertions(4);
+		expect.assertions(5);
 
 		const { backend, launches, writes } = makeBackend([reeSummary(jestResult(0))]);
 		await backend.runTestsAsync(makeBackendOptions([makeJob()]));
@@ -184,7 +184,29 @@ describe("emulatorBackend", () => {
 
 		expect(context["setupFiles"]).toStrictEqual(["ReplicatedStorage/TS/test/setup"]);
 		expect(context["pattern"]).toBe("hud/ballCam");
+		expect(context["coverage"]).toBeFalse();
 		expect(writes.get("/stage/harness.luau")).toContain("debug.loadmodule");
+	});
+
+	it("should request coverage collection when the config enables it", async () => {
+		expect.assertions(1);
+
+		const launches: Array<CapturedLaunch> = [];
+		const backend = new EmulatorBackend({
+			config: createResolvedConfig({ collectCoverage: true, rootDir: "/repo" }),
+			launch: async (request) => {
+				launches.push({ args: request.args, reePath: request.reePath });
+				return { done: Promise.resolve(reeSummary(jestResult(0))) };
+			},
+			stage: () => STAGE_RESULT,
+			writeFile: () => {},
+		});
+		await backend.runTestsAsync(makeBackendOptions([makeJob()]));
+
+		const { args } = launches[0]!;
+		const context: Record<string, unknown> = parseJsonObject(args.at(args.indexOf("--context") + 1));
+
+		expect(context["coverage"]).toBeTrue();
 	});
 
 	it("should normalize emulator ignore patterns to instance shape", async () => {

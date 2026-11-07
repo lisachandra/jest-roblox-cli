@@ -58,4 +58,14 @@ describe("buildEmulatorHarnessLuau", () => {
 		expect(source).toContain("testPathIgnorePatterns = Context.ignorePatterns");
 		expect(source).toContain("setupFiles = setupFiles");
 	});
+
+	it("should arm the coverage sink and attach the hits only on coverage runs", () => {
+		expect.assertions(3);
+
+		const source = buildEmulatorHarnessLuau({});
+
+		expect(source).toContain("if Context.coverage == true then");
+		expect(source).toContain("_G.__jest_roblox_cov = {}");
+		expect(source).toContain("payload.runner = { coverage = _G.__jest_roblox_cov }");
+	});
 });

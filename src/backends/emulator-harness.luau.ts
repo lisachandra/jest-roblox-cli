@@ -38,6 +38,8 @@ export type EmulatorHarnessGlobals = Record<string, boolean | number | string>;
 export interface EmulatorHarnessContext {
 	/** Jest's `ci` mode flag. */
 	ci: boolean;
+	/** Whether the run collects coverage; arms the probe-hit sink. */
+	coverage?: boolean | undefined;
 	/** Global flags, mirrored from the backend config for late writers. */
 	globals?: EmulatorHarnessGlobals | undefined;
 	/** Instance-shaped `testPathIgnorePatterns`. */
@@ -194,14 +196,26 @@ end
 		setupFiles = setupFiles,
 	}
 
+	-- Coverage run: arm the probe-hit sink the instrumented twins' preambles
+	-- write into; the payload hands it back as "runner.coverage" so the CLI's
+	-- report step maps it onto the coverage manifest.
+	if Context.coverage == true then
+		_G.__jest_roblox_cov = {}
+	end
+
 	local status, result = Jest.runCLI(script, argv, projects):awaitStatus()
 	if status == "Rejected" then
 		error("emulator harness: runCLI rejected: " .. tostring(result))
 	end
 
 	-- Same envelope shape the run-mode plugin reports: one entry per project,
-	-- jestOutput a nested JSON string of the Jest result.
-	local jestOutput = HttpService:JSONEncode(result.results)
+	-- jestOutput a nested JSON string of the Jest result plus the runner
+	-- extras (coverage hits) the CLI's envelope parser knows to extract.
+	local payload = { results = result.results }
+	if Context.coverage == true then
+		payload.runner = { coverage = _G.__jest_roblox_cov }
+	end
+	local jestOutput = HttpService:JSONEncode(payload)
 	local envelope = HttpService:JSONEncode({
 		entries = {
 			{ jestOutput = jestOutput },
