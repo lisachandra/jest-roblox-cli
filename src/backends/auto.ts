@@ -8,6 +8,7 @@ import type { FileSystem } from "../utils/file-system.ts";
 import { nodeFileSystem } from "../utils/file-system.ts";
 import type { Backend, BackendKind, ParallelOption } from "./interface.ts";
 import { createOpenCloudBackend } from "./open-cloud.ts";
+import { createEmulatorBackend } from "./emulator.ts";
 import { createStudioCliBackend } from "./studio-cli.ts";
 import {
 	configuredStudioPath,
@@ -107,6 +108,13 @@ export function assertVmParallel(kind: BackendKind, vmParallel: ParallelOption):
 		);
 	}
 
+	if (kind === "emulator") {
+		throw new Error(
+			"--experimental-vm-parallel is Studio-only: the emulator runs one Luau VM " +
+				"per project, serially. Pass projects to run and let it sequence them.",
+		);
+	}
+
 	// The hosts are declared in the plugin's rojo project, so the pool is fixed
 	// when the plugin is built. An explicit count above it is a request the
 	// plugin cannot serve: say so rather than quietly run fewer VMs than asked
@@ -170,6 +178,10 @@ function createBackend({
 			timeout: config.timeout,
 			webSocketServerFactory,
 		});
+	}
+
+	if (kind === "emulator") {
+		return createEmulatorBackend({ config });
 	}
 
 	if (kind === "studio-cli") {

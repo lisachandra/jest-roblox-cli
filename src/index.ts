@@ -11,6 +11,11 @@ export type { ArtifactBundle, PrepareArtifactsOptions } from "./artifacts/prepar
 export type { Backend, BackendOptions, ParallelOption } from "./backends/interface.ts";
 export { OpenCloudBackend, createOpenCloudBackend } from "./backends/open-cloud.ts";
 
+export {
+	EmulatorBackend,
+	createEmulatorBackend,
+	toInstancePattern,
+} from "./backends/emulator.ts";
 export { StudioCliBackend, createStudioCliBackend } from "./backends/studio-cli.ts";
 
 export { StudioBackend, createStudioBackend } from "./backends/studio.ts";

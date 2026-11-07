@@ -207,9 +207,10 @@ describe(parseArgs, () => {
 	});
 
 	it("should parse valid --backend values", () => {
-		expect.assertions(4);
+		expect.assertions(5);
 
 		expect(parseArgs(["--backend", "auto"]).backend).toBe("auto");
+		expect(parseArgs(["--backend", "emulator"]).backend).toBe("emulator");
 		expect(parseArgs(["--backend", "open-cloud"]).backend).toBe("open-cloud");
 		expect(parseArgs(["--backend", "studio"]).backend).toBe("studio");
 		expect(parseArgs(["--backend", "studio-cli"]).backend).toBe("studio-cli");
@@ -257,7 +258,7 @@ describe(parseArgs, () => {
 			'Invalid backend "not-a-backend"',
 		);
 		expect(() => parseArgs(["--backend", "invalid"])).toThrow(
-			"Must be one of: auto, open-cloud, studio, studio-cli",
+			"Must be one of: auto, emulator, open-cloud, studio, studio-cli",
 		);
 	});
 

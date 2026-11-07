@@ -250,7 +250,7 @@ export interface BackendResult {
 }
 
 /** Backend that runs the tests. */
-export type BackendKind = "open-cloud" | "studio" | "studio-cli";
+export type BackendKind = "emulator" | "open-cloud" | "studio" | "studio-cli";
 
 /** Runs test jobs in one execution environment. */
 export interface Backend {

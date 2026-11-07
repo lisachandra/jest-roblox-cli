@@ -149,6 +149,13 @@ export function resolveWorkspaceBackend({
 		return {};
 	}
 
+	if (runOptions.backend === "emulator") {
+		throw new Error(
+			'--workspace is not supported by the emulator backend: it stages and runs ' +
+				"one repo's compiled output. Run per package instead.",
+		);
+	}
+
 	if (runOptions.backend === "studio-cli") {
 		return { backend: studioCliBackendFor({ cli, dependencies, runOptions }) };
 	}

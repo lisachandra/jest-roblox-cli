@@ -256,7 +256,7 @@ async function prepareMultiCoverageAsync({
 	// `jest.config` ModuleScripts from the payload configs — baking here too
 	// would collide ("Structural collision …"). Every other backend needs the
 	// stubs baked in.
-	const isBakeStubs = backendKind !== "studio-cli";
+	const isBakeStubs = backendKind !== "studio-cli" && backendKind !== "emulator";
 	const { artifacts, coverage } = await prepareBakedCoverageAsync({
 		bakeStubs: isBakeStubs,
 		cacheRoot,

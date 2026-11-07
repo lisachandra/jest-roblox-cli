@@ -2,6 +2,7 @@ import type { Backend, CoverageReporter } from "./schema.ts";
 
 export const VALID_BACKENDS: ReadonlySet<string> = new Set<Backend>([
 	"auto",
+	"emulator",
 	"open-cloud",
 	"studio",
 	"studio-cli",

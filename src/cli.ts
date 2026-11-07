@@ -35,8 +35,8 @@ Commands:
                                     as ./setup
 
 Options:
-  --backend <type>                  Backend: "auto", "open-cloud", "studio", or
-                                    "studio-cli" (default: auto)
+  --backend <type>                  Backend: "auto", "open-cloud", "studio",
+                                    "studio-cli", or "emulator" (default: auto)
   --port <number>                   WebSocket port for studio backend (default: 3001)
   --studioPath <path>               Roblox Studio executable for the studio-cli
                                     backend (auto-detected if not set)

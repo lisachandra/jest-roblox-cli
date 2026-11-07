@@ -6,7 +6,30 @@ import type { Except } from "type-fest";
 import type { TypecheckConfig } from "./resolve-typecheck-config.ts";
 
 /** Execution backend that runs the tests. */
-export type Backend = "auto" | "open-cloud" | "studio" | "studio-cli";
+export type Backend = "auto" | "emulator" | "open-cloud" | "studio" | "studio-cli";
+
+/**
+ * Options for the `emulator` backend, which runs the compiled Luau specs
+ * inside the roblox-engine-emulator (`ree`). Never selected by `"auto"`;
+ * request it explicitly. See `docs/agents/offline-runtime-spike.md` in the
+ * consuming repo for the parity shims the harness installs.
+ */
+export interface EmulatorConfig {
+	/** Extra `testPathIgnorePatterns`, filesystem-style; normalized per run. */
+	ignorePatterns?: Array<string>;
+	/** Global flags the harness writes before any module loads. */
+	globals?: Record<string, string | number | boolean>;
+	/** Absolute or rootDir-relative path of the vendored ree reflection dump. */
+	reflectionPath?: string;
+	/** The Rojo project describing the DataModel. Default `rojoProject`. */
+	rojoProjectPath?: string;
+	/** The `ree` executable. Default `"ree"` (resolved from PATH). */
+	reePath?: string;
+	/** Virtual seconds each `ree run` gets. Default `30`. */
+	seconds?: number;
+	/** Stage directory, relative to `rootDir`. Default `.jest-roblox/emulator`. */
+	stagingDirectory?: string;
+}
 
 /** Name of an Istanbul coverage reporter. */
 export type CoverageReporter = keyof ReportOptions;
@@ -365,11 +388,15 @@ export interface Config {
 	 * installed, otherwise `"open-cloud"`; `"open-cloud"` uploads and runs via
 	 * Roblox Open Cloud; `"studio"` drives a locally running Studio;
 	 * `"studio-cli"` launches its own headless Studio via `--task RunScript`
-	 * and quits it (pass `--headed` to show the Studio window during the run).
-	 * Default `"auto"`. `"studio"` is never selected by `"auto"` — request it
-	 * explicitly.
+	 * and quits it (pass `--headed` to show the Studio window during the run);
+	 * `"emulator"` runs the compiled specs offline inside the
+	 * roblox-engine-emulator, serially, one run per project.
+	 * Default `"auto"`. `"studio"` and `"emulator"` are never selected by
+	 * `"auto"` — request them explicitly.
 	 */
 	backend?: Backend;
+	/** Options for the `emulator` backend. */
+	emulator?: EmulatorConfig;
 	/**
 	 * Budget in milliseconds for the boot probe after uploading, run against
 	 * the uploaded version. Default `90000`. Only a completed probe earns an

@@ -97,7 +97,7 @@ describe("DEFAULT_CONFIG", () => {
 
 	it("should have backend typed as string literal union", () => {
 		expectTypeOf<ResolvedConfig["backend"]>().toEqualTypeOf<
-			"auto" | "open-cloud" | "studio" | "studio-cli"
+			"auto" | "emulator" | "open-cloud" | "studio" | "studio-cli"
 		>();
 	});
 });
