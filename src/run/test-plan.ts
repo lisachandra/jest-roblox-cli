@@ -325,9 +325,16 @@ function planRuntimeJob({
 		project: { config: selection.config, testFiles: selection.runtimeFiles },
 		tsconfigReader: input.seams.tsconfigReader,
 	});
+	// The per-project `outDir` resolves on ResolvedProjectConfig but the job
+	// config narrows it away; backends that map test files to mounts (the
+	// emulator) read it from the job config, so re-attach the project's value.
+	const jobConfig =
+		config.outDir === undefined && project.outDir !== undefined
+			? { ...config, outDir: project.outDir }
+			: config;
 	return {
 		job: {
-			config,
+			config: jobConfig,
 			displayColor: project.displayColor,
 			displayName: project.displayName,
 			runtimeFiles: selection.runtimeFiles,

@@ -11,6 +11,7 @@ export const ROOT_CLI_KEYS_LIST: ReadonlyArray<RootCliKey> = [
 	"bootProbeTimeout",
 	"color",
 	"coverageCache",
+	"emulator",
 	"extends",
 	"formatters",
 	"gameOutput",

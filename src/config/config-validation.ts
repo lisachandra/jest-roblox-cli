@@ -114,6 +114,18 @@ const workspaceConfigSchema = type({
 	"root?": "string",
 });
 
+const emulatorConfigSchema = type({
+	"+": "reject",
+	"globals?": "Record<string, string|number|boolean>",
+	"ignorePatterns?": "string[]",
+	"reePath?": "string",
+	"reflectionPath?": "string",
+	"rojoProjectPath?": "string",
+	"seconds?": "number",
+	"snapshotsDirectory?": "string",
+	"stagingDirectory?": "string",
+});
+
 const formatterEntrySchema = type("string").or(type(["string", type("object")]));
 
 const projectEntrySchema = type("string").or(inlineProjectSchema);
@@ -171,11 +183,12 @@ const globalTestConfigSchema = type({
 
 export const configSchema: Type<Config> = type({
 	"+": "reject",
-	"backend?": type("'auto'|'open-cloud'|'studio'|'studio-cli'"),
+	"backend?": type("'auto'|'emulator'|'open-cloud'|'studio'|'studio-cli'"),
 	"bootProbeTimeout?": "number",
 	"color?": "boolean",
 	"config?": "string",
 	"coverageCache?": "boolean",
+	"emulator?": emulatorConfigSchema,
 	"extends?": type("string").or(type("string[]")),
 	"formatters?": formatterEntrySchema.array(),
 	"gameOutput?": type("string").or("true"),

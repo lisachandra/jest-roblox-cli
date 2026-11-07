@@ -5,7 +5,7 @@
  * shims the spike (`docs/agents/offline-runtime-spike.md` in the consuming
  * repo) proved necessary:
  *
- * 1. thread-env seeding — ree's `warn` is a VM-level global but is missing as
+ * 1. Thread-env seeding — ree's `warn` is a VM-level global but is missing as
  *    a member of the table `getfenv(0)` returns; the runner snapshots
  *    print/warn/math.random from exactly that table for global mocks.
  * 2. `_luau-aliases` rename-back — ree skips dot-prefixed mount entries, so
@@ -30,30 +30,30 @@
  */
 
 /** Serializable global flags the harness writes before anything loads. */
-export type EmulatorHarnessGlobals = Record<string, string | number | boolean>;
+export type EmulatorHarnessGlobals = Record<string, boolean | number | string>;
 
-/** `--context` payload the backend hands the harness. */
+/**
+ * `--context` payload the backend hands the harness.
+ */
 export interface EmulatorHarnessContext {
+	/** Jest's `ci` mode flag. */
 	ci: boolean;
+	/** Global flags, mirrored from the backend config for late writers. */
 	globals?: EmulatorHarnessGlobals | undefined;
+	/** Instance-shaped `testPathIgnorePatterns`. */
 	ignorePatterns?: Array<string> | undefined;
+	/** Instance-shaped `testPathPattern`. */
 	pattern?: string | undefined;
-	/** Slash-separated DataModel path of the test runner entry module. */
-	runnerPath: string;
 	/** Slash-separated DataModel paths to discover specs under. */
 	roots: Array<string>;
+	/** Slash-separated DataModel path of the test runner entry module. */
+	runnerPath: string;
 	/** DataModel paths of setup scripts, run once before the framework. */
 	setupFiles: Array<string>;
+	/** Jest `testNamePattern`, when the run filters by test name. */
 	testNamePattern?: string | undefined;
+	/** Jest's `verbose` flag. */
 	verbose: boolean;
-}
-
-function luauLiteral(value: string | number | boolean): string {
-	if (typeof value === "string") {
-		return JSON.stringify(value);
-	}
-
-	return value.toString();
 }
 
 /**
@@ -95,10 +95,33 @@ ${globalLines.length > 0 ? `${globalLines.join("\n")}\n` : ""}	-- ree parity gap
 		end
 	end
 
+	-- The Studio lane splices the global-asset containers into the place
+	-- (addGlobalAssetsToPlace); the emulator lane has no place build. The
+	-- asset registry and the client bootstrap index these containers at load
+	-- time, so seed empty ones when the stage carries none — specs that need
+	-- real templates still fail loudly on the missing child they touch.
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	for _, name in { "Animations", "UI", "VFX", "Models" } do
+		if ReplicatedStorage:FindFirstChild(name) == nil then
+			local stub = Instance.new("Folder")
+			stub.Name = name
+			stub.Parent = ReplicatedStorage
+		end
+	end
+	local SoundService = game:GetService("SoundService")
+	if SoundService:FindFirstChild("Sounds") == nil then
+		local stub = Instance.new("Folder")
+		stub.Name = "Sounds"
+		stub.Parent = SoundService
+	end
+
 	-- ree creates CoreScriptSyncService but does not emulate GetScriptFilePath;
 	-- hide it so the runner's SearchSource takes the Instance-relative branch.
+	-- StandIn takes the ModuleScript INSTANCE (not the require result) and
+	-- replaces its source before anything loads it — requiring here first would
+	-- cache the unpatched result.
 	local ok, getDataModelService = pcall(function()
-		return require(resolveInstance("ReplicatedStorage/TS/rbxts_include/node_modules/@rbxts-js/RobloxShared/getDataModelService"))
+		return resolveInstance("ReplicatedStorage/TS/rbxts_include/node_modules/@rbxts-js/RobloxShared/getDataModelService")
 	end)
 	local fakeGetDataModelServiceSource = [[
 return function(service)
@@ -188,4 +211,12 @@ end
 	print("@done")
 end
 `;
+}
+
+function luauLiteral(value: boolean | number | string): string {
+	if (typeof value === "string") {
+		return JSON.stringify(value);
+	}
+
+	return value.toString();
 }

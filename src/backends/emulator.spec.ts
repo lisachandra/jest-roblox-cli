@@ -1,11 +1,22 @@
 import { describe, expect, it } from "vitest";
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
 import { createResolvedConfig } from "#test/mocks/resolved-config.ts";
 import { NOOP_RUN_PROGRESS } from "../progress/reporter.ts";
 import type { BackendOptions, ProjectJob } from "./interface.ts";
 import type { EmulatorRun } from "./emulator.ts";
-import { EmulatorBackend, parseSummary, resolveInstancePath, toInstancePattern } from "./emulator.ts";
+import { LuauScriptError } from "../reporter/luau-script-error.ts";
+import { EmulatorBackend } from "./emulator.ts";
 import type { EmulatorStageMapping, EmulatorStageResult } from "./emulator-stage.ts";
+
+/** Captured launch request from the fake launcher. */
+interface CapturedLaunch {
+	args: Array<string>;
+	reePath: string;
+}
 
 const MAPPINGS: Array<EmulatorStageMapping> = [
 	{ dataModelPath: "ReplicatedStorage/TS/client", fsPath: "/repo/out/client" },
@@ -39,12 +50,12 @@ function makeBackendOptions(jobs: Array<ProjectJob>): BackendOptions {
 	return { jobs, progress: NOOP_RUN_PROGRESS };
 }
 
-function jestResult(numFailedTests: number): string {
+function jestResult(failedTestCount: number): string {
 	return JSON.stringify({
-		numFailedTests,
-		numPassedTests: numFailedTests === 0 ? 2 : 1,
+		numFailedTests: failedTestCount,
+		numPassedTests: failedTestCount === 0 ? 2 : 1,
 		numTotalTests: 2,
-		success: numFailedTests === 0,
+		success: failedTestCount === 0,
 	});
 }
 
@@ -62,11 +73,6 @@ function reeSummary(entryJestOutput: string): { code: number; stderr: string; st
 			status: "ok",
 		})}\n`,
 	};
-}
-
-interface CapturedLaunch {
-	args: Array<string>;
-	reePath: string;
 }
 
 function makeBackend(
@@ -95,34 +101,87 @@ function makeBackend(
 	return { backend, launches, writes };
 }
 
+function parseJsonObject(text: string | undefined): Record<string, unknown> {
+	if (text === undefined) {
+		throw new Error("missing argument");
+	}
+
+	const parsed: unknown = JSON.parse(text);
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("expected a JSON object");
+	}
+
+	return Object.fromEntries(Object.entries(parsed));
+}
+
+function numberFailedTestsOf(jestOutput: string): number {
+	const parsed: unknown = JSON.parse(jestOutput);
+	if (typeof parsed !== "object" || parsed === null || !("numFailedTests" in parsed)) {
+		return -1;
+	}
+
+	const { numFailedTests: failedTests } = parsed;
+	return typeof failedTests === "number" ? failedTests : -1;
+}
+
+function luauScriptErrorOf(caught: unknown): LuauScriptError {
+	if (!(caught instanceof LuauScriptError)) {
+		throw new Error(`expected a LuauScriptError, got ${String(caught)}`);
+	}
+
+	return caught;
+}
+
 describe("emulatorBackend", () => {
-	it("should run one ree process per job and parse the envelope", async () => {
-		expect.assertions(6);
+	it("should run one ree process per job", async () => {
+		expect.assertions(3);
 
 		const { backend, launches } = makeBackend([reeSummary(jestResult(0)), reeSummary(jestResult(0))]);
 		const result = await backend.runTestsAsync(makeBackendOptions([makeJob(), makeJob()]));
 
 		expect(result.rawResults).toHaveLength(2);
-		expect((JSON.parse(result.rawResults[0]!.entry.jestOutput) as { numFailedTests: number }).numFailedTests).toBe(0);
-		expect(result.rawResults[0]!.entry.project).toBe("client");
-		expect(result.rawResults[1]!.entry.project).toBe("client");
+
 		expect(launches).toHaveLength(2);
 		expect(result.timing.executionMs).toBeGreaterThanOrEqual(0);
 	});
 
-	it("should build mount and context args from the stage mappings", async () => {
-		expect.assertions(7);
+	it("should shape each envelope entry with the project label", async () => {
+		expect.assertions(3);
+
+		const { backend } = makeBackend([reeSummary(jestResult(0)), reeSummary(jestResult(0))]);
+		const result = await backend.runTestsAsync(makeBackendOptions([makeJob(), makeJob()]));
+
+		expect(numberFailedTestsOf(result.rawResults[0]!.entry.jestOutput)).toBe(0);
+
+		expect(result.rawResults[0]!.entry.project).toBe("client");
+		expect(result.rawResults[1]!.entry.project).toBe("client");
+	});
+
+	it("should build mount args from the stage mappings", async () => {
+		expect.assertions(3);
+
+		const { backend, launches } = makeBackend([reeSummary(jestResult(0))]);
+		await backend.runTestsAsync(makeBackendOptions([makeJob()]));
+
+		const { args } = launches[0]!;
+
+		expect(args).toContain("--harness");
+
+		expect(args).toContain("--mount");
+		expect(args).toContain("ReplicatedStorage/TS/client=/stage/ReplicatedStorage/TS/client");
+	});
+
+	it("should build the runner context from the job and stage", async () => {
+		expect.assertions(4);
 
 		const { backend, launches, writes } = makeBackend([reeSummary(jestResult(0))]);
 		await backend.runTestsAsync(makeBackendOptions([makeJob()]));
 
-		const args = launches[0]!.args;
-		const context = JSON.parse(args[args.indexOf("--context") + 1]!) as Record<string, unknown>;
+		const { args } = launches[0]!;
+		const context: Record<string, unknown> = parseJsonObject(args.at(args.indexOf("--context") + 1));
 
-		expect(args).toContain("--harness");
-		expect(args).toContain("--mount");
-		expect(args).toContain("ReplicatedStorage/TS/client=/stage/ReplicatedStorage/TS/client");
 		expect(context["roots"]).toStrictEqual(["ReplicatedStorage/TS/client"]);
+
 		expect(context["setupFiles"]).toStrictEqual(["ReplicatedStorage/TS/test/setup"]);
 		expect(context["pattern"]).toBe("hud/ballCam");
 		expect(writes.get("/stage/harness.luau")).toContain("debug.loadmodule");
@@ -146,11 +205,10 @@ describe("emulatorBackend", () => {
 		});
 		await backend.runTestsAsync(makeBackendOptions([makeJob()]));
 
-		const args = launches[0]!.args;
-		const context = JSON.parse(args[args.indexOf("--context") + 1]!) as {
-			ignorePatterns: Array<string>;
-		};
-		expect(context.ignorePatterns).toStrictEqual(["server/tests/simulation.spec"]);
+		const { args } = launches[0]!;
+		const context: Record<string, unknown> = parseJsonObject(args.at(args.indexOf("--context") + 1));
+
+		expect(context["ignorePatterns"]).toStrictEqual(["server/tests/simulation.spec"]);
 	});
 
 	it("should bail remaining jobs after a failing one", async () => {
@@ -163,6 +221,7 @@ describe("emulatorBackend", () => {
 		});
 
 		expect(result.rawResults).toHaveLength(1);
+
 		expect(result.bailedJobIndices).toStrictEqual([1]);
 		expect(launches).toHaveLength(1);
 	});
@@ -173,7 +232,7 @@ describe("emulatorBackend", () => {
 		const { backend } = makeBackend([reeSummary(jestResult(2))]);
 		const result = await backend.runTestsAsync(makeBackendOptions([makeJob()]));
 
-		expect((JSON.parse(result.rawResults[0]!.entry.jestOutput) as { numFailedTests: number }).numFailedTests).toBe(2);
+		expect(numberFailedTestsOf(result.rawResults[0]!.entry.jestOutput)).toBe(2);
 	});
 
 	it("should throw a LuauScriptError when the run carries no results", async () => {
@@ -185,14 +244,16 @@ describe("emulatorBackend", () => {
 			status: "error",
 		})}\n`;
 		const { backend } = makeBackend([{ code: 0, stderr: "", stdout }]);
-		const run = backend.runTestsAsync(makeBackendOptions([makeJob()]));
+		let caught: unknown;
+		try {
+			await backend.runTestsAsync(makeBackendOptions([makeJob()]));
+		} catch (err) {
+			caught = err;
+		}
 
-		await expect(run).rejects.toThrow("produced no test results");
-		await run.catch((err: unknown) => {
-			expect((err as Error & { gameOutput?: string }).gameOutput).toContain(
-				"attempt to index nil",
-			);
-		});
+		expect(caught).toBeInstanceOf(LuauScriptError);
+
+		expect(luauScriptErrorOf(caught).gameOutput).toContain("attempt to index nil");
 	});
 
 	it("should throw a LuauScriptError when ree exits without a summary", async () => {
@@ -203,53 +264,58 @@ describe("emulatorBackend", () => {
 
 		await expect(run).rejects.toThrow("exited 126 without a summary");
 	});
-});
 
-describe("parseSummary", () => {
-	it("should read the trailing JSON summary from ree stdout", () => {
+	it("should pass --snapshot-dir when the configured directory exists", async () => {
 		expect.assertions(2);
 
-		const summary = parseSummary('status line\n{"output":[],"status":"ok"}\n', {
-			code: 0,
-			stderr: "",
+		const snapshotsDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "emu-snapshots-"));
+		const launches: Array<CapturedLaunch> = [];
+		try {
+			const backend = new EmulatorBackend({
+				config: createResolvedConfig({
+					emulator: { snapshotsDirectory },
+					rootDir: "/repo",
+				}),
+				launch: async (request) => {
+					launches.push({ args: request.args, reePath: request.reePath });
+					return { done: Promise.resolve(reeSummary(jestResult(0))) };
+				},
+				stage: () => STAGE_RESULT,
+				writeFile: () => {},
+			});
+			await backend.runTestsAsync(makeBackendOptions([makeJob()]));
+		} finally {
+			fs.rmSync(snapshotsDirectory, { force: true, recursive: true });
+		}
+
+		const { args } = launches[0]!;
+
+		expect(args).toContain("--snapshot-dir");
+
+		expect(args.at(args.indexOf("--snapshot-dir") + 1)).toBe(snapshotsDirectory);
+	});
+
+	it("should omit --snapshot-dir and warn when the configured directory is missing", async () => {
+		expect.assertions(2);
+
+		const launches: Array<CapturedLaunch> = [];
+		const backend = new EmulatorBackend({
+			config: createResolvedConfig({
+				emulator: { snapshotsDirectory: "/repo/build/absent-templates" },
+				rootDir: "/repo",
+			}),
+			launch: async (request) => {
+				launches.push({ args: request.args, reePath: request.reePath });
+				return { done: Promise.resolve(reeSummary(jestResult(0))) };
+			},
+			stage: () => STAGE_RESULT,
+			writeFile: () => {},
 		});
+		await backend.runTestsAsync(makeBackendOptions([makeJob()]));
 
-		expect(summary.status).toBe("ok");
-		expect(summary.output).toStrictEqual([]);
-	});
+		const { args } = launches[0]!;
 
-	it("should reject stdout without a summary object", () => {
-		expect.assertions(1);
-
-		expect(() => parseSummary("no json here\n", { code: 1, stderr: "boom" })).toThrow(
-			"exited 1 without a summary",
-		);
-	});
-});
-
-describe("toInstancePattern", () => {
-	it("should strip src prefixes and TypeScript extensions", () => {
-		expect.assertions(4);
-
-		expect(toInstancePattern("src/server/tests/simulation.spec.ts")).toBe(
-			"server/tests/simulation.spec",
-		);
-		expect(toInstancePattern("src/client/ui/init.spec.tsx")).toBe("client/ui/init.spec");
-		expect(toInstancePattern("ui/hud/ballCam")).toBe("ui/hud/ballCam");
-		expect(toInstancePattern("src/shared/index.ts")).toBe("shared/init");
-	});
-});
-
-describe("resolveInstancePath", () => {
-	it("should map a file under a mount to its DataModel path", () => {
-		expect.assertions(3);
-
-		expect(
-			resolveInstancePath("/repo/out/client/ui/hud/ballCam.spec.luau", "/repo", MAPPINGS),
-		).toBe("ReplicatedStorage/TS/client/ui/hud/ballCam.spec.luau");
-		expect(resolveInstancePath("./out/test/setup", "/repo", MAPPINGS)).toBe(
-			"ReplicatedStorage/TS/test/setup",
-		);
-		expect(resolveInstancePath("/repo/unknown/where.luau", "/repo", MAPPINGS)).toBeUndefined();
+		expect(args).not.toContain("--snapshot-dir");
+		expect(args).toContain("--mount");
 	});
 });

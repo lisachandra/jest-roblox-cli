@@ -569,7 +569,7 @@ describe(configSchema, () => {
 			assert(result instanceof type.errors);
 
 			expect(result.summary).toMatchInlineSnapshot(
-				'"backend must be "auto", "open-cloud", "studio" or "studio-cli" (was "bad")"',
+				'"backend must be "auto", "emulator", "open-cloud", "studio" or "studio-cli" (was "bad")"',
 			);
 		});
 

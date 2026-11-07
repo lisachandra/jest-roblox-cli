@@ -15,19 +15,29 @@ export type Backend = "auto" | "emulator" | "open-cloud" | "studio" | "studio-cl
  * consuming repo for the parity shims the harness installs.
  */
 export interface EmulatorConfig {
+	/** Global flags the harness writes before any module loads. */
+	globals?: Record<string, boolean | number | string>;
 	/** Extra `testPathIgnorePatterns`, filesystem-style; normalized per run. */
 	ignorePatterns?: Array<string>;
-	/** Global flags the harness writes before any module loads. */
-	globals?: Record<string, string | number | boolean>;
-	/** Absolute or rootDir-relative path of the vendored ree reflection dump. */
+	/** The `ree` executable. Default `"ree"` (resolved from PATH). */
+	reePath?: string;
+	/**
+	 * Absolute or rootDir-relative path of the vendored ree reflection dump.
+	 */
 	reflectionPath?: string;
 	/** The Rojo project describing the DataModel. Default `rojoProject`. */
 	rojoProjectPath?: string;
-	/** The `ree` executable. Default `"ree"` (resolved from PATH). */
-	reePath?: string;
 	/** Virtual seconds each `ree run` gets. Default `30`. */
 	seconds?: number;
-	/** Stage directory, relative to `rootDir`. Default `.jest-roblox/emulator`. */
+	/**
+	 * Directory of `<Service>.rbxm` ree snapshot bundles (place-cache exports)
+	 * loaded before the mounts. A missing directory degrades to the harness's
+	 * empty container stubs. Absolute or rootDir-relative.
+	 */
+	snapshotsDirectory?: string;
+	/**
+	 * Stage directory, relative to `rootDir`. Default `.jest-roblox/emulator`.
+	 */
 	stagingDirectory?: string;
 }
 
@@ -207,8 +217,8 @@ export interface WorkspaceConfig {
 	 * manager installs as real members, most often. `--packages` overrides
 	 * this: naming a package is asking for it.
 	 *
-	 * Independent of `packages`/`root`, so it narrows the `pnpm-workspace.yaml`
-	 * source too.
+	 * Independent of `packages`/`root`, so it narrows the
+	 * `pnpm-workspace.yaml` source too.
 	 */
 	exclude?: Array<string>;
 	/**
@@ -395,8 +405,6 @@ export interface Config {
 	 * `"auto"` — request them explicitly.
 	 */
 	backend?: Backend;
-	/** Options for the `emulator` backend. */
-	emulator?: EmulatorConfig;
 	/**
 	 * Budget in milliseconds for the boot probe after uploading, run against
 	 * the uploaded version. Default `90000`. Only a completed probe earns an
@@ -412,6 +420,8 @@ export interface Config {
 	 * nothing changed. Default `true`.
 	 */
 	coverageCache?: boolean;
+	/** Options for the `emulator` backend. */
+	emulator?: EmulatorConfig;
 	/**
 	 * One or more config files to inherit from (c12 layering), relative to
 	 * this file. Local keys win over extended ones.
@@ -645,8 +655,8 @@ export interface WorkspaceRunOptions {
 	/** Force ANSI colour in output. */
 	color: boolean;
 	/**
-	 * Studio-only, experimental: how many Luau VMs one package's projects split
-	 * across. CLI-only, like `bail`.
+	 * Studio-only, experimental: how many Luau VMs one package's projects
+	 * split across. CLI-only, like `bail`.
 	 */
 	experimentalVmParallel?: ParallelCount | undefined;
 	/** Output formatters. */
