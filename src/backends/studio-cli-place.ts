@@ -5,6 +5,7 @@ import type { BuildManifestArtifact } from "../coverage-pipeline/build-manifest.
 import { findRojoProject } from "../coverage-pipeline/luau-roots.ts";
 import type { BuildPlaceOptions } from "../staging/place-builder.ts";
 import type { FileSystem } from "../utils/file-system.ts";
+import { applyPlaceHook } from "../utils/place-hook.ts";
 import { isWorkspaceRun, type ProjectJob } from "./interface.ts";
 import type { RunPlace } from "./studio-cli-bootstrap.ts";
 
@@ -107,6 +108,7 @@ async function buildCleanPlaceAsync({
 		projectFile: path.join(workDirectory, PLACE_PROJECT_FILE),
 		wrap: false,
 	});
+	applyPlaceHook(placeFile);
 
 	return placeFile;
 }
