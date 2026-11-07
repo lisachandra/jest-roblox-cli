@@ -41,8 +41,6 @@ if not RunService:IsRunning() then
 	end
 end
 
-_G.__JEST__ = true
-
 -- Plugin/CLI protocol version. Must match `STUDIO_PROTOCOL_VERSION` in
 -- `src/backends/studio.ts` and `STUDIO_CLI_PROTOCOL_VERSION` in
 -- `src/backends/studio-cli.ts`. v9 adds the workspace payload's `vmParallel`
