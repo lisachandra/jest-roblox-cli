@@ -71,9 +71,16 @@ describe("stageEmulatorMounts", () => {
 		const isNestedStaged = fs.existsSync(
 			path.join(staged, "ReplicatedStorage/TS/node_modules/@acme/Widgets/init.luau"),
 		);
-		const isVerbatimDropped = !fs.existsSync(
-			path.join(staged, "ReplicatedStorage/TS/node_modules/@acme/widgets"),
+		// By name, not by `existsSync`: a case-insensitive filesystem — Windows
+		// and macOS by default — resolves `widgets` to the projected `Widgets`
+		// directory, so the two spellings are indistinguishable to a stat and
+		// the drop this checks for can never be observed there. `readdir`
+		// reports the entries as spelled, which is the only reading of "the
+		// verbatim copy is gone" that means the same thing on every host.
+		const nestedParentEntries = fs.readdirSync(
+			path.join(staged, "ReplicatedStorage/TS/node_modules/@acme"),
 		);
+		const isVerbatimDropped = !nestedParentEntries.includes("widgets");
 		const isDotRenamed = fs.existsSync(path.join(staged, "ReplicatedStorage/TS/_cache/junk.txt"));
 		fs.rmSync(root, { force: true, recursive: true });
 
@@ -81,7 +88,7 @@ describe("stageEmulatorMounts", () => {
 
 		expect(isNestedStaged).toBeTrue();
 
-		expect(isVerbatimDropped).toBeFalse();
+		expect(isVerbatimDropped).toBeTrue();
 
 		expect(isDotRenamed).toBeTrue();
 
