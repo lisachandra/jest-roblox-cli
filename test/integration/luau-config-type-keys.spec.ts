@@ -51,6 +51,7 @@ const SCHEMA_KEYS = new Map<string, Array<string>>([
 	["Config", keysOf(configSchema)],
 	["CoverageThreshold", keysOf(testSchema.get("coverageThreshold").exclude("undefined"))],
 	["DisplayName", keysOf(testSchema.get("displayName").extract("object"))],
+	["EmulatorConfig", keysOf(configSchema.get("emulator").exclude("undefined"))],
 	["GlobalTestConfig", keysOf(testSchema)],
 	["InlineProjectConfig", keysOf(inlineProjectSchema)],
 	["ProjectTestConfig", keysOf(inlineProjectSchema.get("test"))],

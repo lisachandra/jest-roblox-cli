@@ -1,5 +1,5 @@
 --!strict
-export type Backend = "auto" | "open-cloud" | "studio" | "studio-cli"
+export type Backend = "auto" | "emulator" | "open-cloud" | "studio" | "studio-cli"
 
 export type CoverageReporter =
 	"clover"
@@ -41,6 +41,18 @@ export type CoverageThreshold = {
 	functions: number?,
 	lines: number?,
 	statements: number?,
+	[string]: never,
+}
+
+export type EmulatorConfig = {
+	globals: { [string]: boolean | number | string }?,
+	ignorePatterns: { string }?,
+	reflectionPath: string?,
+	reePath: string?,
+	rojoProjectPath: string?,
+	seconds: number?,
+	snapshotsDirectory: string?,
+	stagingDirectory: string?,
 	[string]: never,
 }
 
@@ -165,6 +177,7 @@ export type Config = {
 	bootProbeTimeout: number?,
 	color: boolean?,
 	coverageCache: boolean?,
+	emulator: EmulatorConfig?,
 	extends: (string | { string })?,
 	formatters: { FormatterEntry }?,
 	gameOutput: (string | true)?,
