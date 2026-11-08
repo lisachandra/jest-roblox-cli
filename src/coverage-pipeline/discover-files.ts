@@ -1,6 +1,6 @@
 import picomatch from "picomatch";
 
-import type { FileSystem } from "../utils/file-system.ts";
+import type { Dirent, FileSystem } from "../utils/file-system.ts";
 import { nodeFileSystem } from "../utils/file-system.ts";
 import { hashString } from "../utils/hash.ts";
 import type { PosixRoot } from "../utils/normalize-windows-path.ts";
@@ -185,9 +185,45 @@ export function discoverRootFiles(
 	return { excluded, instrumentable };
 }
 
+/**
+ * Whether an entry is a directory, following a symlink when it is one.
+ *
+ * Windows junctions — every pnpm workspace link, and every store entry
+ * re-exported into one — carry the reparse bit, and `Dirent` reports only that
+ * fact, so a junction to a directory reads as "not a directory" and the walker
+ * files it as a file. `readFileSync` on that path is then an `EISDIR`. Only a
+ * link needs the extra `stat`; a real directory or file answers from the
+ * `Dirent`, which keeps the common case at one syscall per directory.
+ * @param fileSystem - File system to stat through.
+ * @param directory - Directory holding the entry.
+ * @param entry - The entry, as read.
+ * @returns True when the entry resolves to a directory.
+ */
+function isDirectoryEntry(
+	fileSystem: FileSystem,
+	directory: string,
+	entry: Dirent,
+): boolean {
+	if (entry.isDirectory()) {
+		return true;
+	}
+
+	if (!entry.isSymbolicLink()) {
+		return false;
+	}
+
+	try {
+		return fileSystem.statSync(`${directory}/${entry.name}`).isDirectory();
+	} catch {
+		// A dangling link: nothing to descend into, and nothing to copy.
+		return false;
+	}
+}
+
 function walkFrom({
 	directory,
 	relativePrefix,
+	visited,
 	...walk
 }: {
 	directory: string;
@@ -195,6 +231,7 @@ function walkFrom({
 	filter: WalkFilter;
 	relativePrefix: string;
 	results: Array<string>;
+	visited?: Set<string>;
 }): void {
 	const { fileSystem, filter, results } = walk;
 	const entries = fileSystem.readdirSync(directory, { withFileTypes: true });
@@ -204,16 +241,37 @@ function walkFrom({
 			continue;
 		}
 
-		if (entry.isDirectory()) {
+		if (isDirectoryEntry(fileSystem, directory, entry)) {
 			if (isSkippedDirectory(entry.name)) {
 				continue;
+			}
+
+			// A junction can point back up the tree, and following one would walk
+			// forever. Keyed on the resolved path, so the same directory reached by
+			// two names is still descended into once.
+			const childDirectory = `${directory}/${entry.name}`;
+			const seen = visited ?? new Set<string>();
+			if (entry.isSymbolicLink()) {
+				let real: string;
+				try {
+					real = fileSystem.realpathSync(childDirectory);
+				} catch {
+					continue;
+				}
+
+				if (seen.has(real)) {
+					continue;
+				}
+
+				seen.add(real);
 			}
 
 			filter.onDirectory?.(relative);
 			walkFrom({
 				...walk,
-				directory: `${directory}/${entry.name}`,
+				directory: childDirectory,
 				relativePrefix: `${relative}/`,
+				visited: seen,
 			});
 		} else if (filter.accept(entry.name)) {
 			results.push(relative);

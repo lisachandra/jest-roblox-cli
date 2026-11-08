@@ -3,6 +3,14 @@ import { collectMounts, loadRojoProject, type Mount } from "@isentinel/rojo-util
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import color from "tinyrainbow";
+
+/**
+ * How many dropped links the staging warning names before it stops listing
+ * them. A broken link is one line of diagnosis; a hundred is a wall.
+ */
+const MAX_REPORTED_DROPPED_LINKS = 10;
+
 /**
  * Materializes the physical mount tree `ree` runs against.
  *
@@ -136,8 +144,67 @@ function readNestedProject(packageDirectory: string): NestedProject | undefined 
 	return { name, sourceDirectory: path.join(packageDirectory, treePath) };
 }
 
+/**
+ * Copies a tree into the stage with its junctions and symlinks dereferenced.
+ *
+ * The copy starts from the source's real path, not the path it was named by.
+ * A pnpm package reached through one workspace (`server/node_modules/@rbxts/
+ * muster`, itself a link into `packages/@internal/muster`) still carries the
+ * relative links its own `node_modules` was built with, and Windows resolves
+ * those against the spelled path rather than the resolved one: `realpath`
+ * finds the target, and the very next `stat` returns `ENOENT`. Entering from
+ * the real path makes every inner link resolve as its author intended.
+ *
+ * A link that does not resolve even from there is dropped, with a warning. The
+ * ones this layout produces point at type-only packages — `@rbxts/types` and
+ * friends, reached through a sibling workspace's `node_modules` — so there is
+ * no runtime code behind them to miss.
+ *
+ * @param source - Tree to copy, as the mount names it.
+ * @param destination - Where the copy lands.
+ */
 function copyDeref(source: string, destination: string): void {
-	fs.cpSync(source, destination, { dereference: true, recursive: true, verbatimSymlinks: false });
+	let realSource: string;
+	try {
+		realSource = fs.realpathSync(source);
+	} catch {
+		// Gone between the mount scan and the copy: nothing to project.
+		return;
+	}
+
+	const dropped: Array<string> = [];
+	fs.cpSync(realSource, destination, {
+		dereference: true,
+		filter: (candidate) => {
+			const stats = fs.lstatSync(candidate, { throwIfNoEntry: false });
+			if (stats?.isSymbolicLink() !== true) {
+				return true;
+			}
+
+			if (fs.statSync(candidate, { throwIfNoEntry: false }) !== undefined) {
+				return true;
+			}
+
+			dropped.push(candidate);
+			return false;
+		},
+		recursive: true,
+		verbatimSymlinks: false,
+	});
+
+	if (dropped.length > 0) {
+		const listing = dropped
+			.slice(0, MAX_REPORTED_DROPPED_LINKS)
+			.map((entry) => `  ${path.relative(realSource, entry)}`);
+		const omitted = dropped.length - listing.length;
+		if (omitted > 0) {
+			listing.push(`  …and ${omitted.toString()} more`);
+		}
+
+		process.stderr.write(
+			`${color.dim(`Staged without ${dropped.length.toString()} unresolvable link(s) under ${realSource}:`)}\n${listing.join("\n")}\n`,
+		);
+	}
 }
 
 /**
