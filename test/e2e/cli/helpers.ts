@@ -138,8 +138,9 @@ export function readJsonSync(filePath: string): JSONValue {
 }
 
 /**
- * Whether rojo can be shelled out to. The specs that build a real place gate on
- * it, because a machine without rojo should skip them rather than fail them.
+ * Whether rojo can be shelled out to. The specs that build a real place gate
+ * on it, because a machine without rojo should skip them rather than fail
+ * them.
  *
  * Rojo is the only place builder: `buildWithRojo` shells `rojo build` and
  * throws "rojo was not found on PATH" with no fallback. Some of these specs
@@ -229,10 +230,10 @@ function probeRojo(): boolean {
  * sandbox) leave these behind, and they are gitignored, so which of them exist
  * depends on what ran on this machine before.
  *
- * Copying them into a sandbox is how a spec ends up asserting on an artifact it
- * did not produce: `.jest-roblox/cache/<mount>/jest.config.luau` is a generated
- * stub, so a spec that checks the CLI generated one would pass against a stale
- * copy with generation entirely broken.
+ * Copying them into a sandbox is how a spec ends up asserting on an artifact
+ * it did not produce: `.jest-roblox/cache/<mount>/jest.config.luau` is a
+ * generated stub, so a spec that checks the CLI generated one would pass
+ * against a stale copy with generation entirely broken.
  */
 const FIXTURE_RUN_ARTIFACTS = new Set([".jest-roblox", "coverage"]);
 

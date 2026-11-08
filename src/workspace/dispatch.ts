@@ -134,8 +134,8 @@ export async function runDispatchedProjectsAsync(
 }
 
 /**
- * Resolve every pending (pkg, project) into the job it dispatches as, pinned to
- * the one synthesized place the whole workspace run shares.
+ * Resolve every pending (pkg, project) into the job it dispatches as, pinned
+ * to the one synthesized place the whole workspace run shares.
  *
  * The run builds these once and hands the same array to both the script build
  * and the run itself, so the two cannot disagree about a project's config. The

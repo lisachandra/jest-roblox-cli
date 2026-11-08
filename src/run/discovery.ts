@@ -35,8 +35,8 @@ interface TestFileDiscovery {
 }
 
 /**
- * Drop the files a `testPathPattern` regex does not select; `undefined` selects
- * everything.
+ * Drop the files a `testPathPattern` regex does not select; `undefined`
+ * selects everything.
  *
  * Shared rather than inlined at each call site: the two discovery paths glob
  * different things — this one walks `testMatch`, while workspace mode walks a

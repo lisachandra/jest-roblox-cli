@@ -20,10 +20,10 @@ export interface StudioCliProcess {
 	 * post-close telemetry drain. Hard-kills anyway after `graceCapMs` (a
 	 * long-yielding handler). Returns immediately; the watch runs in the
 	 * background, keeping node's event loop alive (the child handle + a poll
-	 * timer) until it fires, so the CLI prints results now and the process
-	 * exits once teardown completes. The caller closes the result server first,
-	 * which is what lets the bootstrap return and `--quitAfterExecution` begin
-	 * the graceful close.
+	 * timer) until it fires, so the CLI prints results now and the process exits
+	 * once teardown completes. The caller closes the result server first, which
+	 * is what lets the bootstrap return and `--quitAfterExecution` begin the
+	 * graceful close.
 	 */
 	killOnLockRelease: (graceCapMs: number) => void;
 	/** Subscribe to a spawn failure, such as a bad `studioPath`. */

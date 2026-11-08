@@ -146,11 +146,11 @@ function aggregatePerPackageCoverage(
 
 /**
  * Drive coverage off per-package manifests, not the workspace-level
- * `collectCoverage`. A package that opted into coverage via its own jest.config
- * carries a `coverageManifest`; aggregating regardless of workspace config
- * keeps that report from being dropped. Each gate carries the package's own
- * reporter settings so the report layer emits one report per package, into that
- * package's own directory, from that package's own config.
+ * `collectCoverage`. A package that opted into coverage via its own
+ * jest.config carries a `coverageManifest`; aggregating regardless of
+ * workspace config keeps that report from being dropped. Each gate carries the
+ * package's own reporter settings so the report layer emits one report per
+ * package, into that package's own directory, from that package's own config.
  *
  * @param runtimeResults - Per-project runtime results.
  * @param aggregateCoverage - Folds per-package coverage into reports.
@@ -243,8 +243,8 @@ function resolveReportOptions({
 
 /**
  * Counted in packages, not project rows: one package can own several projects,
- * and "after 3 packages" reading as 3 when only one package ran would misreport
- * how far the run got.
+ * and "after 3 packages" reading as 3 when only one package ran would
+ * misreport how far the run got.
  *
  * @param bailedPackages - Packages a `--bail` run did not run.
  * @param results - Per-project runtime results.

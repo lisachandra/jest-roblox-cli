@@ -66,8 +66,8 @@ const MAX_DRAIN_SWEEPS = 50;
 /**
  * Best-effort teardown for the MemoryStore structures a cancelled run leaves
  * behind: its work queue and the SortedMaps its tasks write. Bound to one
- * `queueId` and its `mapIds` at construction, so it structurally cannot touch a
- * concurrent sibling run's data — and it never issues the universe-wide
+ * `queueId` and its `mapIds` at construction, so it structurally cannot touch
+ * a concurrent sibling run's data — and it never issues the universe-wide
  * `memory-store:flush`. Every failure is logged and swallowed: leftovers the
  * janitor cannot reach (a mid-drain API error, a claim that outlives the
  * caller's reclaim budget) expire with the queue TTL backstop.

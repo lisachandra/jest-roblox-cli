@@ -118,9 +118,9 @@ export function applySetupResolver(
 /**
  * `mapFsPathToDataModel` is not an equivalent substitution for this walk: the
  * resolver follows the pnpm symlink and any nested rojo config, so it strips
- * `out` from a package path where the tree mapper keeps it. That walk dominates
- * the cost of resolving a package's setup files, so a shared cache spares every
- * package after the first that mounts the same project file.
+ * `out` from a package path where the tree mapper keeps it. That walk
+ * dominates the cost of resolving a package's setup files, so a shared cache
+ * spares every package after the first that mounts the same project file.
  *
  * @param options - Cache, resolver factory and Rojo project file.
  * @returns The cached or newly built resolver.

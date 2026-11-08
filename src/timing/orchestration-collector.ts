@@ -62,11 +62,11 @@ export interface TimingCollector {
 	/** Run an async phase inside a span named `name`. */
 	profileAsync: <T>(name: string, func: () => Promise<T>) => Promise<T>;
 	/**
-	 * {@link TimingCollector.profile}, plus the phase's duration handed back to
-	 * the caller. The one way to read a duration off the collector, and the
+	 * {@link TimingCollector.profile}, plus the phase's duration handed back
+	 * to the caller. The one way to read a duration off the collector, and the
 	 * only member that measures on a disabled run: the span tree is written for
-	 * the `TIMING` report and cleared at flush, while the Duration line prints
-	 * on every run and needs the number now. Two clock reads per call is what a
+	 * the `TIMING` report and cleared at flush, while the Duration line prints on
+	 * every run and needs the number now. Two clock reads per call is what a
 	 * disabled run pays for that.
 	 */
 	profileTimed: <T>(

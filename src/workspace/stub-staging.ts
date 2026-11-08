@@ -17,11 +17,11 @@ interface StubStagingOptions {
 }
 
 /**
- * Clears leftover stubs, writes each live project's `jest.config` stub into the
- * package cache root, and returns the synthesizer descriptors — each carrying
- * its `stubMounts` plus, for instrumented packages, the `coverageRoots` that
- * redirect its `$path` entries at the shadow tree and the `coverageSpine` the
- * demote mounts in place of the ones above them.
+ * Clears leftover stubs, writes each live project's `jest.config` stub into
+ * the package cache root, and returns the synthesizer descriptors — each
+ * carrying its `stubMounts` plus, for instrumented packages, the
+ * `coverageRoots` that redirect its `$path` entries at the shadow tree and the
+ * `coverageSpine` the demote mounts in place of the ones above them.
  *
  * Reports what the two phases cost, which the caller charges to staging. The
  * leftover sweep is a filesystem walk and gets a span of its own, under the

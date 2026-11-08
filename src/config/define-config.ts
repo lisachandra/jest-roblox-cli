@@ -49,8 +49,8 @@ type GlobalTestConfigInput = {
 /**
  * Identity helper for authoring a typed `jest.config.*` file. Returns its
  * input unchanged; it exists purely to give editors autocompletion and
- * type-checking for the root config contract (`Config` plus the c12 layer props
- * on `ConfigInput`).
+ * type-checking for the root config contract (`Config` plus the c12 layer
+ * props on `ConfigInput`).
  *
  * Use it as the default export of a config file discovered by c12 (`.ts`,
  * `.js`, `.mjs`, `.cjs`, `.json`, `.yaml`, `.toml`). All jest-passthrough

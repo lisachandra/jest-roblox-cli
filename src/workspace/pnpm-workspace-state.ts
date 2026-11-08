@@ -36,8 +36,8 @@ const workspaceStateSchema = type({
  *
  * The pnpm CLI enumerates the workspace itself on every install and writes the
  * answer to `node_modules/.pnpm-workspace-state-v1.json`. Reading it costs one
- * `readFile` where the glob path it replaces costs a full walk of the repo, and
- * it is the authority on questions that walk gets wrong: dot-directory
+ * `readFile` where the glob path it replaces costs a full walk of the repo,
+ * and it is the authority on questions that walk gets wrong: dot-directory
  * packages, `!` exclusions, and the root project.
  *
  * `undefined` means "ask the filesystem instead", never "no packages": every

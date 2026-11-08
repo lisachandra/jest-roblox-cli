@@ -302,8 +302,8 @@ class RunProgressReporter implements RunProgress {
 
 	/**
 	 * Wraps every guarded stream's `write` in `interleave`, so a warning from
-	 * code that has never heard of this block still lands above it. Released
-	 * when the block settles, or by `finish` for a run that never got that far.
+	 * code that has never heard of this block still lands above it. Released when
+	 * the block settles, or by `finish` for a run that never got that far.
 	 */
 	private guardStreams(): void {
 		for (const stream of this.options.guarded) {

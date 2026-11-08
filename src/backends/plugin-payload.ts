@@ -12,8 +12,8 @@ import { resolveVmHostCount } from "./vm-parallel.ts";
 export type RunPayload = ConfigRunPayload | WorkspaceRunPayload;
 
 /**
- * The runner's default result budget holds Open Cloud's 4 MiB return cap, which
- * no Studio transport has.
+ * The runner's default result budget holds Open Cloud's 4 MiB return cap,
+ * which no Studio transport has.
  */
 const UNBOUNDED_RESULT_BUDGET_BYTES = Number.MAX_SAFE_INTEGER;
 

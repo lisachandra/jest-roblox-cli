@@ -15,20 +15,19 @@ const PLACE_HOOK_ENV = "JEST_ROBLOX_PLACE_HOOK";
  */
 const COVERAGE_PLACE_HOOK_ENV = "JEST_ROBLOX_COVERAGE_PLACE_HOOK";
 
-function shellQuote(value: string): string {
-	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
-}
-
 /**
  * Run the post-build place hook, if configured.
  *
  * Resolution order:
- *  1. `JEST_ROBLOX_PLACE_HOOK`  — runs for every place build (clean, coverage, workspace).
- *  2. `JEST_ROBLOX_COVERAGE_PLACE_HOOK` — legacy fallback, runs only when the
+ *  1. `JEST_ROBLOX_PLACE_HOOK`  — runs for every place build (clean, coverage,
+ *  workspace). 2. `JEST_ROBLOX_COVERAGE_PLACE_HOOK` — legacy fallback, runs
+ *  only when the
  *     general hook is unset.
  *
  * The `{placeFile}` token in the command is replaced with the absolute,
  * shell-quoted path of the just-built `.rbxl`.
+ * @param placeFile
+ * @param _hookSource
  */
 export function applyPlaceHook(
 	placeFile: string,
@@ -49,4 +48,8 @@ export function applyPlaceHook(
 	} catch (err) {
 		throw new Error(`${source} failed`, { cause: err });
 	}
+}
+
+function shellQuote(value: string): string {
+	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }

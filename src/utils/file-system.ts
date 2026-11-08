@@ -14,8 +14,8 @@ export type { Dirent, Stats } from "node:fs";
  * its own in-memory volume and nothing crosses between files.
  *
  * The list is the union of what the CLI calls, not all of `node:fs`. Widen it
- * when a caller needs another primitive; `memfs` implements the whole sync API,
- * so a spec's volume keeps satisfying it.
+ * when a caller needs another primitive; `memfs` implements the whole sync
+ * API, so a spec's volume keeps satisfying it.
  */
 export type FileSystem = Pick<
 	typeof nodeFs,

@@ -13,11 +13,12 @@ import { parseVersionedManifest } from "./manifest-parse.ts";
  * `MANIFEST_VERSION` (the coverage manifest's version) — the two siblings
  * version separately and are cross-linked by `buildId`.
  *
- * Bumped when `cleanPlace.contentId` was added. The field is optional, so a
- * v1 manifest still parses against the shape — which is exactly the hazard: a
- * consumer reading one would find no identity and could not tell "this producer
- * stamped nothing" from "this producer is older than the stamp". The bump makes
- * the older artifact unreadable instead, and the producer rebuilds it.
+ * Bumped when `cleanPlace.contentId` was added. The field is optional, so a v1
+ * manifest still parses against the shape — which is exactly the hazard: a
+ * consumer reading one would find no identity and could not tell "this
+ * producer stamped nothing" from "this producer is older than the stamp". The
+ * bump makes the older artifact unreadable instead, and the producer rebuilds
+ * it.
  */
 export const BUILD_MANIFEST_VERSION = 2 as const;
 
@@ -59,11 +60,11 @@ export interface BuildManifestFileRecord {
 export interface BuildManifestArtifact {
 	/**
 	 * The Place Content Id stamped inside this place, when one was. Unlike
-	 * {@link BuildManifestArtifact.hash} — which the file's own bytes decide,
-	 * and which nothing inside the place can name — this is readable from a
-	 * booted server, so a consumer can prove the place a task ran is the build
-	 * this manifest describes. Absent for a place built before the stamp, or by
-	 * a caller that asked for none.
+	 * {@link BuildManifestArtifact.hash} — which the file's own bytes decide, and
+	 * which nothing inside the place can name — this is readable from a booted
+	 * server, so a consumer can prove the place a task ran is the build this
+	 * manifest describes. Absent for a place built before the stamp, or by a
+	 * caller that asked for none.
 	 */
 	contentId?: string;
 	/** SHA-256 of the place file. */
@@ -102,9 +103,9 @@ export interface BuildManifest {
 
 /**
  * Outcome of reading a Build Manifest: the verified manifest, or the first
- * reason to refuse it. In mismatch variants `actual` is the value found on disk
- * or in the file and `expected` is the value the manifest or caller requires;
- * `path` is the recorded path or source key that failed.
+ * reason to refuse it. In mismatch variants `actual` is the value found on
+ * disk or in the file and `expected` is the value the manifest or caller
+ * requires; `path` is the recorded path or source key that failed.
  */
 export type ReadBuildManifestResult =
 	| { actual: string; expected: string; kind: "buildid-mismatch" }
@@ -186,8 +187,8 @@ export interface CoverageArtifacts {
 	/** ISO timestamp of the build. */
 	generatedAt: string;
 	/**
-	 * Per-project DataModel paths the kernel consumes, resolved by the run path
-	 * that built the place. Empty when the run resolved no projects.
+	 * Per-project DataModel paths the kernel consumes, resolved by the run
+	 * path that built the place. Empty when the run resolved no projects.
 	 */
 	projects: Array<BuildManifestProject>;
 	/** `false` on the incremental no-change reuse path. */

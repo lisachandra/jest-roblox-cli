@@ -134,8 +134,8 @@ interface ProjectSelection {
 
 /**
  * `DiscoveryInput` plus the run's `rootDir`→`outDir` rewrites. Kept local to
- * the plan: the mappings only place a discovered TS source under the mount that
- * owns it, so nothing downstream of `buildTestPlan` has any use for them.
+ * the plan: the mappings only place a discovered TS source under the mount
+ * that owns it, so nothing downstream of `buildTestPlan` has any use for them.
  */
 interface ProjectPlanInput extends DiscoveryInput {
 	tsconfigCache: TsconfigMappingCache;
@@ -199,12 +199,12 @@ export function buildTestPlan({ timing, ...discovery }: TestPlanInput): TestPlan
 /**
  * The same plan, aimed at the place its jobs will actually execute against.
  *
- * A plan is built before the run stages anything, so that one selecting nothing
- * stops the run before a backend is resolved or a place is built. The
+ * A plan is built before the run stages anything, so that one selecting
+ * nothing stops the run before a backend is resolved or a place is built. The
  * instrumented place a coverage run puts in the way does not exist yet at that
  * point, and the place reaches a job through its config and nowhere else — so
- * this is the only writer of it, and aiming the jobs afterwards is the whole of
- * the difference.
+ * this is the only writer of it, and aiming the jobs afterwards is the whole
+ * of the difference.
  *
  * @param plan - Plan built before staging.
  * @param placeFile - Place the jobs execute against.

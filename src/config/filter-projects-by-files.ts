@@ -140,12 +140,12 @@ export function matchFilesToProjects({
 
 /**
  * Multi's view of {@link matchFilesToProjects}: every project resolves against
- * the one run root, and each keeps its cli files in the form they were typed so
- * discovery can re-resolve them against the project's own `rootDir`.
+ * the one run root, and each keeps its cli files in the form they were typed
+ * so discovery can re-resolve them against the project's own `rootDir`.
  *
  * Used so a positional file arg can auto-pick its owning project without
- * forcing the user to pass `--project`, and so each project only sees the files
- * it actually owns (no leaking type-test files or runtime files across
+ * forcing the user to pass `--project`, and so each project only sees the
+ * files it actually owns (no leaking type-test files or runtime files across
  * projects).
  *
  * @param options - Cli files, projects and the run root.

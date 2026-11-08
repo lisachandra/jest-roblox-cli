@@ -132,13 +132,14 @@ function maxPosition(
  * any.
  *
  * One TypeScript statement lowers to several Luau statements — a destructuring
- * declaration becomes `local _binding = ...` plus one statement per bound name,
- * and a nested expression is hoisted into its own temporary — each mapped to a
- * different column of the same source line. Istanbul counts one entry per
- * source statement, so keying on the exact start position alone inflates the
- * statement total and splits the hit count across fragments that sit in
- * different basic blocks: the outer fragment runs, an inner one does not, and
- * the line reports as partially covered although the source statement ran.
+ * declaration becomes `local _binding = ...` plus one statement per bound
+ * name, and a nested expression is hoisted into its own temporary — each
+ * mapped to a different column of the same source line. Istanbul counts one
+ * entry per source statement, so keying on the exact start position alone
+ * inflates the statement total and splits the hit count across fragments that
+ * sit in different basic blocks: the outer fragment runs, an inner one does
+ * not, and the line reports as partially covered although the source statement
+ * ran.
  *
  * Sharing a start line is therefore the rule, qualified by one of the two spans
  * covering several lines — that span is the enclosing statement, so the pair

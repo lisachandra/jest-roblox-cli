@@ -40,13 +40,14 @@ interface FileNarrowing {
  * Node-side discovery is the source of truth: the FS-namespace filter
  * (positional args or `--testPathPattern`) has already resolved to a concrete
  * file set against real paths. Drop the raw FS-shaped pattern and re-narrow by
- * the discovered files so Jest-on-Roblox matches the same files — its paths are
- * Roblox Instance names (e.g. `ServerScriptService/...`) with no `src/` prefix,
- * so a raw FS pattern like `src/server/foo.spec` matches zero files there.
+ * the discovered files so Jest-on-Roblox matches the same files — its paths
+ * are Roblox Instance names (e.g. `ServerScriptService/...`) with no `src/`
+ * prefix, so a raw FS pattern like `src/server/foo.spec` matches zero files
+ * there.
  *
  * This is the seam every dispatch mode narrows through, so `toInstancePath`
- * belongs here rather than in either caller: each mode builds the resolver from
- * whatever it knows about its own Rojo mounts and hands it to one shared
+ * belongs here rather than in either caller: each mode builds the resolver
+ * from whatever it knows about its own Rojo mounts and hands it to one shared
  * translation.
  *
  * @param options - Config, filter state, discovered files and resolver.
@@ -91,9 +92,9 @@ function toBasenamePattern(file: string): string {
  *
  * A file no mount owns falls back to the basename (without test-file
  * extension). The Luau-side path Jest matches against is built from Roblox
- * Instance names (e.g. `ReplicatedStorage/shared/.../foo`), which won't contain
- * the FS path prefix (`src/...`); Instance.Name preserves the original file
- * basename, so a basename still finds the intended file — alongside any
+ * Instance names (e.g. `ReplicatedStorage/shared/.../foo`), which won't
+ * contain the FS path prefix (`src/...`); Instance.Name preserves the original
+ * file basename, so a basename still finds the intended file — alongside any
  * namesake — the one exception being an `index` stem, which roblox-ts renames
  * to `init` (see `toInstanceStem`).
  *

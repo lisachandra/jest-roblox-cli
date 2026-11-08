@@ -58,9 +58,9 @@ export interface WorkspacePackageUniverse {
  * that package's own universe. Original-Luau file keys may collide across
  * packages (different sources at the same relative path); mapping each pkg's
  * data with its own manifest first avoids that ambiguity. Nothing is merged
- * across packages: every consumer downstream — the report, the threshold gate —
- * works per package, and a cross-package pool would let one package's coverage
- * mask another's.
+ * across packages: every consumer downstream — the report, the threshold gate
+ * — works per package, and a cross-package pool would let one package's
+ * coverage mask another's.
  *
  * Packages without coverageData (for example when the materializer never reset `_G` for
  * them) are skipped silently. Empty input returns an empty list.

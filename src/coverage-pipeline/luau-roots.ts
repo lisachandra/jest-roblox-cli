@@ -40,8 +40,8 @@ interface RojoProjectRead {
 	/**
 	 * The parse failure, held rather than thrown, and set only for a project
 	 * too malformed to read — never for a missing one. A run that names its own
-	 * `luauRoots` never needs the tree, and refusing it for a project it does
-	 * not read would turn a working run into a hard failure, so only the root
+	 * `luauRoots` never needs the tree, and refusing it for a project it does not
+	 * read would turn a working run into a hard failure, so only the root
 	 * auto-detect rethrows this.
 	 */
 	failure: Error | undefined;
@@ -61,10 +61,10 @@ interface RojoContext {
 	 * The project, read on the first ask and remembered.
 	 *
 	 * Lazy rather than eager: a config that names its own `luauRoots` never
-	 * looks at the tree, and reading it costs a parse of the project plus a
-	 * parse of every project it nests. Multi asks this question once per
-	 * project config, so the eager read spent N of those on an answer the first
-	 * branch already had.
+	 * looks at the tree, and reading it costs a parse of the project plus a parse
+	 * of every project it nests. Multi asks this question once per project
+	 * config, so the eager read spent N of those on an answer the first branch
+	 * already had.
 	 */
 	read: () => RojoProjectRead;
 	tsconfigReader: TsconfigReader;

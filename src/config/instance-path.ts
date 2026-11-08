@@ -23,14 +23,14 @@ export type InstancePathResolver = (file: string) => string | undefined;
 /** Inputs for building an `InstancePathResolver`. */
 export interface InstancePathOptions {
 	/**
-	 * Base the mounts and the tsconfig mappings are relative to — the directory
-	 * the Rojo project and the `tsconfig*.json` files were read from.
+	 * Base the mounts and the tsconfig mappings are relative to — the
+	 * directory the Rojo project and the `tsconfig*.json` files were read from.
 	 *
-	 * Separate from `rootDirectory` because the two genuinely differ: `rootDir`
-	 * is not a project-only key, so a project (or package) may point discovery
-	 * at a subdirectory while its mounts stay relative to the Rojo root. Both
-	 * sides resolve to absolute paths before anything is compared, so no caller
-	 * has to keep the two coordinate systems in step by hand.
+	 * Separate from `rootDirectory` because the two genuinely differ:
+	 * `rootDir` is not a project-only key, so a project (or package) may point
+	 * discovery at a subdirectory while its mounts stay relative to the Rojo
+	 * root. Both sides resolve to absolute paths before anything is compared, so
+	 * no caller has to keep the two coordinate systems in step by hand.
 	 */
 	mountBase: string;
 	/** Rojo mounts that map filesystem directories to Instances. */
@@ -55,8 +55,8 @@ interface MountPrefix {
 }
 
 /**
- * Strip the language extension and apply the roblox-ts `index` → `init` rename,
- * leaving the name the Roblox Instance carries.
+ * Strip the language extension and apply the roblox-ts `index` → `init`
+ * rename, leaving the name the Roblox Instance carries.
  *
  * The roblox-ts compiler renames a filename stem of exactly `index` to `init`
  * (PathTranslator), so the Instance — and thus the path Jest matches against —
@@ -65,8 +65,9 @@ interface MountPrefix {
  * would match zero tests.
  *
  * Not the exact inverse of `luauInitToIndex` in the source mapper, which
- * rewrites an `init` segment anywhere in a path. This one rewrites the filename
- * stem only, because a _directory_ named `index` is not renamed by roblox-ts.
+ * rewrites an `init` segment anywhere in a path. This one rewrites the
+ * filename stem only, because a _directory_ named `index` is not renamed by
+ * roblox-ts.
  *
  * @param filePath - Source file path.
  * @returns The path with its extension stripped and an `index` stem renamed.
@@ -82,11 +83,11 @@ export function toInstanceStem(filePath: string): string {
  * `src/server/systems/attack/index.test.ts` becomes
  * `PkgServer/systems/attack/init.test`.
  *
- * Jest matches `testPathPattern` with an unanchored, case-insensitive substring
- * test (`testPathPatternToRegExp` is `RegExp(pattern, "i")`), which is why the
- * mount's Instance name has to be on the front. Without it the path below the
- * mount is a bare suffix, and naming `a/index.spec.ts` would also select
- * `nested/a/index.spec.ts` — the same namesake bug one level up.
+ * Jest matches `testPathPattern` with an unanchored, case-insensitive
+ * substring test (`testPathPatternToRegExp` is `RegExp(pattern, "i")`), which
+ * is why the mount's Instance name has to be on the front. Without it the path
+ * below the mount is a bare suffix, and naming `a/index.spec.ts` would also
+ * select `nested/a/index.spec.ts` — the same namesake bug one level up.
  *
  * Only the mount's *last* segment is used, never its full `dataModelPath`.
  * Jest's path is `CoreScriptSyncService:GetScriptFilePath` when that service
@@ -142,14 +143,14 @@ export function createInstancePathResolver({
  * decide, which is the only authority on where the code actually lands.
  *
  * `replacePrefix` returns its input unchanged when a mapping does not own the
- * path, so a non-matching mapping simply repeats the unmapped candidate — which
- * the list needs anyway, for a project that mounts its sources directly.
+ * path, so a non-matching mapping simply repeats the unmapped candidate —
+ * which the list needs anyway, for a project that mounts its sources directly.
  *
  * Only a TS source is ever rebased. A Luau source is already in the output
- * namespace, and a `rootDirs` tsconfig collapses to a `rootDir` that owns every
- * path under the base — so rebasing one would prepend the outDir a second time
- * (`out/out/shared/…`) and, under a mount at the outDir root, hand back a path
- * that matches nothing on the Luau side.
+ * namespace, and a `rootDirs` tsconfig collapses to a `rootDir` that owns
+ * every path under the base — so rebasing one would prepend the outDir a
+ * second time (`out/out/shared/…`) and, under a mount at the outDir root, hand
+ * back a path that matches nothing on the Luau side.
  *
  * @param absoluteFile - Absolute source file path.
  * @param mappings - Tsconfig `rootDir`→`outDir` rewrites.

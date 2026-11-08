@@ -10,8 +10,8 @@ import { nodeFileSystem } from "../utils/file-system.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 
 /**
- * What a previous build recorded: the key its inputs hashed to, and the hash of
- * the place it produced. The place hash is what proves the `.rbxl` still on
+ * What a previous build recorded: the key its inputs hashed to, and the hash
+ * of the place it produced. The place hash is what proves the `.rbxl` still on
  * disk is the one that key was recorded against, rather than a half-written
  * file an interrupted build left behind.
  */

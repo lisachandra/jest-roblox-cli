@@ -203,9 +203,9 @@ function isSea(): boolean {
  * project's on-disk `node_modules`. Anchoring the require at the config path
  * lets a config that imports a runtime value (e.g. `defineConfig` from
  * `@isentinel/jest-roblox`) resolve it relative to itself; a genuinely
- * unresolvable import surfaces Node's standard module-resolution error. `.json`
- * keeps its read + parse path (a bare `require` of JSON works too, but reading
- * avoids relying on CJS JSON-module semantics).
+ * unresolvable import surfaces Node's standard module-resolution error.
+ * `.json` keeps its read + parse path (a bare `require` of JSON works too, but
+ * reading avoids relying on CJS JSON-module semantics).
  *
  * @param id - Absolute path of the config module.
  * @param fileSystem - File system for JSON reads.
@@ -223,9 +223,10 @@ async function seaImport(id: string, fileSystem: FileSystem): Promise<ConfigModu
 }
 
 /**
- * `defuFn` wants a non-empty argument list, which a variadic array can't prove.
- * The leading `{}` supplies it and contributes nothing: defu gives the first
- * source the highest priority, so an empty one leaves the merge order intact.
+ * `defuFn` wants a non-empty argument list, which a variadic array can't
+ * prove. The leading `{}` supplies it and contributes nothing: defu gives the
+ * first source the highest priority, so an empty one leaves the merge order
+ * intact.
  *
  * @param sources - Configs in priority order, highest first.
  * @returns The merged config.
@@ -237,9 +238,9 @@ function merger(...sources: Array<Config | null | undefined>): Config {
 /**
  * `workspace.root` is relative in source; anchor it to the directory of the
  * file that declares it (typically a shared config reached via `extends:`) so
- * the workspace root stays stable regardless of which package directory the CLI
- * runs from. Applied per-layer before merge — once layers merge, the declaring
- * file's directory is no longer recoverable.
+ * the workspace root stays stable regardless of which package directory the
+ * CLI runs from. Applied per-layer before merge — once layers merge, the
+ * declaring file's directory is no longer recoverable.
  *
  * @param config - Layer config.
  * @param baseDirectory - Directory of the file that declares the layer.

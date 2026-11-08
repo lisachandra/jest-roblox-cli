@@ -13,8 +13,8 @@ declare module "istanbul-reports/lib/*" {
 
 /**
  * The html reporter, declared past the wildcard because two of its members are
- * reached by name: `onStart`, whose asset copy is replaced, and the writer that
- * says which directory the replacement writes into.
+ * reached by name: `onStart`, whose asset copy is replaced, and the writer
+ * that says which directory the replacement writes into.
  */
 declare module "istanbul-reports/lib/html/index.js" {
 	import type { Context, FileWriter, Node, ReportBase } from "istanbul-lib-report";

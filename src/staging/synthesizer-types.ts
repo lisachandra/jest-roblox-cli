@@ -28,10 +28,10 @@ export interface PackageDescriptor extends WorkspacePackageDescriptor {
 	coverageRoots?: Array<CoverageRoot> | undefined;
 	/**
 	 * The directories between each `coverageRoots` entry and the `$path` mount
-	 * above it, mapped to the shadow's copy of that directory's own loose
-	 * files. A mount named here is demoted: its `$path` moves to the spine copy
-	 * and every directory beneath it becomes an explicit child, so the coverage
-	 * root can be swapped without the mount above serving the originals.
+	 * above it, mapped to the shadow's copy of that directory's own loose files.
+	 * A mount named here is demoted: its `$path` moves to the spine copy and
+	 * every directory beneath it becomes an explicit child, so the coverage root
+	 * can be swapped without the mount above serving the originals.
 	 */
 	coverageSpine?: Array<CoverageRoot> | undefined;
 	/** `jest.config` stubs to mount into the package's tree. */

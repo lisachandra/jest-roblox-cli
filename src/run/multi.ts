@@ -100,12 +100,12 @@ export function loadRojoTree(
 }
 
 /**
- * Multi-project execution core: staging, test-plan building, and execution over
- * a set of already-resolved projects. Shared by the `projects:`-configured path
- * (`runMultiProject`) and the no-`projects` collapse (`run.ts` synthesizes one
- * project from the config's luau roots and calls this), so both paths get
- * identical per-root `jest.config` stub injection, place rebuild, coverage, and
- * result shaping.
+ * Multi-project execution core: staging, test-plan building, and execution
+ * over a set of already-resolved projects. Shared by the
+ * `projects:`-configured path (`runMultiProject`) and the no-`projects`
+ * collapse (`run.ts` synthesizes one project from the config's luau roots and
+ * calls this), so both paths get identical per-root `jest.config` stub
+ * injection, place rebuild, coverage, and result shaping.
  *
  * @param input - Resolved projects, root config, CLI options, seams and profiler.
  * @param input.allProjects - Every resolved project.
@@ -182,8 +182,8 @@ export async function runMultiProjectAsync(options: MultiRunOptions): Promise<Mu
 }
 
 /**
- * The Code Roots this run's Code Bundle is split against, or none when it ships
- * the whole place.
+ * The Code Roots this run's Code Bundle is split against, or none when it
+ * ships the whole place.
  *
  * @param options - Backend, discovery and root config.
  * @param options.backend - Backend the run dispatches to.
@@ -210,8 +210,8 @@ function resolveRunCodeRoots({
 }
 
 /**
- * Put the run's inputs on disk against a backend already in hand, then dispatch
- * against it.
+ * Put the run's inputs on disk against a backend already in hand, then
+ * dispatch against it.
  *
  * @param options - Backend, CLI options, discovery, plan and root config.
  * @param options.backend - Backend already resolved for the run.

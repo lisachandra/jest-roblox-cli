@@ -82,10 +82,10 @@ export function tryRemove(deleteEntry: () => void): boolean {
  *
  * Directories matter for one shape rojo cannot tolerate: a `foo/index.ts` ->
  * `foo.ts` rename leaves the shadow holding a stale `foo/` beside the fresh
- * `foo.luau`, which rojo mounts as a Folder and a ModuleScript both named `foo`
- * under one parent. An empty *source* directory is legitimate — a cold run
- * mirrors it and rojo makes a Folder — so a directory is judged on whether its
- * source counterpart exists, never on whether it still holds anything.
+ * `foo.luau`, which rojo mounts as a Folder and a ModuleScript both named
+ * `foo` under one parent. An empty *source* directory is legitimate — a cold
+ * run mirrors it and rojo makes a Folder — so a directory is judged on whether
+ * its source counterpart exists, never on whether it still holds anything.
  *
  * The one exception is a generated `jest.config.luau` on a run whose
  * `beforeBuild` bakes them: those are copied in from the cache root after this
@@ -272,11 +272,11 @@ function pruneOrphanDirectory({
 }
 
 /**
- * A directory whose source counterpart is gone takes its whole subtree with it,
- * `node_modules`/dot-dir children included: nothing under an orphaned parent
- * can be anything but orphaned, so there is no judgement to withhold. Leaving
- * such a child behind would strand the stale `foo/` this reconcile exists to
- * clear from beside a fresh `foo.luau`.
+ * A directory whose source counterpart is gone takes its whole subtree with
+ * it, `node_modules`/dot-dir children included: nothing under an orphaned
+ * parent can be anything but orphaned, so there is no judgement to withhold.
+ * Leaving such a child behind would strand the stale `foo/` this reconcile
+ * exists to clear from beside a fresh `foo.luau`.
  *
  * A bake is the one thing under there that is not stale, and it can be what put
  * the directory there: it writes to a mount the mirror never reached, so the

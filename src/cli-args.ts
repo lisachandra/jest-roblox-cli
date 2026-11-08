@@ -324,10 +324,10 @@ function parseParallelValue(raw: string | undefined): ParallelOption {
 
 /**
  * `--experimental-vm-parallel [n]`: how many Luau VMs the Studio plugin splits
- * the run's configs across. Bare — or the `auto` the bare form is rewritten to,
- * which a user may also type — means one VM per config; an explicit count must
- * be a positive integer, and the plugin clamps it to the configs it was given
- * and the hosts it ships.
+ * the run's configs across. Bare — or the `auto` the bare form is rewritten
+ * to, which a user may also type — means one VM per config; an explicit count
+ * must be a positive integer, and the plugin clamps it to the configs it was
+ * given and the hosts it ships.
  *
  * @param raw - The flag value, or `undefined` when the flag is absent.
  * @returns `undefined` when absent, `"auto"` when bare, else the count.

@@ -100,10 +100,9 @@ export interface ExecuteScriptOptions {
 	/**
 	 * Pin execution to a specific place version (the `versionNumber` returned
 	 * by {@link RemoteRunner.uploadPlaceAsync}). Open Cloud Luau Execution
-	 * otherwise boots whatever version is currently live, so a concurrent
-	 * upload to the same place clobbers an in-flight run; pinning isolates each
-	 * run to the version it uploaded. Omitted ⇒ run against the live (head)
-	 * version.
+	 * otherwise boots whatever version is currently live, so a concurrent upload
+	 * to the same place clobbers an in-flight run; pinning isolates each run to
+	 * the version it uploaded. Omitted ⇒ run against the live (head) version.
 	 */
 	placeVersion?: number;
 	/**
@@ -141,8 +140,8 @@ export interface ExecuteScriptOptions {
 	 * server keeps saying "later". A budget converts that into a failure with
 	 * a number on it.
 	 *
-	 * The trade is a submit abandoned in flight: the request may still land and
-	 * consume a task slot nobody polls. Set it only where a duplicate task is
+	 * The trade is a submit abandoned in flight: the request may still land
+	 * and consume a task slot nobody polls. Set it only where a duplicate task is
 	 * cheaper than a stage that never returns.
 	 */
 	submitBudget?: number;

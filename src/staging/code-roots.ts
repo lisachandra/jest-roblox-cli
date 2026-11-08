@@ -36,8 +36,8 @@ export interface CodeRootsRequest {
 	 */
 	stagingDirectory: string;
 	/**
-	 * How a tsconfig is read, for a project whose roots come from its `outDir`.
-	 * Defaults to the real one.
+	 * How a tsconfig is read, for a project whose roots come from its
+	 * `outDir`. Defaults to the real one.
 	 */
 	tsconfigReader?: TsconfigReader | undefined;
 }

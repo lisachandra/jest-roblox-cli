@@ -73,9 +73,9 @@ export interface FakeOpenCloudTask {
 	 */
 	project?: string;
 	/**
-	 * Verbatim `output.results[0]` for this task, bypassing the envelope
-	 * wrap — for outputs that are not Jest envelopes, such as the version-guard
-	 * race sentinel.
+	 * Verbatim `output.results[0]` for this task, bypassing the envelope wrap
+	 * — for outputs that are not Jest envelopes, such as the version-guard race
+	 * sentinel.
 	 */
 	rawOutput?: string;
 	/**

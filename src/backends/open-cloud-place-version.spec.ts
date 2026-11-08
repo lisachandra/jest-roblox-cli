@@ -280,8 +280,8 @@ describe(PlaceVersionGate, () => {
 		});
 
 		/**
-		 * The budget is wall clock, not a task deadline, and a budget under the
-		 * probe's own deadline is still the whole answer: the task may not be
+		 * The budget is wall clock, not a task deadline, and a budget under
+		 * the probe's own deadline is still the whole answer: the task may not be
 		 * given longer to run than the caller will wait for it.
 		 */
 		it.for([

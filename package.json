@@ -70,6 +70,7 @@
 		"knip-production": "knip --production",
 		"lint": "oxlint && eslint --cache",
 		"lint:ci": "oxlint && eslint --cache --cache-strategy content",
+		"lint:fix": "oxlint --fix && eslint --cache --fix",
 		"mutation": "pnpm build:bundle && stryker run",
 		"prepack": "pnpm build",
 		"prepublishOnly": "pnpm build",

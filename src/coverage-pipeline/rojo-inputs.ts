@@ -174,11 +174,12 @@ async function digestFilesAsync({
 
 /**
  * SHA-256 over every rojo build input that lives OUTSIDE the instrumented
- * luauRoots: non-luauRoot `$path` mounts (for example `include/RuntimeLib.lua`,
- * vendored `@rbxts`, game assets) plus the rojo project file(s) themselves.
- * The incremental coverage cache folds a mismatch into its rebuild decision so
- * an edit to any of these — which the per-luauRoot shadow diff never observes
- * — still forces a fresh place build instead of silently reusing a stale one.
+ * luauRoots: non-luauRoot `$path` mounts (for example
+ * `include/RuntimeLib.lua`, vendored `@rbxts`, game assets) plus the rojo
+ * project file(s) themselves. The incremental coverage cache folds a mismatch
+ * into its rebuild decision so an edit to any of these — which the
+ * per-luauRoot shadow diff never observes — still forces a fresh place build
+ * instead of silently reusing a stale one.
  *
  * Files under a luauRoot are skipped: the shadow diff already content-hashes them, so
  * re-reading the compiled output here would be wasted work. Throws on a
@@ -264,10 +265,10 @@ async function collectInputFilesAsync(target: string, walk: InputWalk): Promise<
 }
 
 /**
- * Walk a directory, given the canonical location it resolves to — its parent's,
- * plus its own name. A path entered from outside the walk inherits none and
- * resolves its own, but only past the gate below: a root about to be turned
- * away is not worth a `realpath`.
+ * Walk a directory, given the canonical location it resolves to — its
+ * parent's, plus its own name. A path entered from outside the walk inherits
+ * none and resolves its own, but only past the gate below: a root about to be
+ * turned away is not worth a `realpath`.
  *
  * A luauRoot is skipped wherever it turns up, not just when it is the mount
  * itself: narrowing puts the roots below their mount, so the walk reaches them

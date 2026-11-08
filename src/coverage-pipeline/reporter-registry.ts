@@ -22,13 +22,13 @@ import { writeIstanbulHtmlAssets } from "./html-assets.ts";
  * Every reporter, named the way `coverageReporters` names it, bound to its
  * class rather than to its module path.
  *
- * `istanbulReports.create(name)` — the documented way to do this — resolves the
- * class with `require(path.join(__dirname, 'lib', name))`. A bundler cannot see
- * through that: no reporter module is reachable from the entry, so none is
- * bundled, and the standalone binary (which resolves built-in modules and
- * nothing else) failed every `--coverage` run with
- * `No such built-in module: <exe dir>/lib/text`. Naming each class in an import
- * is what puts it in the bundle.
+ * `istanbulReports.create(name)` — the documented way to do this — resolves
+ * the class with `require(path.join(__dirname, 'lib', name))`. A bundler
+ * cannot see through that: no reporter module is reachable from the entry, so
+ * none is bundled, and the standalone binary (which resolves built-in modules
+ * and nothing else) failed every `--coverage` run with `No such built-in
+ * module: <exe dir>/lib/text`. Naming each class in an import is what puts it
+ * in the bundle.
  *
  * The three html-writing reporters are built through factories of their own,
  * because bundling a reporter class does not bundle the asset files it copies.

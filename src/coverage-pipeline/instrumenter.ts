@@ -159,13 +159,15 @@ function ensureShadowDirectory({
  *
  * The chain is walked a level at a time rather than made by one recursive
  * `mkdirSync`, because a stale file on any level blocks the whole make and the
- * recursive call cannot be trusted to say so. The instrumenter is the pass that
- * has to survive that: `prepareShadowRoot` instruments before it mirrors, so
- * the mirror walk — which judges the same levels against source — has not run.
+ * recursive call cannot be trusted to say so. The instrumenter is the pass
+ * that has to survive that: `prepareShadowRoot` instruments before it mirrors,
+ * so the mirror walk — which judges the same levels against source — has not
+ * run.
  *
  * The twin's own path is cleared last, and never cached: that clash is per
- * file, so it costs a `stat` on every file written. Cheap against the write and
- * the atomic cov-map that follow, but not free — measure before adding another.
+ * file, so it costs a `stat` on every file written. Cheap against the write
+ * and the atomic cov-map that follow, but not free — measure before adding
+ * another.
  *
  * The `.cov-map.json` sidecar beside the twin is deliberately not cleared. Only
  * a source directory named `*.cov-map.json` can put a directory on that path,

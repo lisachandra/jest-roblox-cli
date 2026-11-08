@@ -173,9 +173,10 @@ async function executeWorkspaceRunAsync({
  * comes back short — has to drop the entries it never reached before anything
  * downstream reads them, or a package's name pairs with its neighbor's result.
  *
- * The report counts packages, not projects, so a package is "not run" only when
- * none of its projects ran. One that got part-way through its projects before
- * the bail landed still ran, and naming it on both sides would count it twice.
+ * The report counts packages, not projects, so a package is "not run" only
+ * when none of its projects ran. One that got part-way through its projects
+ * before the bail landed still ran, and naming it on both sides would count it
+ * twice.
  *
  * @param pending - Pending entries in dispatch order.
  * @param ranProjectIndices - Indices of the entries that ran.
@@ -205,12 +206,12 @@ function splitBailedSelection(
 }
 
 /**
- * The Code Roots this run's Code Bundle is split against, or none when it ships
- * the whole place.
+ * The Code Roots this run's Code Bundle is split against, or none when it
+ * ships the whole place.
  *
- * Every package's compiled directories plus the workspace cache, which is where
- * the coverage shadow, the spine copies and each package's `jest.config` stub
- * are mounted from.
+ * Every package's compiled directories plus the workspace cache, which is
+ * where the coverage shadow, the spine copies and each package's `jest.config`
+ * stub are mounted from.
  *
  * @param options - Cache directory, loaded packages and run options.
  * @returns The Code Roots, or `undefined` for the whole place.
@@ -234,8 +235,8 @@ function resolveWorkspaceCodeRoots({
 }
 
 /**
- * Argument shuffle only: `stageWorkspacePlaceAsync` owns the phase measurements
- * this run reports.
+ * Argument shuffle only: `stageWorkspacePlaceAsync` owns the phase
+ * measurements this run reports.
  *
  * @param options - Runtime inputs.
  * @returns The staged place.

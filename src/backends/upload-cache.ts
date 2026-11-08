@@ -10,21 +10,23 @@ import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
  * Records which place version a set of place-file bytes already has on Roblox,
  * so an unchanged build can skip `places.save` entirely.
  *
- * An entry also means those bytes boot: the caller writes it only once its boot
- * probe has come back, so a hit is what lets a later run skip the probe too.
+ * An entry also means those bytes boot: the caller writes it only once its
+ * boot probe has come back, so a hit is what lets a later run skip the probe
+ * too.
  *
  * Why it is worth skipping: an upload is the only thing measured to precede a
- * cold place boot. Across 60 tasks, every upload-free task ran warm (~3s) while
- * tasks following an upload ran cold (~22s) in most windows. The mechanism is
- * undocumented and the rate varies, so treat the fast path as a bonus over a
- * correct-but-slow path, never as something to depend on. See
+ * cold place boot. Across 60 tasks, every upload-free task ran warm (~3s)
+ * while tasks following an upload ran cold (~22s) in most windows. The
+ * mechanism is undocumented and the rate varies, so treat the fast path as a
+ * bonus over a correct-but-slow path, never as something to depend on. See
  * `docs/research/open-cloud-warm-boot/README.md`.
  *
  * The cache cannot be validated against the server — Open Cloud exposes no
  * content hash for a place version. It does not need to be: the caller submits
- * every task to the recorded version itself, which holds exactly the bytes this
- * file hashed, and a version keeps existing after head moves on. A version Open
- * Cloud no longer serves answers with a 404, and the caller drops the entry.
+ * every task to the recorded version itself, which holds exactly the bytes
+ * this file hashed, and a version keeps existing after head moves on. A
+ * version Open Cloud no longer serves answers with a 404, and the caller drops
+ * the entry.
  */
 export interface UploadCacheTarget {
 	/** Absolute path of the place file whose bytes were uploaded. */

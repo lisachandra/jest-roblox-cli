@@ -60,10 +60,10 @@ export function hardTeardown(child: StudioCliProcess | undefined, server: WebSoc
 /**
  * Wind a run down now that the result is in hand, decoupling teardown from it:
  * close the result server (so the bootstrap returns and `--quitAfterExecution`
- * begins a graceful `ClosePlace` that runs edit-mode `BindToClose` handlers and
- * frees the lock), then kill the instant the lock releases — skipping Studio's
- * ~30s telemetry drain. The watch is non-awaited, so results return now and the
- * process exits after teardown.
+ * begins a graceful `ClosePlace` that runs edit-mode `BindToClose` handlers
+ * and frees the lock), then kill the instant the lock releases — skipping
+ * Studio's ~30s telemetry drain. The watch is non-awaited, so results return
+ * now and the process exits after teardown.
  *
  * @param options - Teardown inputs.
  * @param options.child - The Studio process that answered.

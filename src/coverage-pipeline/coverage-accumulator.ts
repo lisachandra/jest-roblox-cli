@@ -104,8 +104,8 @@ interface ImplicitElse {
 /**
  * Gathers the records the probe inserter and coverage-map builder consume, and
  * owns the bookkeeping the collectors must not have to repeat: the 1-based
- * index allocation for each of the three counters, the wrap-probe sentinel, and
- * the 1..N `armIndex` pairing between a branch's arms and their probes.
+ * index allocation for each of the three counters, the wrap-probe sentinel,
+ * and the 1..N `armIndex` pairing between a branch's arms and their probes.
  */
 class CoverageAccumulator {
 	private readonly branches: Array<BranchInfo<LuauSpan>> = [];

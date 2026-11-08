@@ -49,10 +49,10 @@ export interface CoveragePlaceBundle {
  * Build the coverage-instrumented place **without running it** — the offline
  * half of the split producer. Instruments (incrementally) and rojo-builds the
  * place, bakes each project's `jest.config` stub into it so any runner that
- * opens the place can discover and run the suite unaided, publishes the sibling
- * Build + Coverage manifests, and hands back the place. No backend is resolved,
- * no suite executes, nothing hits the network. Coverage collection is forced on
- * regardless of the input config.
+ * opens the place can discover and run the suite unaided, publishes the
+ * sibling Build + Coverage manifests, and hands back the place. No backend is
+ * resolved, no suite executes, nothing hits the network. Coverage collection
+ * is forced on regardless of the input config.
  *
  * The counterpart to `prepareArtifacts`, minus the run and the Clean Place —
  * the entry point for a machine that cannot execute Roblox at all. It shares

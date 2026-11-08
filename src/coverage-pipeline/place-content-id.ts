@@ -52,11 +52,11 @@ type HashedFiles = Record<string, { sourceHash: string }>;
  *
  * Records are sorted, because the maps' own key order is the order the
  * instrumenter happened to walk in and says nothing about content. Sorting the
- * joined lines orders them by kind and then by path, because NUL is below every
- * character a path can carry. Parts are NUL-joined: a package-relative POSIX
- * path and a hex digest both carry no NUL, and neither is ever empty, so the
- * join is injective. The kind prefix keeps a probed record from aliasing an
- * unprobed one at the same path.
+ * joined lines orders them by kind and then by path, because NUL is below
+ * every character a path can carry. Parts are NUL-joined: a package-relative
+ * POSIX path and a hex digest both carry no NUL, and neither is ever empty, so
+ * the join is injective. The kind prefix keeps a probed record from aliasing
+ * an unprobed one at the same path.
  *
  * @param covering - The instrument step's record of what the place holds.
  * @returns The 64-character hex Place Content Id.

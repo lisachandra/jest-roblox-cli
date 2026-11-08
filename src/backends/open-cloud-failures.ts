@@ -14,7 +14,8 @@ export function isNotFoundError(err: unknown): boolean {
 }
 
 /**
- * Fail on a bundle that never reached Roblox, naming the cause and the way out.
+ * Fail on a bundle that never reached Roblox, naming the cause and the way
+ * out.
  *
  * `binaryInputs.create` is metered per key — five a minute, and the owner of a
  * key may be running several agents on it — so the client has already retried

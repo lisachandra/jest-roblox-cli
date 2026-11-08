@@ -66,8 +66,9 @@ export function createStubBake({
 }
 
 /**
- * The mirror keeps a user's `jest.config.lua` in the shadow, and rojo builds it
- * beside a `.luau` stub as a second `jest.config`, so the stub takes its name.
+ * The mirror keeps a user's `jest.config.lua` in the shadow, and rojo builds
+ * it beside a `.luau` stub as a second `jest.config`, so the stub takes its
+ * name.
  *
  * @param fileSystem - File system to read through.
  * @param mountedDirectory - Shadow directory the place mounts.

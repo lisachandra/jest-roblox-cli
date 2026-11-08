@@ -253,9 +253,9 @@ function enumerateFromGlobs({
 /**
  * The packages carrying a `jest.config.*`, whichever source found them.
  *
- * A package manager's list answers "what does it install", which in a repo with
- * libraries and fixtures is a much wider set than "what has tests" — a bare
- * `--workspace` would otherwise select every library in the repo.
+ * A package manager's list answers "what does it install", which in a repo
+ * with libraries and fixtures is a much wider set than "what has tests" — a
+ * bare `--workspace` would otherwise select every library in the repo.
  *
  * One sweep of the whole root rather than a `readdir` per package, riding the
  * walk that found the manifests: `cache` is declared for both leaves, so the

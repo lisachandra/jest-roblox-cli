@@ -2,8 +2,8 @@ import type { ExecErrorTestFileResult, TestFileResult } from "./jest-result-type
 
 /**
  * The synthetic path a suite that never ran is filed under. Jest names a file
- * result by the file it ran; a failure that happened before any file did has no
- * such name, so this stands in for one.
+ * result by the file it ran; a failure that happened before any file did has
+ * no such name, so this stands in for one.
  */
 export const EXEC_ERROR_FILE_PATH = "<exec-error>";
 

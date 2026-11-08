@@ -157,9 +157,9 @@ function bail(validationExitCode: 2, validationMessage?: string): WorkspaceRunRe
 }
 
 /**
- * `collectCoverage` is intentionally omitted: workspace coverage is per-package
- * (driven by each package's manifest), so there is no workspace-level flag to
- * surface the "Coverage enabled" subtitle.
+ * `collectCoverage` is intentionally omitted: workspace coverage is
+ * per-package (driven by each package's manifest), so there is no
+ * workspace-level flag to surface the "Coverage enabled" subtitle.
  *
  * @param options - CLI options, progress, run options and workspace root.
  * @param options.cli - Parsed command-line options; supplies `verbose`.
@@ -221,9 +221,9 @@ function resolveStreamingProgressSink({
 	}
 
 	/**
-	 * Through the reporter rather than stdout: a live stage block owns the last
-	 * lines on screen, so a bare write would land inside it and leave the next
-	 * repaint erasing this line in place of its own rows.
+	 * Through the reporter rather than stdout: a live stage block owns the
+	 * last lines on screen, so a bare write would land inside it and leave the
+	 * next repaint erasing this line in place of its own rows.
 	 *
 	 * @param entry - Streamed result entry of one package.
 	 */

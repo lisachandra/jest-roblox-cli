@@ -72,8 +72,8 @@ interface MirroredTree {
  *
  * One read serves both jobs. The hash decides whether the copy is needed, and
  * when it is, the bytes are already in hand — `copyFileSync` would open and
- * read the same file a second time. The directory above `shadowPath` belongs to
- * whichever pass owns the tree: the mirror walk creates every directory it
+ * read the same file a second time. The directory above `shadowPath` belongs
+ * to whichever pass owns the tree: the mirror walk creates every directory it
  * enters, and the spine mirror creates the level it is about to fill.
  *
  * Exported for that spine mirror, which copies the loose files of the

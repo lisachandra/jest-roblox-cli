@@ -8,10 +8,10 @@ export interface PlaceNode {
 }
 
 /**
- * An item's opening tag, its closing tag, or the `Name` property that names it.
- * Rojo writes an item's properties before its child items, so the first `Name`
- * after an open belongs to the item that opened; matching the property name
- * literally keeps every other string property out, whatever order the
+ * An item's opening tag, its closing tag, or the `Name` property that names
+ * it. Rojo writes an item's properties before its child items, so the first
+ * `Name` after an open belongs to the item that opened; matching the property
+ * name literally keeps every other string property out, whatever order the
  * serializer put them in.
  */
 const ITEM_TOKEN = /<Item\s+class="([^"]+)"[^>]*>|<\/Item>|<string name="Name">([^<]*)</g;

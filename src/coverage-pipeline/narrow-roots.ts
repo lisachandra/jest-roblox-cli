@@ -104,8 +104,8 @@ export function narrowLuauRoots(
 }
 
 /**
- * Every file the shadow would carry for this mount, mount-relative, and whether
- * the ignore list refused anything on the way.
+ * Every file the shadow would carry for this mount, mount-relative, and
+ * whether the ignore list refused anything on the way.
  *
  * The whole set, not just the probed half: the share the threshold reads is a
  * share of the copying, and a spec file or a `.meta.json` costs the same to
@@ -181,9 +181,9 @@ function collapseToMaximal(candidates: ReadonlySet<string>): Array<string> {
  * the rojo `$path` swap is directory-granular. Most of those files carry no
  * probes and are byte-identical to what the compiler already wrote, so the
  * mirror is the largest cost in a cold prepare. Deriving the roots from where
- * the universe resolves — rather than from the mount, or from the static prefix
- * of the globs — leaves the shadow holding the probed subtrees and the way down
- * to them.
+ * the universe resolves — rather than from the mount, or from the static
+ * prefix of the globs — leaves the shadow holding the probed subtrees and the
+ * way down to them.
  *
  * The universe is resolvable before anything is instrumented: the walk reads
  * directory entries only, and the universe gate reads source maps. So the
@@ -239,11 +239,11 @@ function narrowRootToUniverse(
  * Whether the place can be made to load every one of these roots.
  *
  * A root earns that from a `$path` mount landing on it — redirected outright —
- * or from one above it, which is demoted onto a spine copy instead. A root with
- * neither is instrumented into a shadow nothing mounts, which is coverage that
- * comes back empty with no sign of why. Narrowing gives that up rather than
- * risk it: the mount it started from was reachable by construction, so falling
- * back to it costs copying, not correctness.
+ * or from one above it, which is demoted onto a spine copy instead. A root
+ * with neither is instrumented into a shadow nothing mounts, which is coverage
+ * that comes back empty with no sign of why. Narrowing gives that up rather
+ * than risk it: the mount it started from was reachable by construction, so
+ * falling back to it costs copying, not correctness.
  *
  * The live way in is a rojo project this run could not read — a mount set it
  * cannot see is one it cannot demote against.

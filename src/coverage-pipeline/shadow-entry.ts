@@ -3,8 +3,8 @@ import { nodeFileSystem } from "../utils/file-system.ts";
 
 /**
  * The shadow's two entry makers: one for a directory, one for the path a file
- * is about to take. Both answer the same question — what already sits here, and
- * is it the wrong kind of thing?
+ * is about to take. Both answer the same question — what already sits here,
+ * and is it the wrong kind of thing?
  *
  * A source path that changed kind between runs leaves the warm shadow holding
  * last run's entry exactly where this run's has to go, in both directions. The
@@ -24,8 +24,8 @@ import { nodeFileSystem } from "../utils/file-system.ts";
 
 /**
  * Make one shadow directory, clearing a file that occupies its path. Returns
- * whether the shadow gained a directory it did not have — a warm run reads that
- * as "a directory appeared upstream" and rebuilds the place around it.
+ * whether the shadow gained a directory it did not have — a warm run reads
+ * that as "a directory appeared upstream" and rebuilds the place around it.
  *
  * One level only. Callers walk parent-first, so the chain above is already
  * judged by the time this reaches any level of it.

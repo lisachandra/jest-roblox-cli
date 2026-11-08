@@ -151,7 +151,7 @@ export function resolveWorkspaceBackend({
 
 	if (runOptions.backend === "emulator") {
 		throw new Error(
-			'--workspace is not supported by the emulator backend: it stages and runs ' +
+			"--workspace is not supported by the emulator backend: it stages and runs " +
 				"one repo's compiled output. Run per package instead.",
 		);
 	}

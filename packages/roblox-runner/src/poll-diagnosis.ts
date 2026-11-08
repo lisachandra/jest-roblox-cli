@@ -276,8 +276,8 @@ function describeSuspects(context: PollContext): Array<string> {
 /**
  * The state the last polled task was in, or `"unknown"`.
  *
- * `lastObservedTask` is `unknown` on the error type ocale hands back, and it is
- * absent entirely when the budget ran out before a single poll answered.
+ * `lastObservedTask` is `unknown` on the error type ocale hands back, and it
+ * is absent entirely when the budget ran out before a single poll answered.
  * `Object()` flattens both into something readable, so one fallback covers a
  * missing task and an unrecognised one alike.
  *

@@ -127,10 +127,10 @@ export type RunProjects = typeof runProjectsAsync;
  * project, so the Luau runner never re-resolves or shares format state across
  * projects (fixes the spike's snapshot-diff regression — C1).
  *
- * Every runtime script is built from these jobs, in both dispatch modes — multi
- * through `runProjectsAsync` above, workspace through the materializer payload
- * (`buildMaterializerInputs`), which resolves its entries here before it
- * freezes the script. Per-project config resolution belongs in this one
+ * Every runtime script is built from these jobs, in both dispatch modes —
+ * multi through `runProjectsAsync` above, workspace through the materializer
+ * payload (`buildMaterializerInputs`), which resolves its entries here before
+ * it freezes the script. Per-project config resolution belongs in this one
  * function for that reason: resolve a field anywhere downstream of the payload
  * and it reaches multi mode only. `buildTestPlan` builds its jobs here too, so
  * the multi-mode stubs bake the same config.

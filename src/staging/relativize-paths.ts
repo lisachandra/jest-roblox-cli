@@ -7,8 +7,8 @@ import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
 import { readDeclaredGlobIgnorePaths } from "./glob-ignore.ts";
 
 /**
- * Rewrite every `$path` in a synthesized project so it is expressed relative to
- * the directory the project file is written to.
+ * Rewrite every `$path` in a synthesized project so it is expressed relative
+ * to the directory the project file is written to.
  *
  * Rojo matches `globIgnorePaths` against each candidate path *as the project
  * expresses it*, so an absolute `$path` silently disables the ignore list for

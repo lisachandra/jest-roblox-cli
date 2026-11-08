@@ -1,10 +1,10 @@
 import { matchesGlobPattern } from "../utils/glob.ts";
 
 /**
- * Subtract files matching any `excludeGlobs` pattern. Pure string-glob matching
- * against each file path — no filesystem access — so the caller owns the path
- * namespace: the globs must be written to match the same relative paths
- * discovery returns. Returns the input untouched when `excludeGlobs` is
+ * Subtract files matching any `excludeGlobs` pattern. Pure string-glob
+ * matching against each file path — no filesystem access — so the caller owns
+ * the path namespace: the globs must be written to match the same relative
+ * paths discovery returns. Returns the input untouched when `excludeGlobs` is
  * undefined or empty.
  *
  * @param files - Paths to filter.

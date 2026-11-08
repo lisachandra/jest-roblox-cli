@@ -8,8 +8,8 @@ import istanbulHtmlAssets from "virtual:istanbul-html-assets";
 export type HtmlAssetGroup = keyof typeof istanbulHtmlAssets;
 
 /**
- * What istanbul's html reporter prepends to each `.js` asset it copies, kept so
- * a report directory linted by its consumer reads the same either way.
+ * What istanbul's html reporter prepends to each `.js` asset it copies, kept
+ * so a report directory linted by its consumer reads the same either way.
  */
 const JS_ASSET_HEADER = "/* eslint-disable */\n";
 

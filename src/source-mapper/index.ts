@@ -32,10 +32,10 @@ export interface MappedLocation {
 /**
  * Rewrites Luau stack frames to the sources they came from.
  *
- * Not pure: `resolveTestFilePath` (and so `resolveDisplayPath`, which calls it)
- * touches the filesystem — a DataModel path with no tsconfig mapping is probed
- * on disk as `.luau` then `.lua`. `mapFailureWithLocations` reads source maps
- * and TS sources off disk too.
+ * Not pure: `resolveTestFilePath` (and so `resolveDisplayPath`, which calls
+ * it) touches the filesystem — a DataModel path with no tsconfig mapping is
+ * probed on disk as `.luau` then `.lua`. `mapFailureWithLocations` reads
+ * source maps and TS sources off disk too.
  */
 export interface SourceMapper {
 	/** Rewrite each resolvable frame in a failure message and list them. */

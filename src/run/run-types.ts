@@ -89,9 +89,9 @@ export interface MultiRunResult extends PreDispatchTiming {
 	/** Producer record for the entry point to emit a Build Manifest from. */
 	coverageArtifacts?: CoverageArtifacts | undefined;
 	/**
-	 * Narrows the agent coverage **text table** to the directly-filtered source
-	 * files on a filtered run (positional files / `--testPathPattern`, or the
-	 * selected `--project` scope). Display-only: thresholds, totals, and
+	 * Narrows the agent coverage **text table** to the directly-filtered
+	 * source files on a filtered run (positional files / `--testPathPattern`, or
+	 * the selected `--project` scope). Display-only: thresholds, totals, and
 	 * lcov/html/json keep the full universe. Undefined on a full run.
 	 */
 	coverageDisplayFilter?: CoverageDisplayPredicate | undefined;
@@ -170,8 +170,8 @@ export interface WorkspaceRunResult extends PreDispatchTiming {
 	 */
 	coveragePackages?: Array<WorkspacePackageCoverageGate> | undefined;
 	/**
-	 * Consensus-resolved Aggregated Game Output path the runner wrote (if any).
-	 * Surfaced so formatters point "View …" hints at the file that exists,
+	 * Consensus-resolved Aggregated Game Output path the runner wrote (if
+	 * any). Surfaced so formatters point "View …" hints at the file that exists,
 	 * rather than the workspace-root `config.gameOutput` (which the runner does
 	 * not consult).
 	 */
@@ -188,8 +188,8 @@ export interface WorkspaceRunResult extends PreDispatchTiming {
 	 * Render settings for the output layer. Absent on every result that never
 	 * reached the runner — a validation bail, no affected packages, a run that
 	 * tested nothing — each of which dispatch returns before the output layer
-	 * sees it, on `validationExitCode` or on having neither project results nor
-	 * a Type Test result.
+	 * sees it, on `validationExitCode` or on having neither project results nor a
+	 * Type Test result.
 	 */
 	reportOptions?: undefined | WorkspaceReportOptions;
 	/** Type Test result; absent when no type tests ran. */

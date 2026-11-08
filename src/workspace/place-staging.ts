@@ -41,16 +41,16 @@ export interface StagedWorkspacePlace {
 	/** Coverage per instrumented package, for the report layer. */
 	coverageByPackage: Map<string, WorkspacePackageCoverage>;
 	/**
-	 * Host time spent instrumenting the packages that opted into coverage — the
-	 * phase multi reports as its coverage bake. 0 when no package opted in, so
-	 * a run that collected no coverage reports no coverage time.
+	 * Host time spent instrumenting the packages that opted into coverage —
+	 * the phase multi reports as its coverage bake. 0 when no package opted in,
+	 * so a run that collected no coverage reports no coverage time.
 	 */
 	coverageMs: number;
 	/** Path of the synthesized place file. */
 	placeFile: string;
 	/**
-	 * Host time spent on the rest of the staging: the stubs and the rojo build,
-	 * which a run pays whether or not it collects coverage.
+	 * Host time spent on the rest of the staging: the stubs and the rojo
+	 * build, which a run pays whether or not it collects coverage.
 	 */
 	stagingMs: number;
 }
@@ -84,8 +84,8 @@ export interface StageWorkspacePlaceOptions {
 /**
  * Instruments the packages that opted into coverage, stages every live
  * project's `jest.config` stub, and builds the one synthesized place the whole
- * workspace run dispatches against. The coverage map rides back out because the
- * report layer needs each package's manifest once the results land.
+ * workspace run dispatches against. The coverage map rides back out because
+ * the report layer needs each package's manifest once the results land.
  *
  * Each phase times itself, and the caller opens the dispatch window only after
  * this returns — exactly as multi opens its window after its own staging. See

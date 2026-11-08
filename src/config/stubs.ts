@@ -92,8 +92,8 @@ export function assertMountContained({
 }
 
 /**
- * `jest.config` stub mounts for a place build: one `$path` named-child per rojo
- * mount, pointing at the cache stub.
+ * `jest.config` stub mounts for a place build: one `$path` named-child per
+ * rojo mount, pointing at the cache stub.
  *
  * @param options - Cache root and projects.
  * @param options.cacheRoot - Directory that holds the generated stubs.

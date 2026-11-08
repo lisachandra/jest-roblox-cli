@@ -15,9 +15,9 @@ const TSCONFIG_FILENAME = /^tsconfig.*\.json$/i;
  *
  * Same reason as `FileSystem` in `../utils/file-system.ts`: `get-tsconfig` is
  * an externalized dependency that reads through a `node:fs` binding of its
- * own, and `vi.mock` of one holds only while no earlier file in the same worker
- * evaluated it unmocked — a guarantee Vitest gives with process isolation and
- * takes away without it.
+ * own, and `vi.mock` of one holds only while no earlier file in the same
+ * worker evaluated it unmocked — a guarantee Vitest gives with process
+ * isolation and takes away without it.
  */
 export type TsconfigReader = typeof getTsconfig;
 

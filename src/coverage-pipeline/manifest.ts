@@ -71,8 +71,8 @@ export interface TestRecord {
 	/**
 	 * Where the test is declared, in the coordinates of the file
 	 * `testFileSourceHash` hashes: the TypeScript line when the test file has a
-	 * source map, the Luau line otherwise. The column is always 0, as Luau
-	 * frames carry none. Absent when the runtime could not read the call site.
+	 * source map, the Luau line otherwise. The column is always 0, as Luau frames
+	 * carry none. Absent when the runtime could not read the call site.
 	 */
 	location?: TestLocation;
 	/** Full test name (describe chain + leaf `it`). */
@@ -109,17 +109,17 @@ export interface CoverageManifest {
 	 * What the Code Mount split would emit for the place beside this manifest:
 	 * its pass version and the Code Roots it ran over, or absent for a place
 	 * built whole. The incremental cache rebuilds on a mismatch, which is what
-	 * keeps a harness built by an older split rule — or by a run that shipped
-	 * its code differently — from being handed out as current. Absent on
-	 * manifests written before this field existed, which reads as a whole-place
-	 * build and so rebuilds for the first harness run.
+	 * keeps a harness built by an older split rule — or by a run that shipped its
+	 * code differently — from being handed out as current. Absent on manifests
+	 * written before this field existed, which reads as a whole-place build and
+	 * so rebuilds for the first harness run.
 	 */
 	codeSplitKey?: string | undefined;
 	/**
 	 * Digest of the `coverageCopyIgnorePatterns` that decided what this shadow
-	 * carries, per `hashCopyIgnorePatterns`. The incremental cache rebuilds on
-	 * a mismatch: a widened list demotes a file the shadow already holds while
-	 * its source hash stays put, exactly as a narrowed universe does. Absent on
+	 * carries, per `hashCopyIgnorePatterns`. The incremental cache rebuilds on a
+	 * mismatch: a widened list demotes a file the shadow already holds while its
+	 * source hash stays put, exactly as a narrowed universe does. Absent on
 	 * manifests written before this field existed, which reads as changed and
 	 * repopulates it on the next run.
 	 */

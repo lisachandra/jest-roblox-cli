@@ -128,8 +128,9 @@ export interface FormatterProjectEntry {
 }
 
 /**
- * Running numbering for the detailed-failure blocks. Mutated as each failure is
- * rendered, so it is passed by reference across projects to keep one sequence.
+ * Running numbering for the detailed-failure blocks. Mutated as each failure
+ * is rendered, so it is passed by reference across projects to keep one
+ * sequence.
  */
 export interface FailureContext {
 	/**

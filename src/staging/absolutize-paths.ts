@@ -201,7 +201,8 @@ function spineChildNode(absoluteTarget: string, options: AbsolutizeOptions): Roj
  * mount's `$path` onto a spine directory holding that directory's own loose
  * files — which is what keeps an `init.luau`, a `.meta.json` and every
  * extension rojo mounts for itself working — and promotes each directory
- * beneath it to an explicit child, pointed at the shadow or back at the source.
+ * beneath it to an explicit child, pointed at the shadow or back at the
+ * source.
  *
  * A name the project already declares is left alone: it is the author's node,
  * and rojo would build both.

@@ -40,8 +40,8 @@ const CACHE_DIR = path.join(".jest-roblox", "cache");
 
 /**
  * Everything a consumer (mutation-tester, `flux`) needs from one artifact-
- * production run: the two distinct places, the coverage hit data, and the paths
- * of the sibling manifests, all sharing one `buildId`.
+ * production run: the two distinct places, the coverage hit data, and the
+ * paths of the sibling manifests, all sharing one `buildId`.
  */
 export interface ArtifactBundle {
 	/** Build id shared by both places and the sibling manifests. */
@@ -147,8 +147,9 @@ function requireCoverageArtifacts(
 
 /**
  * The manifest the instrument step published for this run. Unreadable is a
- * fault rather than a degraded bundle: it is what the Place Content Id is taken
- * over, and a place stamped from anything less proves less than it claims.
+ * fault rather than a degraded bundle: it is what the Place Content Id is
+ * taken over, and a place stamped from anything less proves less than it
+ * claims.
  *
  * @param manifestPath - Where the instrument step wrote it.
  * @param fileSystem - File system to read it from.

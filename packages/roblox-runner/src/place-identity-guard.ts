@@ -13,17 +13,18 @@
  * `__NAME__` shape callers use for template placeholders, so a later
  * placeholder pass cannot rewrite a guard already baked into a script.
  *
- * Exported for the one question {@link placeIdentityGuardSource} cannot answer:
- * whether a script carries a guard at all. Asserting the absence of one
- * particular guard's text passes on a script guarding something else.
+ * Exported for the one question {@link placeIdentityGuardSource} cannot
+ * answer: whether a script carries a guard at all. Asserting the absence of
+ * one particular guard's text passes on a script guarding something else.
  */
 export const PLACE_MISMATCH = "ROBLOX_RUNNER_PLACE_MISMATCH";
 
 /**
  * Instance name the place build stamps its Place Content Id under, a
  * `StringValue` child of {@link PLACE_CONTENT_ID_SERVICE}. Spelled here rather
- * than at the build because this package owns the guard that reads it back: the
- * two spellings are one contract, and only one of them ships inside the place.
+ * than at the build because this package owns the guard that reads it back:
+ * the two spellings are one contract, and only one of them ships inside the
+ * place.
  */
 export const PLACE_CONTENT_ID_NAME = "__place_content_id";
 
@@ -55,9 +56,9 @@ export type ExpectedPlaceIdentity =
 	  };
 
 /**
- * What a Luau double-quoted literal cannot carry: the quote that would close it
- * early, the escape that would change what follows, and the line breaks that
- * would end the statement.
+ * What a Luau double-quoted literal cannot carry: the quote that would close
+ * it early, the escape that would change what follows, and the line breaks
+ * that would end the statement.
  */
 const UNSAFE_IN_LITERAL_PATTERN = /["\\\n\r]/u;
 
@@ -78,24 +79,24 @@ export function formatPlaceMismatch(bootedVersion: number): string {
 
 /**
  * The guard, as one Luau statement: a task that booted anything other than the
- * place the host published names the version it did boot and returns instead of
- * running, so the host can relaunch that one task pinned.
+ * place the host published names the version it did boot and returns instead
+ * of running, so the host can relaunch that one task pinned.
  *
  * A stamped place is judged on the stamp alone. The stamp *is* the build, so
  * two places carrying it are interchangeable to a task however their version
  * numbers differ — which is what stops a second checkout of one commit, whose
  * own publish mints its own number, from refusing a place holding exactly the
  * build this run collected. An absent stamp is a mismatch rather than a
- * fallback to the version: every place a stamping run uploads carries one, so a
- * place without it is some other build. The class is checked before `Value` is
- * read, because `FindFirstChild` returns whatever holds the name — reading
+ * fallback to the version: every place a stamping run uploads carries one, so
+ * a place without it is some other build. The class is checked before `Value`
+ * is read, because `FindFirstChild` returns whatever holds the name — reading
  * `Value` off a `Folder` raises, and a task that raises is a lost result the
  * pool relaunches rather than a refusal the host can pin against.
  *
  * Given a version instead, the version is all there is to compare. It proves
  * the place is the object this run's upload made, which is as much as a caller
- * that did not build the place can ask for — and no more, since the same upload
- * of a stale file mints a version too.
+ * that did not build the place can ask for — and no more, since the same
+ * upload of a stale file mints a version too.
  *
  * One statement, so a caller may splice it wherever its own script permits:
  * after a directive header it does not own, or behind a placeholder in a

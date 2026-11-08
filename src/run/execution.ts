@@ -330,11 +330,11 @@ async function buildDispatchPlaceAsync({
  * Build the place a non-coverage run dispatches against, for a backend whose
  * `placeInput` is `built`, and report how long it took.
  *
- * Timed rather than merely elapsed-through: the build lands before the dispatch
- * window opens, so its cost falls outside every phase the backend measures. A
- * coverage run builds nothing here — `prepareCoverage` already built the
- * instrumented place, and `stageRun` charged that build to staging too, so the
- * two paths report the same phase under the same name.
+ * Timed rather than merely elapsed-through: the build lands before the
+ * dispatch window opens, so its cost falls outside every phase the backend
+ * measures. A coverage run builds nothing here — `prepareCoverage` already
+ * built the instrumented place, and `stageRun` charged that build to staging
+ * too, so the two paths report the same phase under the same name.
  *
  * @param input - Backend, Code Roots, discovery and staging products.
  * @param input.backend - Backend whose `placeInput` decides the build.

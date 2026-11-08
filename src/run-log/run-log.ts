@@ -18,8 +18,8 @@ export interface RunLogOptions {
 
 /**
  * A standard stream as the log touches it: `write` is swapped out and back,
- * nothing else. The trailing arguments — an encoding, a callback — pass through
- * unnamed.
+ * nothing else. The trailing arguments — an encoding, a callback — pass
+ * through unnamed.
  */
 interface RunLogStream {
 	/** Write a chunk; the log swaps it out for the run and back after. */

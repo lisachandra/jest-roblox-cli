@@ -6,9 +6,9 @@ import { descendants, nodeAt, readPlaceTree } from "#test/e2e/cli/place-tree.ts"
 
 /**
  * The staged-tree fix has no unit seam that can prove it: whether a class the
- * engine pins reaches the place depends on what rojo reads out of a model file,
- * which only a real `rojo build` decides. So this drives one, then walks the
- * built place and asserts on where the classes landed.
+ * engine pins reaches the place depends on what rojo reads out of a model
+ * file, which only a real `rojo build` decides. So this drives one, then walks
+ * the built place and asserts on where the classes landed.
  */
 
 const PINNED_CLASSES = new Set([

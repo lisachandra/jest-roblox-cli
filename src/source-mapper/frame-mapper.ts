@@ -63,9 +63,9 @@ export function createFrameMapper(
 
 /**
  * Builds the function that turns a Luau line of a test file into the line of
- * its source. Shares the frame mapper's path chain up to the `.luau` path, then
- * asks the source map for the first mapping on that line rather than an exact
- * column, because the runtime reports test call sites without one.
+ * its source. Shares the frame mapper's path chain up to the `.luau` path,
+ * then asks the source map for the first mapping on that line rather than an
+ * exact column, because the runtime reports test call sites without one.
  *
  * @param context - The resolver, source-map reader and filesystem to walk.
  * @returns A mapper giving the source line, the Luau line itself for a file

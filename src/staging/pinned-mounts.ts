@@ -47,10 +47,10 @@ export const PINNED_MOUNT_PASS_VERSION = 1;
 const PINNED_XML_CLASS = /(<Item\s+class=")([^"]+)(")/g;
 /**
  * An item's own properties — the block between its opening tag and its first
- * child `Item`, which is what the non-greedy match stops at. Keyed on the class
- * still written in the file, so it has to run BEFORE the class fold: once every
- * pinned class reads `Folder`, nothing tells a rewritten item apart from a
- * Folder the consumer authored, and stripping would reach both.
+ * child `Item`, which is what the non-greedy match stops at. Keyed on the
+ * class still written in the file, so it has to run BEFORE the class fold:
+ * once every pinned class reads `Folder`, nothing tells a rewritten item apart
+ * from a Folder the consumer authored, and stripping would reach both.
  */
 const CLASSED_PROPERTIES =
 	/(<Item\s+class="([^"]+)"[^>]*>\s*<Properties>)([\s\S]*?)(<\/Properties>)/g;

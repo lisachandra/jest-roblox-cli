@@ -6,7 +6,7 @@ import type { EmulatorStageMapping } from "./emulator-stage.ts";
 
 /**
  * Overwrites the staged Luau files with their coverage-instrumented twins so
- * the run collects probe hits. ree mounts directories, so a twin must sit at
+ * the run collects probe hits. Ree mounts directories, so a twin must sit at
  * the exact staged path its original occupies — legal because the
  * instrumenter keeps twins line-for-line aligned with their originals, which
  * leaves every Instance path and source map valid.
@@ -15,6 +15,7 @@ import type { EmulatorStageMapping } from "./emulator-stage.ts";
  * executes, and the report step reports the empty coverage like the Studio
  * lanes do.
  *
+ * @param root0
  * @returns The number of twins applied.
  */
 export function applyCoverageTwins({
@@ -62,6 +63,7 @@ export function applyCoverageTwins({
  * Reads the manifest's `files` records, warning when the coverage staging did
  * not leave a usable manifest behind.
  *
+ * @param manifestPath
  * @returns The file records, or undefined when the manifest is absent/malformed.
  */
 function readManifestFiles(manifestPath: string): Record<string, unknown> | undefined {
@@ -93,6 +95,7 @@ function readManifestFiles(manifestPath: string): Record<string, unknown> | unde
 /**
  * Resolves the staged path of an original file by longest-prefix mount match.
  *
+ * @param root0
  * @returns The staged path, or undefined when no mount owns the file.
  */
 function stagedPathFor({
@@ -119,7 +122,11 @@ function stagedPathFor({
 	return undefined;
 }
 
-/** The record's string field, or undefined when absent or mistyped. */
+/**
+ * The record's string field, or undefined when absent or mistyped.
+ * @param record
+ * @param field
+ */
 function recordString(record: unknown, field: string): string | undefined {
 	if (typeof record !== "object" || record === null || !(field in record)) {
 		return undefined;

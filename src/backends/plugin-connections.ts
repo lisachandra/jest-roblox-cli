@@ -85,10 +85,10 @@ export type PluginSelection =
  * A Studio with several `JestRobloxRunner` copies installed opens one socket
  * per copy, so "the plugin" is a selection rather than a given: the pool
  * records each connection's announcement and hands back the one whose protocol
- * matches. Dispatching to an unselected socket is what used to let a stale copy
- * lose the run for a Studio that also had a working one — a stale copy refuses
- * instantly while the working copy is still running the suite, so its refusal
- * always won the race.
+ * matches. Dispatching to an unselected socket is what used to let a stale
+ * copy lose the run for a Studio that also had a working one — a stale copy
+ * refuses instantly while the working copy is still running the suite, so its
+ * refusal always won the race.
  */
 export class PluginConnectionPool {
 	private readonly candidates = new Map<WebSocket, PluginCandidate>();
@@ -286,8 +286,8 @@ export function closePluginServer(wss: WebSocketServer): void {
 }
 
 /**
- * The error text for a Studio whose plugins cannot serve this CLI: what the CLI
- * needs, what each connection reported, and what to do about it.
+ * The error text for a Studio whose plugins cannot serve this CLI: what the
+ * CLI needs, what each connection reported, and what to do about it.
  *
  * Names every connection rather than just the first, because the case this
  * exists for is several installed copies — knowing only that "a plugin is

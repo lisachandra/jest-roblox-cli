@@ -24,8 +24,8 @@ const PUBLISH_SCOPE = "universe-messaging-service:publish";
  * Open Cloud Luau Execution task, which can subscribe to it with
  * `MessagingService:SubscribeAsync` (measured: a task reaches a published
  * message in ~1s, and the engine call is not sandboxed away). The SDK has no
- * messaging operation, so this goes through the raw {@link HttpClient} seam the
- * same way `flushMemoryStoreAsync` does.
+ * messaging operation, so this goes through the raw {@link HttpClient} seam
+ * the same way `flushMemoryStoreAsync` does.
  *
  * Throws on any failure. Open Cloud guarantees no delivery, so a caller may
  * well shrug one off — but that is the caller's call to make. A refused key has

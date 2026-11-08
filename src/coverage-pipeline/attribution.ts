@@ -77,9 +77,9 @@ export function harvestAttribution({
 /**
  * Write an attribution result into a coverage manifest: set `tests[]` and
  * place each file's per-statement `coveringTestIds` and `staticStatementIds`
- * on its record. Attribution for a file absent from the manifest (for example a
- * covered helper outside the report universe) is dropped — the manifest's file
- * set stays the source of truth.
+ * on its record. Attribution for a file absent from the manifest (for example
+ * a covered helper outside the report universe) is dropped — the manifest's
+ * file set stays the source of truth.
  *
  * Every record drops both attribution fields before either is written, so what
  * a record carries always comes from one harvest. A warm shadow carries an

@@ -23,7 +23,8 @@ const NON_INSTRUMENTED_SUFFIXES = [
 /**
  * The `coverageCopyIgnorePatterns` gate, over paths relative to the compiled
  * root. One matcher answers for the whole shadow — the walks and the reconcile
- * — so a pattern cannot mean one thing on a cold run and another on a warm one.
+ * — so a pattern cannot mean one thing on a cold run and another on a warm
+ * one.
  */
 export type CopyIgnoreMatcher = (relativePath: string) => boolean;
 
@@ -54,9 +55,9 @@ export interface WalkFilter {
 	/** Collect a file when true. Receives the entry's own name. */
 	accept: (name: string) => boolean;
 	/**
-	 * Called for every directory the walk descends into, with its path relative
-	 * to the walk root. A directory carries no file to collect, so this is the
-	 * only way a caller mirroring the tree learns an empty one exists.
+	 * Called for every directory the walk descends into, with its path
+	 * relative to the walk root. A directory carries no file to collect, so this
+	 * is the only way a caller mirroring the tree learns an empty one exists.
 	 */
 	onDirectory?: ((relativePath: string) => void) | undefined;
 	/**
@@ -199,6 +200,7 @@ export function discoverRootFiles(
  * @param entry - The entry, as read.
  * @returns True when the entry resolves to a directory.
  */
+// eslint-disable-next-line better-max-params/better-max-params -- the three inputs are already the minimum: a stat target, its container, and the entry.
 function isDirectoryEntry(
 	fileSystem: FileSystem,
 	directory: string,
@@ -247,8 +249,8 @@ function walkFrom({
 			}
 
 			// A junction can point back up the tree, and following one would walk
-			// forever. Keyed on the resolved path, so the same directory reached by
-			// two names is still descended into once.
+			// forever. Keyed on the resolved path, so the same directory reached
+			// by two names is still descended into once.
 			const childDirectory = `${directory}/${entry.name}`;
 			const seen = visited ?? new Set<string>();
 			if (entry.isSymbolicLink()) {

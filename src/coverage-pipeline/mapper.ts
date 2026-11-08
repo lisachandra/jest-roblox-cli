@@ -36,10 +36,10 @@ export type CoverageMapper = typeof mapCoverageToTypeScript;
 type TraceMapFactory = (rawSourceMap: string) => PositionResolver;
 
 /**
- * Thrown when a coverage map sidecar is present on disk but cannot be parsed or
- * validated. Silently skipping these files would let coverage thresholds pass
- * on incomplete data — the exact silent-breakage failure mode this guard is
- * meant to eliminate.
+ * Thrown when a coverage map sidecar is present on disk but cannot be parsed
+ * or validated. Silently skipping these files would let coverage thresholds
+ * pass on incomplete data — the exact silent-breakage failure mode this guard
+ * is meant to eliminate.
  */
 class CoverageMapMalformedError extends Error {
 	public readonly coverageMapPath: string;

@@ -38,10 +38,10 @@ export interface WorkspaceRunnerOutput {
 
 /**
  * Outcome of the workspace Type Test pass: the aggregate `outcome` (the merged
- * result + timing the existing sinks consume) plus `byPackage`, the merged Type
- * Test result keyed by package name. The per-package result files write each
- * package's result under every project that owns Type Tests, so they need the
- * split the aggregate has already collapsed.
+ * result + timing the existing sinks consume) plus `byPackage`, the merged
+ * Type Test result keyed by package name. The per-package result files write
+ * each package's result under every project that owns Type Tests, so they need
+ * the split the aggregate has already collapsed.
  */
 export interface WorkspaceTypecheckPass {
 	/** Merged Type Test result per package name. */

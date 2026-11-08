@@ -2,6 +2,7 @@ import { collectMounts, loadRojoProject, type Mount } from "@isentinel/rojo-util
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import process from "node:process";
 
 import color from "tinyrainbow";
 
@@ -69,8 +70,9 @@ interface NestedProject {
 
 /**
  * Builds the stage. Returns the effective mounts; callers derive harness
- * mounts from `mappings` (one `--mount <dataModelPath>=<stage>/<dataModelPath>`
- * per entry) and resolve setup files through them.
+ * mounts from `mappings` (one `--mount
+ * <dataModelPath>=<stage>/<dataModelPath>` per entry) and resolve setup files
+ * through them.
  *
  * @param options - Project path, stage directory and reflection dump path.
  * @returns The stage root and effective mappings.
@@ -201,9 +203,8 @@ function copyDeref(source: string, destination: string): void {
 			listing.push(`  …and ${omitted.toString()} more`);
 		}
 
-		process.stderr.write(
-			`${color.dim(`Staged without ${dropped.length.toString()} unresolvable link(s) under ${realSource}:`)}\n${listing.join("\n")}\n`,
-		);
+		const headline = `Staged without ${dropped.length.toString()} unresolvable link(s) under ${realSource}:`;
+		process.stderr.write(`${color.dim(headline)}\n${listing.join("\n")}\n`);
 	}
 }
 

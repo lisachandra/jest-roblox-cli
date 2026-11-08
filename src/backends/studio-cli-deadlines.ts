@@ -152,11 +152,11 @@ export function startNilReturnRelay({
  * The tail of Studio's own engine log, or nothing when it holds nothing worth
  * printing.
  *
- * Studio's stdio is discarded (see `spawnStudio`), so `--outputFile` is
- * the only channel that survives a run the result socket never answered. It is
- * not a guarantee: a place Studio cannot open stops behind a modal dialog with
- * only the echoed bootstrap flushed, which is exactly why the timeout names the
- * file as well as quoting it.
+ * Studio's stdio is discarded (see `spawnStudio`), so `--outputFile` is the
+ * only channel that survives a run the result socket never answered. It is not
+ * a guarantee: a place Studio cannot open stops behind a modal dialog with
+ * only the echoed bootstrap flushed, which is exactly why the timeout names
+ * the file as well as quoting it.
  *
  * @param fileSystem - File system the log is read through.
  * @param outputFile - Path Studio was told to log to.

@@ -38,9 +38,9 @@ export interface TaskPoolBackoff {
 	 * Index into {@link TaskPoolOptions.places} of the place the slot was
 	 * launching on. Only a `place-full` wait says that place is under pressure:
 	 * the creation budget a 429 refuses is scoped to the key and host, so a
-	 * rate-limited slot names the destination it attempted and nothing about
-	 * the place itself. Summing the two per place reads a global limit as a
-	 * local one.
+	 * rate-limited slot names the destination it attempted and nothing about the
+	 * place itself. Summing the two per place reads a global limit as a local
+	 * one.
 	 */
 	placeIndex: number;
 	/** The slot that waited, numbered as {@link TaskPoolOptions.onResult}'s. */
@@ -79,9 +79,9 @@ export interface TaskPoolOptions {
 	 */
 	isDone: () => boolean;
 	/**
-	 * Whether the `liveTasks` cover the remaining work. While true, a free slot
-	 * waits for a live task to return before it launches. Never asked with no
-	 * task live.
+	 * Whether the `liveTasks` cover the remaining work. While true, a free
+	 * slot waits for a live task to return before it launches. Never asked with
+	 * no task live.
 	 */
 	isWorkCovered?: (liveTasks: number) => boolean;
 	/**
@@ -94,8 +94,8 @@ export interface TaskPoolOptions {
 	 */
 	onBackoff?: (event: TaskPoolBackoff) => void;
 	/**
-	 * Observe a task failure the pool does not back off on, carrying the {@link
-	 * TaskPoolOptions.onResult} slot index.
+	 * Observe a task failure the pool does not back off on, carrying the
+	 * {@link TaskPoolOptions.onResult} slot index.
 	 */
 	onError?: (error: Error, slot: number) => void;
 	/**

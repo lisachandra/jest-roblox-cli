@@ -6,6 +6,9 @@ coverage/
 reports/
 projectStructure.cache.json
 *.tsbuildinfo
+# Local scratch. The e2e fixtures use `.jest-roblox/` for their own state, so
+# only the root `.tmp/` is ignored.
+/.tmp/
 *.rbxl
 !test/e2e/fixtures/live-place/game.rbxl
 *.rbxl.lock

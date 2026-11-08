@@ -6,8 +6,8 @@ import { nodeFileSystem } from "./file-system.ts";
 import { hashFileAsync } from "./hash.ts";
 
 /**
- * Content digests for a file walk, carried between runs so an untouched tree is
- * stat'd rather than re-read.
+ * Content digests for a file walk, carried between runs so an untouched tree
+ * is stat'd rather than re-read.
  */
 export interface InputDigestCache {
 	/**
@@ -57,16 +57,16 @@ const FIELD_COUNT = 4;
  * lands between them does get recorded, against the stat the file had first —
  * and can then never be matched, because the file now carries the writer's
  * newer stamp instead. The entry is dead on arrival rather than wrong, and the
- * next run reads. Re-stat'ing after the read would move that entry from dead to
- * absent and change nothing else, at the price of a second stat per file.
+ * next run reads. Re-stat'ing after the read would move that entry from dead
+ * to absent and change nothing else, at the price of a second stat per file.
  *
  * Three cases survive. A deliberately restored timestamp (`touch -r`, an
  * archive unpacked with times preserved) over same-length content. On a mount
  * whose timestamps are coarse — FAT, some network shares — two same-length
  * writes that fall in one tick, since the guard cannot see below the stamp's
- * own resolution. And a mount whose clock lags the host's, where a write during
- * the run still stamps older than `openedAtMs`. Nothing here is free; a caller
- * that cannot afford any of them should hash the bytes itself.
+ * own resolution. And a mount whose clock lags the host's, where a write
+ * during the run still stamps older than `openedAtMs`. Nothing here is free; a
+ * caller that cannot afford any of them should hash the bytes itself.
  *
  * `cacheFile` need not exist; an absent, unreadable or foreign-format record
  * reads as "nothing known", which costs a full re-read and no correctness.

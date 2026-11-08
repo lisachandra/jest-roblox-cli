@@ -16,10 +16,11 @@ type OptionalCountKey = "filesRemoved" | "unchecked";
 type RequiredCountKey = "added" | "matched" | "total" | "unmatched" | "updated";
 
 /**
- * Folds the counters, `startTime`, `success`, and `testResults` shared by every
- * Jest-result merge in the CLI. The multi-project merge (`output.ts`) and the
- * multi-project formatter both fold the same eight fields the same way; keeping
- * one implementation means a new result dimension lands in both at once.
+ * Folds the counters, `startTime`, `success`, and `testResults` shared by
+ * every Jest-result merge in the CLI. The multi-project merge (`output.ts`)
+ * and the multi-project formatter both fold the same eight fields the same
+ * way; keeping one implementation means a new result dimension lands in both
+ * at once.
  *
  * @param results - Per-project Jest results.
  * @returns Summed counters, earliest `startTime`, joint `success` and all test

@@ -10,7 +10,8 @@ const DEFAULT_SLOW_TEST_THRESHOLD_MS = 300;
 export type ColorFunc = (text: string) => string;
 
 /**
- * Color functions every formatter paints through, plus the slow-test threshold.
+ * Color functions every formatter paints through, plus the slow-test
+ * threshold.
  */
 export interface Styles {
 	/**

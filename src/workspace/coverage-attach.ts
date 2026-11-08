@@ -18,11 +18,12 @@ import type { PackageContext } from "./project-contexts.ts";
 export type PrepareCoverage = typeof prepareWorkspaceCoverage;
 
 /**
- * Everything a package's coverage report and gate are built from, read off that
- * package's own resolved config. A workspace run has no config of its own — the
- * file at the invocation directory is bootstrap only — so these values are the
- * whole story for the package: the universe it reports, where the report lands,
- * which reporters render it, and the threshold it is judged against.
+ * Everything a package's coverage report and gate are built from, read off
+ * that package's own resolved config. A workspace run has no config of its own
+ * — the file at the invocation directory is bootstrap only — so these values
+ * are the whole story for the package: the universe it reports, where the
+ * report lands, which reporters render it, and the threshold it is judged
+ * against.
  */
 export interface PackageCoverageSettings {
 	/** Package's `collectCoverageFrom` globs, if set. */
@@ -54,9 +55,9 @@ export interface PackageCoverageSettings {
 export interface WorkspaceProjectResult {
 	/**
 	 * When coverage is enabled in workspace mode, the per-package manifest
-	 * captured during `prepareWorkspaceCoverage`. Downstream aggregation maps
-	 * the result's `coverageData` (raw hit counts captured by the materializer)
-	 * back through this manifest to produce TS-coord Istanbul records.
+	 * captured during `prepareWorkspaceCoverage`. Downstream aggregation maps the
+	 * result's `coverageData` (raw hit counts captured by the materializer) back
+	 * through this manifest to produce TS-coord Istanbul records.
 	 */
 	coverageManifest?: CoverageManifest | undefined;
 	/** Present whenever `coverageManifest` is. */

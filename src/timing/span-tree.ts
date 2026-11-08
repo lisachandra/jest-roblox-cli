@@ -10,8 +10,8 @@ export interface SpanNode {
 	children: Map<string, SpanNode>;
 	/**
 	 * Whether an `open` on this node has ever closed. Distinguishes a span the
-	 * tree has already reported through a root `onSpanClose` from one that
-	 * only ever arrived by `record`, which has no close and so reports nowhere.
+	 * tree has already reported through a root `onSpanClose` from one that only
+	 * ever arrived by `record`, which has no close and so reports nowhere.
 	 */
 	closed: boolean;
 	/** How many opens, closes or records landed on this node. */

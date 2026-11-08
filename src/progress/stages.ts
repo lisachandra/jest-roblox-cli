@@ -126,9 +126,9 @@ const BYTES_PER_MEGABYTE = BYTES_PER_KILOBYTE * 1024;
  * above it. The sizes here are place files and their uploads, where the digit
  * past the point separates "the place grew" from noise.
  *
- * The ladder stops at megabytes. Open Cloud caps a place well below a gigabyte,
- * so the next rung would be a unit no run can reach and a branch no test can
- * honestly reach either.
+ * The ladder stops at megabytes. Open Cloud caps a place well below a
+ * gigabyte, so the next rung would be a unit no run can reach and a branch no
+ * test can honestly reach either.
  *
  * Exported because a run says a size in two places — the stage line and the
  * cap refusal the Code Bundle can earn — and two spellings of one number read

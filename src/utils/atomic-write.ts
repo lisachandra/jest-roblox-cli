@@ -26,11 +26,11 @@ const TEMPORARY_INFIX = ".tmp.";
 /**
  * How much randomness the stamp's nonce carries. The pid is what the sweep
  * probes; the nonce is what keeps the probe's answer true until the delete
- * lands. An operating system recycles a pid, so a name built from the pid alone
- * is one a later writer can be handed while an abandoned file still holds it —
- * and the sweep, having probed the pid between the two, deletes a write in
- * flight. No two writes draw the same nonce, so the name the sweep resolves
- * belongs to the owner it probed and to nothing else.
+ * lands. An operating system recycles a pid, so a name built from the pid
+ * alone is one a later writer can be handed while an abandoned file still
+ * holds it — and the sweep, having probed the pid between the two, deletes a
+ * write in flight. No two writes draw the same nonce, so the name the sweep
+ * resolves belongs to the owner it probed and to nothing else.
  */
 const NONCE_BYTES = 4;
 
@@ -138,7 +138,8 @@ function isNoSuchProcessError(err: unknown): boolean {
  *
  * Erring towards alive is what makes the sweep safe without a lock. A running
  * owner is never swept, and an owner that is gone can never rename the name it
- * left behind, so the only mistake available is keeping a stray a while longer.
+ * left behind, so the only mistake available is keeping a stray a while
+ * longer.
  *
  * @param pid - The owner pid read off a temp file's name.
  * @returns False only when the pid names no process.

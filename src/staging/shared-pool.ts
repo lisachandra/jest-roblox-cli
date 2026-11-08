@@ -24,13 +24,13 @@ export interface PoolSharedMountsOptions {
 }
 
 /**
- * What {@link poolSharedMounts} would emit, as a number the place-reuse key can
- * hold. Bump it whenever this module would produce different bytes from
+ * What {@link poolSharedMounts} would emit, as a number the place-reuse key
+ * can hold. Bump it whenever this module would produce different bytes from
  * unchanged sources — a different eligibility rule, a different key, a
  * different pool layout.
  *
- * The key covers this pass's inputs and not the pass, so without a bump a place
- * built by the old rule reads as current and is handed out unchanged.
+ * The key covers this pass's inputs and not the pass, so without a bump a
+ * place built by the old rule reads as current and is handed out unchanged.
  */
 export const SHARED_POOL_PASS_VERSION = 3;
 

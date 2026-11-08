@@ -38,11 +38,11 @@ export function entryLookupKey(packageName: string, project: string | undefined)
 /**
  * Pair every job with its aggregated entry, in request order.
  *
- * A gap normally means a task broke and lost its results, so they are collected
- * and one failure message names them all rather than failing on the first.
- * Under `--bail` the gaps are the point: the run stopped on a failing package
- * and the ones after it were never meant to run, so they come back reported as
- * bailed instead.
+ * A gap normally means a task broke and lost its results, so they are
+ * collected and one failure message names them all rather than failing on the
+ * first. Under `--bail` the gaps are the point: the run stopped on a failing
+ * package and the ones after it were never meant to run, so they come back
+ * reported as bailed instead.
  *
  * That trade is real — once any task reports a bail, a sibling that lost
  * results some other way is reported as deliberately skipped too. Nothing here

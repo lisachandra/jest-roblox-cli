@@ -3397,7 +3397,8 @@ describe(prepareCoverageAsync, () => {
 		});
 
 		/**
-		 * Bundled builds also invalidate harnesses made by an older split rule.
+		 * Bundled builds also invalidate harnesses made by an older split
+		 * rule.
 		 */
 		it("should rebuild the place when the split rule that built it moved", async () => {
 			expect.assertions(2);

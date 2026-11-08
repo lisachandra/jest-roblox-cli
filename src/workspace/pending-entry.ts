@@ -29,12 +29,12 @@ export interface PendingEntry {
  * two halves discovery splits its own glob into — or `undefined` when the run
  * named no files, which is what leaves discovery globbing.
  *
- * Classified once, where the files are looked up, rather than at each consumer:
- * `classifyTestFiles` is the rule that decides which half a file belongs to,
- * and running it again downstream would let the dispatched file set and the
- * Luau pattern disagree about a file. `undefined` and "both halves empty"
- * differ — no project reaches here in the latter state, because the file filter
- * drops one that matches nothing before the entry is built.
+ * Classified once, where the files are looked up, rather than at each
+ * consumer: `classifyTestFiles` is the rule that decides which half a file
+ * belongs to, and running it again downstream would let the dispatched file
+ * set and the Luau pattern disagree about a file. `undefined` and "both halves
+ * empty" differ — no project reaches here in the latter state, because the
+ * file filter drops one that matches nothing before the entry is built.
  */
 export type ProjectCliFiles = ClassifiedTestFiles | undefined;
 

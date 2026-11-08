@@ -116,7 +116,8 @@ interface IncrementalFiles {
 
 interface InstrumentationPlan {
 	/**
-	 * Cached records the instrumenter carries forward; undefined on a cold run.
+	 * Cached records the instrumenter carries forward; undefined on a cold
+	 * run.
 	 */
 	incrementalFiles: IncrementalFiles | undefined;
 }

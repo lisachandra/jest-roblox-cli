@@ -600,8 +600,9 @@ export interface AstStatWhile {
 }
 
 /**
- * Hand-rolled rather than type-fest's `Tagged`: jest-roblox's declaration build
- * inlines this lib and refuses a `node_modules` module it was not told to.
+ * Hand-rolled rather than type-fest's `Tagged`: jest-roblox's declaration
+ * build inlines this lib and refuses a `node_modules` module it was not told
+ * to.
  */
 interface Utf16ColumnBrand {
 	readonly isUtf16Column: true;

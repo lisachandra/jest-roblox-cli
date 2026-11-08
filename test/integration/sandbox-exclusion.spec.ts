@@ -20,8 +20,8 @@ const COLLECTING_PROJECTS = [{ name: "e2e", sentinel: "test/e2e/bundle.spec.ts" 
 
 /**
  * Two spec spellings the `e2e` glob collects, planted in one sandbox, because
- * that is how an interrupted run leaks them: the fixture tree it copied is left
- * there whole.
+ * that is how an interrupted run leaks them: the fixture tree it copied is
+ * left there whole.
  */
 const DECOY_SPEC_NAMES = {
 	e2e: "example.spec.ts",

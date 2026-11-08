@@ -24,8 +24,8 @@ export interface PackageGameOutput {
 	 * Present only on an experimental vm-parallel run, where the group holds
 	 * the whole run's output rather than one project's. `LogService.MessageOut`
 	 * reports every message to every listener with no source identity, so once
-	 * projects overlap there is no honest per-project split to write — the
-	 * label says so instead of implying one.
+	 * projects overlap there is no honest per-project split to write — the label
+	 * says so instead of implying one.
 	 */
 	scope?: "batch";
 }
