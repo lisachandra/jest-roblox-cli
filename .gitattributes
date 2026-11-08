@@ -1,3 +1,10 @@
 # pnpm pack (ERR_PNPM_BIN_CRLF) rejects a CRLF shebang: with core.autocrlf=true
 # bin/* checks out CRLF and tsdown build fails during game-repo setup. Pin LF.
 bin/** text eol=lf
+
+# `luau/*.luau` is not compiled — it is spliced verbatim into generated test
+# scripts by string replacement (`src/backends/result-relay.ts`). With
+# autocrlf=true a CRLF checkout makes every spliced line end `\r\n`, so the
+# injected script stops matching the `\n`-joined text its tests assert on, and
+# a generated Luau program can carry stray carriage returns into Roblox.
+luau/** text eol=lf
