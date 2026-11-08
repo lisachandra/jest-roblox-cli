@@ -21,6 +21,7 @@ import { nodeChildProcessRunner } from "../utils/child-process.ts";
 import {
 	collectJobRoots,
 	collectSetupFiles,
+	deriveRunContext,
 	failedJestOutput,
 	parseSummary,
 	type ReeOutputEntry,
@@ -246,6 +247,8 @@ export class EmulatorBackend implements Backend {
 				"play",
 				"--seconds",
 				String(emulatorConfig?.seconds ?? DEFAULT_SECONDS),
+				"--run-context",
+				deriveRunContext(roots),
 				"--context",
 				JSON.stringify(context),
 			],

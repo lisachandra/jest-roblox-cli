@@ -95,6 +95,40 @@ export function resolveInstancePath(
 }
 
 /**
+ * Derives the run context a job runs under from where its specs are mounted.
+ *
+ * `ree` defaults to `client`, so a server-side suite that never says otherwise
+ * runs as a client: `RunService.IsServer()` answers false and every
+ * `assertServerContext()` guard in the specs under test throws. The DataModel
+ * already says which side a project is on — a suite mounted under
+ * `ServerScriptService` cannot run anywhere but the server — so read it from
+ * there rather than from the project's name, which is free-form.
+ *
+ * @param roots - The job's mount-owning DataModel paths, from `collectJobRoots`.
+ * @returns `"server"` when every root is server-side, else `"client"`.
+ */
+export function deriveRunContext(roots: ReadonlyArray<string>): "client" | "server" {
+	// A job spanning both sides would need two engines; `ree` runs one. Client
+	// is the default `ree` applies, so it is also the safe answer here.
+	if (roots.length === 0) {
+		return "client";
+	}
+
+	return roots.every(isServerRoot) ? "server" : "client";
+}
+
+/**
+ * Whether a DataModel path names a server-only service root.
+ *
+ * @param root - One mount-owning DataModel path.
+ * @returns True when the path's first segment is a server-only service.
+ */
+function isServerRoot(root: string): boolean {
+	const head = root.split("/")[0];
+	return head === "ServerScriptService" || head === "ServerStorage";
+}
+
+/**
  * Derives the DataModel roots a job's runner discovers under: the mount owning
  * the project's compiled output directory.
  *

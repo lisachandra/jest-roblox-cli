@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { EmulatorStageMapping } from "./emulator-stage.ts";
-import { parseSummary, resolveInstancePath, toInstancePattern } from "./emulator-context.ts";
+import {
+	deriveRunContext,
+	parseSummary,
+	resolveInstancePath,
+	toInstancePattern,
+} from "./emulator-context.ts";
 
 const MAPPINGS: Array<EmulatorStageMapping> = [
 	{ dataModelPath: "ReplicatedStorage/TS/client", fsPath: "/repo/out/client" },
@@ -75,5 +80,43 @@ describe("parseSummary", () => {
 		expect(() => parseSummary("no json here\n", { code: 1, stderr: "boom" })).toThrow(
 			"exited 1 without a summary",
 		);
+	});
+});
+
+describe("deriveRunContext", () => {
+	it("should run a suite mounted under ServerScriptService as the server", () => {
+		expect.assertions(3);
+
+		// `ree` defaults to client, so a server suite that never says otherwise
+		// answers `IsServer()` with false and its guards throw.
+		expect(deriveRunContext(["ServerScriptService/TS/server"])).toBe("server");
+		expect(deriveRunContext(["ServerStorage"])).toBe("server");
+		expect(deriveRunContext(["ServerScriptService/TS/server", "ServerStorage/x"])).toBe("server");
+	});
+
+	it("should run a suite mounted outside the server services as the client", () => {
+		expect.assertions(3);
+
+		expect(deriveRunContext(["ReplicatedStorage/TS/client"])).toBe("client");
+		expect(deriveRunContext(["ReplicatedStorage/TS/shared"])).toBe("client");
+		// A job spanning both sides cannot run on one engine; client is both
+		// ree's default and the safe answer.
+		expect(deriveRunContext(["ServerScriptService/TS/server", "ReplicatedStorage/TS/shared"])).toBe(
+			"client",
+		);
+	});
+
+	it("should fall back to client when no root resolved", () => {
+		expect.assertions(1);
+
+		expect(deriveRunContext([])).toBe("client");
+	});
+
+	it("should not read a ReplicatedStorage child named like a server service as server", () => {
+		expect.assertions(1);
+
+		// Only the head of the path names a service; a nested `ServerScriptService`
+		// folder is an ordinary instance under ReplicatedStorage.
+		expect(deriveRunContext(["ReplicatedStorage/ServerScriptService"])).toBe("client");
 	});
 });
