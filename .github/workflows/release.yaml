@@ -81,7 +81,26 @@ jobs:
           pnpm exec vitest run --project e2e
 
       - name: Publish to npm
-        run: pnpm publish --access public --no-git-checks
+        # The fork inherits this workflow from upstream, where the package name
+        # is `@isentinel/jest-roblox`. Publishing that name from here would
+        # target a package lisachandra does not own, so the manifest is
+        # rewritten to the fork scope for the push only — the checked-in name
+        # stays upstream's, which keeps every internal self-reference and every
+        # upstream merge untouched. `publishConfig` cannot express this: the
+        # registry has no `name` override. Skipped, not failed, when the fork
+        # has no token configured, so a tag still yields binaries and a plugin.
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "No NPM_TOKEN configured; skipping the publish step."
+            exit 0
+          fi
+          node --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            const manifest = JSON.parse(readFileSync("package.json", "utf-8"));
+            manifest.name = "@lisachandra/jest-roblox";
+            writeFileSync("package.json", `${JSON.stringify(manifest, null, "\t")}\n`);
+          '
+          pnpm publish --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
