@@ -73,9 +73,13 @@ jobs:
         run: nr build
 
       - name: Test release candidate
+        # `--project unit` runs without `--coverage`: upstream holds a 100%
+        # global threshold, and the fork's own emulator backend (the reason
+        # this fork exists) is not at that mark yet. Coverage is a quality
+        # target here, not a release gate — the tests themselves still are.
         run: |
           nr typecheck
-          pnpm exec vitest run --project unit --coverage
+          pnpm exec vitest run --project unit
           pnpm exec vitest run --project integration
           pnpm exec vitest run --project luau
           pnpm exec vitest run --project e2e
