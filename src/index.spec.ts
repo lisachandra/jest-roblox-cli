@@ -10,6 +10,7 @@ describe("artifacts entry point", () => {
 			[
 				"BUILD_MANIFEST_VERSION",
 				"DEFAULT_CONFIG",
+				"EmulatorBackend",
 				"GLOBAL_TEST_KEYS",
 				"JEST_ARGV_EXCLUDED_KEYS",
 				"MANIFEST_VERSION",
@@ -23,6 +24,7 @@ describe("artifacts entry point", () => {
 				"buildJestArgv",
 				"buildManifestSchema",
 				"coverageManifestSchema",
+				"createEmulatorBackend",
 				"createOpenCloudBackend",
 				"createStudioBackend",
 				"createStudioCliBackend",
@@ -54,6 +56,7 @@ describe("artifacts entry point", () => {
 				"runJestRobloxAsync",
 				"runProjectsAsync",
 				"runTypecheckAsync",
+				"toInstancePattern",
 				"visitBlock",
 				"visitExpression",
 				"visitStatement",

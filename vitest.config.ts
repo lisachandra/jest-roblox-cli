@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
+import process from "node:process";
 import type { TestProjectInlineConfiguration } from "vitest/config";
 import { defaultExclude, defineConfig } from "vitest/config";
 
@@ -8,6 +9,17 @@ import { QuotaSkipReporter } from "#test/setup/quota-skip-reporter.ts";
 import { virtualModulesPlugin } from "./loaders/virtual-modules.mjs";
 import { nodeFileSystem } from "./src/utils/file-system.ts";
 import { unitProject as sharedUnitProject } from "./vitest.shared.ts";
+
+// `formatStartAtLine` renders with `toLocaleTimeString`, which follows the
+// host zone on purpose — a CLI should print the time the person running it
+// recognizes. The summary snapshots, though, feed it `Date.UTC(...)` and
+// record the result, so they only match on a UTC machine.
+//
+// This has to be set here, in the config's own process, and not through
+// `test.env`: a worker inherits the zone its parent forked with, so setting it
+// per-test comes too late and the snapshots still render in host time. Only
+// the test run is pinned; the shipped CLI keeps local time.
+process.env["TZ"] ??= "UTC";
 
 const DRIVE_LETTER_START_REGEX = /^[A-Za-z]:\//;
 
