@@ -76,6 +76,9 @@ export function printError(err: unknown): void {
 		process.stderr.write(formatBackendErrorBanner(err));
 	} else if (err instanceof Error) {
 		console.error(`Error: ${err.message}`);
+		if (process.env["JEST_ROBLOX_STACK"] === "1") {
+			console.error(err.stack);
+		}
 	} else {
 		console.error("An unknown error occurred");
 	}

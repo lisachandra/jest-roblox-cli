@@ -3,6 +3,7 @@ import { isOptionalPath, resolveMountPath } from "@isentinel/rojo-utils";
 import * as path from "node:path";
 import process from "node:process";
 
+import { isDirectoryEntry } from "../coverage-pipeline/discover-files.ts";
 import type { CoverageRoot } from "../coverage-pipeline/redirect-path.ts";
 import { redirectPathToShadow } from "../coverage-pipeline/redirect-path.ts";
 import {
@@ -230,8 +231,16 @@ function demoteToSpine({
 	const entries = options.fileSystem.readdirSync(absoluteTarget, { withFileTypes: true });
 	for (const entry of entries) {
 		// A dollar-prefixed disk entry collides with rojo's own reserved keys,
-		// the same reason `demoteAutoMountToExplicit` passes over one.
-		if (!entry.isDirectory() || entry.name.startsWith("$") || node[entry.name] !== undefined) {
+		// the same reason `demoteAutoMountToExplicit` passes over one. The
+		// directory test resolves a link: a demoted `node_modules/@scope` mount
+		// holds nothing but junctions, and a `Dirent` reports only the reparse
+		// bit — trusting `isDirectory` here would promote none of the packages
+		// beneath it and the place would build without them.
+		if (
+			!isDirectoryEntry(options.fileSystem, absoluteTarget, entry) ||
+			entry.name.startsWith("$") ||
+			node[entry.name] !== undefined
+		) {
 			continue;
 		}
 

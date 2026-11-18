@@ -1,6 +1,7 @@
 import * as path from "node:path";
 
 import { ConfigError } from "../config/errors.ts";
+import { isDirectoryEntry } from "../coverage-pipeline/discover-files.ts";
 import type { RojoTreeNode } from "../types/rojo.ts";
 import type { FileSystem } from "../utils/file-system.ts";
 import { normalizeWindowsPath } from "../utils/normalize-windows-path.ts";
@@ -79,8 +80,11 @@ function demoteAutoMountToExplicit({
 		// `$path`-mounts a fixed set of known source extensions. Feeding rojo
 		// an unsupported extension (e.g. `tsconfig.tsbuildinfo`) via `$path`
 		// hard-errors at build time. Directories cover every real use we've
-		// seen of nested project mounts.
-		if (!entry.isDirectory()) {
+		// seen of nested project mounts. The test resolves a link: a scope
+		// folder mounted through pnpm holds nothing but junctions, and a
+		// `Dirent` reports only the reparse bit — trusting `isDirectory` here
+		// would drop every nested project beneath it.
+		if (!isDirectoryEntry(fileSystem, parentPath, entry)) {
 			continue;
 		}
 

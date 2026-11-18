@@ -201,7 +201,7 @@ export function discoverRootFiles(
  * @returns True when the entry resolves to a directory.
  */
 // eslint-disable-next-line better-max-params/better-max-params -- the three inputs are already the minimum: a stat target, its container, and the entry.
-function isDirectoryEntry(
+export function isDirectoryEntry(
 	fileSystem: FileSystem,
 	directory: string,
 	entry: Dirent,

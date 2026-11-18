@@ -247,6 +247,50 @@ describe(prepareSpine, () => {
 		expect(Object.keys(result.files)).toStrictEqual([at("server/keep.luau")]);
 	});
 
+	it("should leave the junctions of a pnpm scope mount out of the spine", () => {
+		expect.assertions(3);
+
+		const { fileSystem, volume } = seed({});
+
+		// The first spine level of a pnpm workspace is a scope folder whose
+		// every entry is a junction, and a `Dirent` reports only the reparse
+		// bit: a mirror that trusts `isDirectory` read each package as a file
+		// and died copying one. The link is resolved instead, answered as a
+		// directory, and skipped — its contents load through the deeper spine
+		// level the demote hangs beside it, never through this one's loose
+		// files.
+		volume.mkdirSync("D:/store/matter/out", { recursive: true });
+		volume.writeFileSync("D:/store/matter/out/init.luau", "");
+		volume.mkdirSync(`${OUT}/server`, { recursive: true });
+		volume.symlinkSync("D:/store/matter", `${OUT}/server/matter`);
+
+		expect(() => spineOf(fileSystem, { levels: ["out/server"].map(posixRoot) })).not.toThrow();
+
+		expect(volume.existsSync(`${mounted("out/server")}/matter`)).toBeFalse();
+		// Created even so: the demote names the leaf as its `$path`, and rojo
+		// fails on one that is not there.
+		expect(volume.existsSync((mounted("out/server")))).toBeTrue();
+	});
+
+	it("should leave a rojo project file out of the spine leaf", () => {
+		expect.assertions(3);
+
+		const { fileSystem, volume } = seed({
+			[at("server/loose.luau")]: "return nil",
+			[at("server/default.project.json")]: "{}",
+		});
+
+		const { files } = spineOf(fileSystem, { levels: ["out/server"].map(posixRoot) });
+
+		// A project file in the leaf turns it into a nested project whose
+		// `$path`s resolve against the leaf — where the directories they name
+		// are the explicit siblings the demote wrote, not the leaf's contents.
+		// Rojo failed to build the place off exactly such a copy.
+		expect(volume.existsSync(`${mounted("out/server")}/default.project.json`)).toBeFalse();
+		expect(volume.existsSync(`${mounted("out/server")}/loose.luau`)).toBeTrue();
+		expect(Object.keys(files)).toStrictEqual([at("server/loose.luau")]);
+	});
+
 	it("should report no change when every record carries forward", () => {
 		expect.assertions(2);
 

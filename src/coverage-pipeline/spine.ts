@@ -6,6 +6,7 @@ import { nodeFileSystem } from "../utils/file-system.ts";
 import type { PosixRoot } from "../utils/normalize-windows-path.ts";
 import { normalizeWindowsPath, toPosixRoot } from "../utils/normalize-windows-path.ts";
 import type { CopyIgnoreMatcher } from "./discover-files.ts";
+import { isDirectoryEntry } from "./discover-files.ts";
 import type { NonInstrumentedFileRecord } from "./manifest.ts";
 import type { NarrowedMount } from "./narrow-roots.ts";
 import type { CoverageRoot } from "./redirect-path.ts";
@@ -387,7 +388,20 @@ function mirrorOneLevel({
 	const entries = fileSystem.readdirSync(sourceDirectory, { withFileTypes: true });
 	for (const entry of entries) {
 		const sourcePath = `${sourceDirectory}/${entry.name}`;
-		if (entry.isDirectory() || isCopyIgnored(sourcePath.slice(mount.length + 1))) {
+		// A junction reads as "not a directory" off the `Dirent`, and the first
+		// spine level of a pnpm workspace is a scope folder whose every entry is
+		// one — copying it as a file is an EISDIR, so the link is resolved the
+		// way the shadow walker resolves one.
+		if (isDirectoryEntry(fileSystem, sourceDirectory, entry) || isCopyIgnored(sourcePath.slice(mount.length + 1))) {
+			continue;
+		}
+
+		// A rojo project file copied into a spine leaf turns the leaf into a
+		// nested project whose `$path`s resolve against the leaf — where the
+		// directories they name are explicit siblings, not contents. The leaf is
+		// a stand-in for one directory's loose files; a project declaration
+		// belongs to the tree the run synthesized, never to the copy.
+		if (entry.name.endsWith(".project.json")) {
 			continue;
 		}
 
