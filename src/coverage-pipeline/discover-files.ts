@@ -125,29 +125,6 @@ export function isSkippedDirectory(name: string): boolean {
 }
 
 /**
- * Shared directory walker. Skips node_modules and dot-prefixed directories,
- * plus anything `filter.skip` claims.
- *
- * Every name it reports is built from the entry names it descended through, so
- * how the caller spelled the root never reaches the answer.
- * @param options - Directory to walk, file system, filter, and the array that
- *   receives each accepted path relative to the directory.
- */
-export function walkLuauDirectory({
-	directory,
-	fileSystem = nodeFileSystem,
-	filter,
-	results,
-}: {
-	directory: string;
-	fileSystem?: FileSystem;
-	filter: WalkFilter;
-	results: Array<string>;
-}): void {
-	walkFrom({ directory, fileSystem, filter, relativePrefix: "", results });
-}
-
-/**
  * Whether an entry is a directory, following a symlink when it is one.
  *
  * Windows junctions — every pnpm workspace link, and every store entry
@@ -181,6 +158,29 @@ export function isDirectoryEntry(
 		// A dangling link: nothing to descend into, and nothing to copy.
 		return false;
 	}
+}
+
+/**
+ * Shared directory walker. Skips node_modules and dot-prefixed directories,
+ * plus anything `filter.skip` claims.
+ *
+ * Every name it reports is built from the entry names it descended through, so
+ * how the caller spelled the root never reaches the answer.
+ * @param options - Directory to walk, file system, filter, and the array that
+ *   receives each accepted path relative to the directory.
+ */
+export function walkLuauDirectory({
+	directory,
+	fileSystem = nodeFileSystem,
+	filter,
+	results,
+}: {
+	directory: string;
+	fileSystem?: FileSystem;
+	filter: WalkFilter;
+	results: Array<string>;
+}): void {
+	walkFrom({ directory, fileSystem, filter, relativePrefix: "", results });
 }
 
 /**

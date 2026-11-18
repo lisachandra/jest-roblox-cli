@@ -60,7 +60,9 @@ describe(containsMatchingFile, () => {
 		volume.writeFileSync("out/init.luau", "");
 		volume.writeFileSync("out/readme.md", "");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau })).toBeTrue();
+		expect(
+			containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau }),
+		).toBeTrue();
 		expect(
 			containsMatchingFile(fileSystem, { directoryPath: "out", matches: () => false }),
 		).toBeFalse();
@@ -75,7 +77,9 @@ describe(containsMatchingFile, () => {
 		volume.writeFileSync("out/readme.md", "");
 		volume.writeFileSync("out/shared/player.luau", "");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau })).toBeTrue();
+		expect(
+			containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau }),
+		).toBeTrue();
 	});
 
 	// Every entry of a pnpm-mounted `node_modules/@scope` folder is a link to a
@@ -125,7 +129,9 @@ describe(containsMatchingFile, () => {
 		volume.mkdirSync("/mount", { recursive: true });
 		volume.symlinkSync("/store/init.luau", "/mount/entry.luau");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "/mount", matches: isLuau })).toBeTrue();
+		expect(
+			containsMatchingFile(fileSystem, { directoryPath: "/mount", matches: isLuau }),
+		).toBeTrue();
 	});
 
 	it("should answer false when a link dangles", () => {
@@ -136,12 +142,16 @@ describe(containsMatchingFile, () => {
 		volume.mkdirSync("mount", { recursive: true });
 		volume.symlinkSync("/nowhere/matter", "mount/matter");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau })).toBeFalse();
+		expect(
+			containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau }),
+		).toBeFalse();
 
 		// A dangling link beside real content answers for the content.
 		volume.writeFileSync("mount/init.luau", "");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau })).toBeTrue();
+		expect(
+			containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau }),
+		).toBeTrue();
 	});
 
 	it("should not revisit a directory a link points back at", () => {
