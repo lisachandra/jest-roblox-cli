@@ -259,10 +259,12 @@ describe(prepareSpine, () => {
 		// directory, and skipped — its contents load through the deeper spine
 		// level the demote hangs beside it, never through this one's loose
 		// files.
-		volume.mkdirSync("D:/store/matter/out", { recursive: true });
-		volume.writeFileSync("D:/store/matter/out/init.luau", "");
+		volume.mkdirSync("/store/matter/out", { recursive: true });
+		volume.writeFileSync("/store/matter/out/init.luau", "");
 		volume.mkdirSync(`${OUT}/server`, { recursive: true });
-		volume.symlinkSync("D:/store/matter", `${OUT}/server/matter`);
+		// The target is root-absolute: a drive-letter one reads as relative on
+		// Linux, where `D:` is a directory name, and the link would dangle.
+		volume.symlinkSync("/store/matter", `${OUT}/server/matter`);
 
 		expect(() => spineOf(fileSystem, { levels: ["out/server"].map(posixRoot) })).not.toThrow();
 
