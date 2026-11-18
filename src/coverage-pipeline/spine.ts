@@ -392,7 +392,10 @@ function mirrorOneLevel({
 		// spine level of a pnpm workspace is a scope folder whose every entry is
 		// one — copying it as a file is an EISDIR, so the link is resolved the
 		// way the shadow walker resolves one.
-		if (isDirectoryEntry(fileSystem, sourceDirectory, entry) || isCopyIgnored(sourcePath.slice(mount.length + 1))) {
+		if (
+			isDirectoryEntry(fileSystem, sourceDirectory, entry) ||
+			isCopyIgnored(sourcePath.slice(mount.length + 1))
+		) {
 			continue;
 		}
 

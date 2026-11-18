@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { createMemoryFileSystem } from "#test/mocks/memory-file-system.ts";
-import { collectRojoMounts, containsMatchingFile, resolveMountWithin } from "./root-reachability.ts";
+import {
+	collectRojoMounts,
+	containsMatchingFile,
+	resolveMountWithin,
+} from "./root-reachability.ts";
 
 describe(resolveMountWithin, () => {
 	it.for(["/", "D:/"])("should exclude the namespace frame itself for %s", (frame) => {
@@ -56,12 +60,10 @@ describe(containsMatchingFile, () => {
 		volume.writeFileSync("out/init.luau", "");
 		volume.writeFileSync("out/readme.md", "");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau })).toBe(
-			true,
-		);
-		expect(containsMatchingFile(fileSystem, { directoryPath: "out", matches: () => false })).toBe(
-			false,
-		);
+		expect(containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau })).toBeTrue();
+		expect(
+			containsMatchingFile(fileSystem, { directoryPath: "out", matches: () => false }),
+		).toBeFalse();
 	});
 
 	it("should match a file a subdirectory holds", () => {
@@ -73,9 +75,7 @@ describe(containsMatchingFile, () => {
 		volume.writeFileSync("out/readme.md", "");
 		volume.writeFileSync("out/shared/player.luau", "");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau })).toBe(
-			true,
-		);
+		expect(containsMatchingFile(fileSystem, { directoryPath: "out", matches: isLuau })).toBeTrue();
 	});
 
 	// Every entry of a pnpm-mounted `node_modules/@scope` folder is a link to a
@@ -96,8 +96,11 @@ describe(containsMatchingFile, () => {
 		volume.symlinkSync("/store/matter", "/mount/@lisachandra/matter");
 
 		expect(
-			containsMatchingFile(fileSystem, { directoryPath: "/mount/@lisachandra", matches: isLuau }),
-		).toBe(true);
+			containsMatchingFile(fileSystem, {
+				directoryPath: "/mount/@lisachandra",
+				matches: isLuau,
+			}),
+		).toBeTrue();
 
 		// A link whose target holds no match is descended into and answered
 		// honestly, not skipped.
@@ -105,8 +108,11 @@ describe(containsMatchingFile, () => {
 		volume.symlinkSync("/store/empty", "/mount/@lisachandra/empty");
 
 		expect(
-			containsMatchingFile(fileSystem, { directoryPath: "/mount/@lisachandra", matches: isLuau }),
-		).toBe(true);
+			containsMatchingFile(fileSystem, {
+				directoryPath: "/mount/@lisachandra",
+				matches: isLuau,
+			}),
+		).toBeTrue();
 	});
 
 	it("should match a file reached through a link", () => {
@@ -119,9 +125,7 @@ describe(containsMatchingFile, () => {
 		volume.mkdirSync("/mount", { recursive: true });
 		volume.symlinkSync("/store/init.luau", "/mount/entry.luau");
 
-		expect(containsMatchingFile(fileSystem, { directoryPath: "/mount", matches: isLuau })).toBe(
-			true,
-		);
+		expect(containsMatchingFile(fileSystem, { directoryPath: "/mount", matches: isLuau })).toBeTrue();
 	});
 
 	it("should answer false when a link dangles", () => {
@@ -132,16 +136,12 @@ describe(containsMatchingFile, () => {
 		volume.mkdirSync("mount", { recursive: true });
 		volume.symlinkSync("/nowhere/matter", "mount/matter");
 
-		expect(
-			containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau }),
-		).toBe(false);
+		expect(containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau })).toBeFalse();
 
 		// A dangling link beside real content answers for the content.
 		volume.writeFileSync("mount/init.luau", "");
 
-		expect(
-			containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau }),
-		).toBe(true);
+		expect(containsMatchingFile(fileSystem, { directoryPath: "mount", matches: isLuau })).toBeTrue();
 	});
 
 	it("should not revisit a directory a link points back at", () => {
@@ -156,7 +156,10 @@ describe(containsMatchingFile, () => {
 		volume.symlinkSync("/mount/@lisachandra", "/mount/@lisachandra/matter/self");
 
 		expect(
-			containsMatchingFile(fileSystem, { directoryPath: "/mount/@lisachandra", matches: isLuau }),
-		).toBe(false);
+			containsMatchingFile(fileSystem, {
+				directoryPath: "/mount/@lisachandra",
+				matches: isLuau,
+			}),
+		).toBeFalse();
 	});
 });

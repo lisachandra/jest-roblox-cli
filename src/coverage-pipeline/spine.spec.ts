@@ -271,15 +271,15 @@ describe(prepareSpine, () => {
 		expect(volume.existsSync(`${mounted("out/server")}/matter`)).toBeFalse();
 		// Created even so: the demote names the leaf as its `$path`, and rojo
 		// fails on one that is not there.
-		expect(volume.existsSync((mounted("out/server")))).toBeTrue();
+		expect(volume.existsSync(mounted("out/server"))).toBeTrue();
 	});
 
 	it("should leave a rojo project file out of the spine leaf", () => {
 		expect.assertions(3);
 
 		const { fileSystem, volume } = seed({
-			[at("server/loose.luau")]: "return nil",
 			[at("server/default.project.json")]: "{}",
+			[at("server/loose.luau")]: "return nil",
 		});
 
 		const { files } = spineOf(fileSystem, { levels: ["out/server"].map(posixRoot) });

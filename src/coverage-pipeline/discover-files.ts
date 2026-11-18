@@ -148,6 +148,42 @@ export function walkLuauDirectory({
 }
 
 /**
+ * Whether an entry is a directory, following a symlink when it is one.
+ *
+ * Windows junctions — every pnpm workspace link, and every store entry
+ * re-exported into one — carry the reparse bit, and `Dirent` reports only that
+ * fact, so a junction to a directory reads as "not a directory" and the walker
+ * files it as a file. `readFileSync` on that path is then an `EISDIR`. Only a
+ * link needs the extra `stat`; a real directory or file answers from the
+ * `Dirent`, which keeps the common case at one syscall per directory.
+ * @param fileSystem - File system to stat through.
+ * @param directory - Directory holding the entry.
+ * @param entry - The entry, as read.
+ * @returns True when the entry resolves to a directory.
+ */
+// eslint-disable-next-line better-max-params/better-max-params -- the three inputs are already the minimum: a stat target, its container, and the entry.
+export function isDirectoryEntry(
+	fileSystem: FileSystem,
+	directory: string,
+	entry: Dirent,
+): boolean {
+	if (entry.isDirectory()) {
+		return true;
+	}
+
+	if (!entry.isSymbolicLink()) {
+		return false;
+	}
+
+	try {
+		return fileSystem.statSync(`${directory}/${entry.name}`).isDirectory();
+	} catch {
+		// A dangling link: nothing to descend into, and nothing to copy.
+		return false;
+	}
+}
+
+/**
  * Fast directory walk over one root's prod .luau/.lua files, split by the
  * coverage universe. This is the single discovery pass every consumer of the
  * pipeline shares — the instrumenter parses exactly this file set.
@@ -184,42 +220,6 @@ export function discoverRootFiles(
 	}
 
 	return { excluded, instrumentable };
-}
-
-/**
- * Whether an entry is a directory, following a symlink when it is one.
- *
- * Windows junctions — every pnpm workspace link, and every store entry
- * re-exported into one — carry the reparse bit, and `Dirent` reports only that
- * fact, so a junction to a directory reads as "not a directory" and the walker
- * files it as a file. `readFileSync` on that path is then an `EISDIR`. Only a
- * link needs the extra `stat`; a real directory or file answers from the
- * `Dirent`, which keeps the common case at one syscall per directory.
- * @param fileSystem - File system to stat through.
- * @param directory - Directory holding the entry.
- * @param entry - The entry, as read.
- * @returns True when the entry resolves to a directory.
- */
-// eslint-disable-next-line better-max-params/better-max-params -- the three inputs are already the minimum: a stat target, its container, and the entry.
-export function isDirectoryEntry(
-	fileSystem: FileSystem,
-	directory: string,
-	entry: Dirent,
-): boolean {
-	if (entry.isDirectory()) {
-		return true;
-	}
-
-	if (!entry.isSymbolicLink()) {
-		return false;
-	}
-
-	try {
-		return fileSystem.statSync(`${directory}/${entry.name}`).isDirectory();
-	} catch {
-		// A dangling link: nothing to descend into, and nothing to copy.
-		return false;
-	}
 }
 
 function walkFrom({
