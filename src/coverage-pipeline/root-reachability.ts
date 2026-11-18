@@ -1,10 +1,9 @@
 import { collectPaths, resolveMountPath } from "@isentinel/rojo-utils";
 
-import * as path from "node:path";
 import process from "node:process";
 
 import type { RojoTreeNode } from "../types/rojo.ts";
-import type { FileSystem } from "../utils/file-system.ts";
+import type { Dirent, FileSystem, Stats } from "../utils/file-system.ts";
 import {
 	normalizeWindowsPath,
 	relativeToRoot,
@@ -42,6 +41,16 @@ export interface MountFrame {
 /**
  * Whether a directory tree holds a file whose name `matches` accepts.
  *
+ * A link to a directory is descended into. The `$path` mounts this judges name
+ * pnpm workspace links — every entry of a mounted `node_modules/@scope` folder
+ * is a junction on Windows and a symlink elsewhere — and a `Dirent` reports
+ * only the reparse bit, so a walk that trusts `isDirectory` reads a linked
+ * package as a file and answers "no luau here" for a subtree that is all luau.
+ * That answer is what dropped every mounted package from root detection in a
+ * pnpm workspace, leaving the lane reporting nothing but its own `out`.
+ *
+ * Cycle-guarded the way the shadow walker is: keyed on the resolved path, so
+ * the same directory reached by two names is entered once.
  * @param fileSystem - File system to walk.
  * @param search - Directory to walk and the file-name test.
  * @param search.directoryPath - Directory to walk.
@@ -52,21 +61,73 @@ export function containsMatchingFile(
 	fileSystem: FileSystem,
 	{ directoryPath, matches }: { directoryPath: string; matches: (name: string) => boolean },
 ): boolean {
-	const entries = fileSystem.readdirSync(directoryPath, { withFileTypes: true });
-	return entries.some((entry) => {
-		if (entry.isFile() && matches(entry.name)) {
-			return true;
+	// Forward slashes throughout: `path.join` writes the host separator, and
+	// every path here is read through a file system that may not be the host's.
+	return directoryHoldsMatch(normalizeWindowsPath(directoryPath), new Set<string>());
+
+	/**
+	 * One directory's turn, with every link entered so far behind `visited`.
+	 * @param directory - Directory to read.
+	 * @param visited - Resolved paths of the links already descended into.
+	 * @returns True when some file under the directory matches.
+	 */
+	function directoryHoldsMatch(directory: string, visited: Set<string>): boolean {
+		let entries: Array<Dirent>;
+		try {
+			entries = fileSystem.readdirSync(directory, { withFileTypes: true });
+		} catch {
+			// A dangling link or an unreadable directory holds nothing to match;
+			// the walk above it still answers for the rest of the tree.
+			return false;
 		}
 
-		if (entry.isDirectory()) {
-			return containsMatchingFile(fileSystem, {
-				directoryPath: path.join(directoryPath, entry.name),
-				matches,
-			});
-		}
+		return entries.some((entry) => {
+			if (entry.isFile() && matches(entry.name)) {
+				return true;
+			}
 
-		return false;
-	});
+			if (entry.isDirectory()) {
+				return directoryHoldsMatch(`${directory}/${entry.name}`, visited);
+			}
+
+			if (!entry.isSymbolicLink()) {
+				return false;
+			}
+
+			// A link's `Dirent` says only "link": `stat` resolves whether the
+			// target is a file whose name matches or a directory to enter.
+			const child = `${directory}/${entry.name}`;
+			let stats: Stats;
+			try {
+				stats = fileSystem.statSync(child);
+			} catch {
+				// Dangling link: nothing behind it.
+				return false;
+			}
+
+			if (stats.isFile()) {
+				return matches(entry.name);
+			}
+
+			if (!stats.isDirectory()) {
+				return false;
+			}
+
+			let real: string;
+			try {
+				real = normalizeWindowsPath(fileSystem.realpathSync(child));
+			} catch {
+				return false;
+			}
+
+			if (visited.has(real)) {
+				return false;
+			}
+
+			visited.add(real);
+			return directoryHoldsMatch(child, visited);
+		});
+	}
 }
 
 /**
