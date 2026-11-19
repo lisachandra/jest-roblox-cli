@@ -1,7 +1,5 @@
 import * as path from "node:path";
 
-import { applyPlaceHook } from "../utils/place-hook.ts";
-
 import {
 	emitWorkspaceBuildManifests,
 	type WorkspacePackageCoverage,
@@ -15,6 +13,7 @@ import type { TimingCollector } from "../timing/orchestration-collector.ts";
 import type { ChildProcessRunner } from "../utils/child-process.ts";
 import type { FileSystem } from "../utils/file-system.ts";
 import type { PosixRoot } from "../utils/normalize-windows-path.ts";
+import { applyPlaceHook } from "../utils/place-hook.ts";
 import type { PrepareCoverage } from "./coverage-attach.ts";
 import { prepareWorkspaceCoverageMap } from "./coverage-attach.ts";
 import type { LoadedPackage } from "./package-loader.ts";

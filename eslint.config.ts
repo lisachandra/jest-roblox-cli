@@ -125,4 +125,33 @@ export default isentinel(
 			"antfu/no-top-level-await": "off",
 		},
 	},
+	// oxfmt wraps at printWidth 100. The shared config's comment-length limits
+	// (80/82) are narrower, so the rule reports comments oxfmt is happy with and
+	// then proposes a "fix" that is still over its own limit. ESLint re-applies
+	// it, sees no change, and gives up with a "circular fixes" warning, so those
+	// errors survive `--fix` forever ("N errors potentially fixable"). Matching
+	// the formatter's width makes the rule's own output satisfy the rule.
+	{
+		name: "project/comment-width",
+		files: ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
+		rules: {
+			"comment-length/limit-multi-line-comments": [
+				"error",
+				{
+					maxLength: 100,
+					mode: "compact-on-overflow",
+					semanticComments: ["oxlint-disable", "oxlint-enable"],
+					tabSize: 4,
+				},
+			],
+			"comment-length/limit-single-line-comments": [
+				"error",
+				{
+					maxLength: 100,
+					semanticComments: ["oxlint-disable", "oxlint-enable"],
+					tabSize: 4,
+				},
+			],
+		},
+	},
 );

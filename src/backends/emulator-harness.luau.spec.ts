@@ -25,7 +25,9 @@ describe("buildEmulatorHarnessLuau", () => {
 
 		expect(source).toContain("local threadEnv = getfenv(0)");
 		expect(source).toContain('folder.Name = ".luau-aliases"');
-		expect(source).toContain("Context.StandIn(getDataModelService, fakeGetDataModelServiceSource)");
+		expect(source).toContain(
+			"Context.StandIn(getDataModelService, fakeGetDataModelServiceSource)",
+		);
 		expect(source).toContain("debug.loadmodule = function(m)");
 	});
 

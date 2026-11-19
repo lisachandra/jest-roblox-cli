@@ -1,11 +1,10 @@
-import { describe, expect, it } from "vitest";
-
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { describe, expect, it } from "vitest";
 
-import type { EmulatorStageMapping } from "./emulator-stage.ts";
 import { applyCoverageTwins } from "./emulator-coverage.ts";
+import type { EmulatorStageMapping } from "./emulator-stage.ts";
 
 const MAPPINGS: Array<EmulatorStageMapping> = [
 	{ dataModelPath: "ReplicatedStorage/TS/client", fsPath: "out/client" },

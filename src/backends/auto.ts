@@ -6,9 +6,9 @@ import process from "node:process";
 import type { CliOptions, ResolvedConfig } from "../config/schema.ts";
 import type { FileSystem } from "../utils/file-system.ts";
 import { nodeFileSystem } from "../utils/file-system.ts";
+import { createEmulatorBackend } from "./emulator.ts";
 import type { Backend, BackendKind, ParallelOption } from "./interface.ts";
 import { createOpenCloudBackend } from "./open-cloud.ts";
-import { createEmulatorBackend } from "./emulator.ts";
 import { createStudioCliBackend } from "./studio-cli.ts";
 import {
 	configuredStudioPath,

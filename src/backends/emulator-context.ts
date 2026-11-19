@@ -2,8 +2,8 @@ import * as path from "node:path";
 
 import type { ResolvedConfig } from "../config/schema.ts";
 import { LuauScriptError } from "../reporter/luau-script-error.ts";
-import type { ProjectJob } from "./interface.ts";
 import type { EmulatorStageMapping } from "./emulator-stage.ts";
+import type { ProjectJob } from "./interface.ts";
 
 /** One output entry of ree's run summary. */
 export interface ReeOutputEntry {
@@ -50,7 +50,10 @@ const TS_EXTENSION = /\.tsx?$/iu;
  * @returns The Instance-path-shaped pattern.
  */
 export function toInstancePattern(pattern: string): string {
-	const normalized = pattern.replaceAll("\\", "/").replace(LEADING_SRC, "").replace(TS_EXTENSION, "");
+	const normalized = pattern
+		.replaceAll("\\", "/")
+		.replace(LEADING_SRC, "")
+		.replace(TS_EXTENSION, "");
 	return normalized.replace(INDEX_RENAME, "$1init$2");
 }
 
@@ -115,17 +118,6 @@ export function deriveRunContext(roots: ReadonlyArray<string>): "client" | "serv
 	}
 
 	return roots.every(isServerRoot) ? "server" : "client";
-}
-
-/**
- * Whether a DataModel path names a server-only service root.
- *
- * @param root - One mount-owning DataModel path.
- * @returns True when the path's first segment is a server-only service.
- */
-function isServerRoot(root: string): boolean {
-	const head = root.split("/")[0];
-	return head === "ServerScriptService" || head === "ServerStorage";
 }
 
 /**
@@ -229,7 +221,10 @@ export function tail(...parts: Array<string>): string {
  * @param outcome - Exit code and stderr for the error message.
  * @returns The parsed summary.
  */
-export function parseSummary(stdout: string, outcome: { code: number; stderr: string }): ReeSummary {
+export function parseSummary(
+	stdout: string,
+	outcome: { code: number; stderr: string },
+): ReeSummary {
 	const lines = stdout.split("\n").map((line) => line.trimEnd());
 	for (let index = lines.length - 1; index >= 0; index -= 1) {
 		const line = (lines[index] ?? "").trim();
@@ -305,12 +300,26 @@ function longestOwningMapping(
 	let best: EmulatorStageMapping | undefined;
 	for (const candidate of candidates) {
 		const owner = longestMappingFor(candidate, mappings);
-		if (owner !== undefined && (best === undefined || owner.fsPath.length > best.fsPath.length)) {
+		if (
+			owner !== undefined &&
+			(best === undefined || owner.fsPath.length > best.fsPath.length)
+		) {
 			best = owner;
 		}
 	}
 
 	return best;
+}
+
+/**
+ * Whether a DataModel path names a server-only service root.
+ *
+ * @param root - One mount-owning DataModel path.
+ * @returns True when the path's first segment is a server-only service.
+ */
+function isServerRoot(root: string): boolean {
+	const head = root.split("/", 1)[0];
+	return head === "ServerScriptService" || head === "ServerStorage";
 }
 
 /**

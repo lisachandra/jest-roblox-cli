@@ -82,4 +82,27 @@ export default isentinel(
 			],
 		},
 	},
+	{
+		name: "project/comment-width",
+		files: ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
+		rules: {
+			"comment-length/limit-multi-line-comments": [
+				"error",
+				{
+					maxLength: 100,
+					mode: "compact-on-overflow",
+					semanticComments: ["oxlint-disable", "oxlint-enable"],
+					tabSize: 4,
+				},
+			],
+			"comment-length/limit-single-line-comments": [
+				"error",
+				{
+					maxLength: 100,
+					semanticComments: ["oxlint-disable", "oxlint-enable"],
+					tabSize: 4,
+				},
+			],
+		},
+	},
 );

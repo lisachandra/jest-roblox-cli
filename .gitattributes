@@ -1,10 +1,27 @@
+# The index is LF. WG15 (Windows) clones set core.autocrlf=true, which without
+# a catch-all checks the whole tree out CRLF. That is not cosmetic: oxfmt and
+# ESLint behave differently on CRLF than on the LF tree CI checks out.
+# Concretely, on a CRLF worktree oxfmt emits one `Delete ␍` per line and never
+# reaches its other checks, so import-order and line-width violations are
+# INVISIBLE locally while CI fails on them; comment-length also counts the
+# trailing `\r` against maxLength and reports fixes it cannot make. `git diff`
+# then shows nothing (the CR is normalised away on the way into the object
+# store) while `git status` shows the whole tree modified, so the churn is easy
+# to commit by accident.
+#
+# Pin every text file to LF. Byte-exact fixtures opt out in their own
+# directory's .gitattributes (e.g. packages/luau-ast/test/fixtures/cst uses
+# `*.luau -text` for the CRLF fidelity fixtures), which takes precedence over
+# this catch-all.
+* text=auto eol=lf
+
 # pnpm pack (ERR_PNPM_BIN_CRLF) rejects a CRLF shebang: with core.autocrlf=true
-# bin/* checks out CRLF and tsdown build fails during game-repo setup. Pin LF.
+# bin/* used to check out CRLF and tsdown build failed during game-repo setup.
 bin/** text eol=lf
 
 # `luau/*.luau` is not compiled — it is spliced verbatim into generated test
-# scripts by string replacement (`src/backends/result-relay.ts`). With
-# autocrlf=true a CRLF checkout makes every spliced line end `\r\n`, so the
-# injected script stops matching the `\n`-joined text its tests assert on, and
-# a generated Luau program can carry stray carriage returns into Roblox.
+# scripts by string replacement (`src/backends/result-relay.ts`). A CRLF
+# checkout makes every spliced line end `\r\n`, so the injected script stops
+# matching the `\n`-joined text its tests assert on, and a generated Luau
+# program can carry stray carriage returns into Roblox.
 luau/** text eol=lf

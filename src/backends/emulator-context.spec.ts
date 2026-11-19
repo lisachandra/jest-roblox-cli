@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type { EmulatorStageMapping } from "./emulator-stage.ts";
 import {
 	deriveRunContext,
 	parseSummary,
 	resolveInstancePath,
 	toInstancePattern,
 } from "./emulator-context.ts";
+import type { EmulatorStageMapping } from "./emulator-stage.ts";
 
 const MAPPINGS: Array<EmulatorStageMapping> = [
 	{ dataModelPath: "ReplicatedStorage/TS/client", fsPath: "/repo/out/client" },
@@ -17,7 +17,10 @@ const MAPPINGS: Array<EmulatorStageMapping> = [
 	},
 ];
 
-function resolverFor(rootDirectory: string): { mappings: Array<EmulatorStageMapping>; rootDirectory: string } {
+function resolverFor(rootDirectory: string): {
+	mappings: Array<EmulatorStageMapping>;
+	rootDirectory: string;
+} {
 	return { mappings: MAPPINGS, rootDirectory };
 }
 
@@ -44,7 +47,9 @@ describe("resolveInstancePath", () => {
 		expect(resolveInstancePath("./out/test/setup", resolverFor("/repo"))).toBe(
 			"ReplicatedStorage/TS/test/setup",
 		);
-		expect(resolveInstancePath("/repo/unknown/where.luau", resolverFor("/repo"))).toBeUndefined();
+		expect(
+			resolveInstancePath("/repo/unknown/where.luau", resolverFor("/repo")),
+		).toBeUndefined();
 	});
 
 	it("should prefer the longest owning prefix", () => {
@@ -55,9 +60,9 @@ describe("resolveInstancePath", () => {
 			{ dataModelPath: "ReplicatedStorage/TS/client", fsPath: "/repo/out/client" },
 		];
 
-		expect(resolveInstancePath("/repo/out/client/x.luau", { mappings, rootDirectory: "/repo" })).toBe(
-			"ReplicatedStorage/TS/client/x.luau",
-		);
+		expect(
+			resolveInstancePath("/repo/out/client/x.luau", { mappings, rootDirectory: "/repo" }),
+		).toBe("ReplicatedStorage/TS/client/x.luau");
 	});
 });
 
@@ -91,7 +96,9 @@ describe("deriveRunContext", () => {
 		// answers `IsServer()` with false and its guards throw.
 		expect(deriveRunContext(["ServerScriptService/TS/server"])).toBe("server");
 		expect(deriveRunContext(["ServerStorage"])).toBe("server");
-		expect(deriveRunContext(["ServerScriptService/TS/server", "ServerStorage/x"])).toBe("server");
+		expect(deriveRunContext(["ServerScriptService/TS/server", "ServerStorage/x"])).toBe(
+			"server",
+		);
 	});
 
 	it("should run a suite mounted outside the server services as the client", () => {
@@ -101,9 +108,9 @@ describe("deriveRunContext", () => {
 		expect(deriveRunContext(["ReplicatedStorage/TS/shared"])).toBe("client");
 		// A job spanning both sides cannot run on one engine; client is both
 		// ree's default and the safe answer.
-		expect(deriveRunContext(["ServerScriptService/TS/server", "ReplicatedStorage/TS/shared"])).toBe(
-			"client",
-		);
+		expect(
+			deriveRunContext(["ServerScriptService/TS/server", "ReplicatedStorage/TS/shared"]),
+		).toBe("client");
 	});
 
 	it("should fall back to client when no root resolved", () => {
