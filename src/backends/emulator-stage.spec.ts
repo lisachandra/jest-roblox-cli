@@ -1,10 +1,26 @@
-import { describe, expect, it } from "vitest";
-
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { describe, expect, it } from "vitest";
 
-import { stageEmulatorMounts } from "./emulator-stage.ts";
+import { assertStagedMounts, EmulatorStagingError, stageEmulatorMounts } from "./emulator-stage.ts";
+import type { EmulatorStageMapping } from "./emulator-stage.ts";
+
+/**
+ * Narrows a caught value to the staging error, failing the spec when it is
+ * something else. The guard lives here rather than in the test body so the
+ * fork's `no-conditional-in-test` rule sees it as helper logic.
+ *
+ * @param caught - The value a `try` block caught.
+ * @returns The staging error.
+ */
+function stagingErrorOf(caught: unknown): EmulatorStagingError {
+	if (!(caught instanceof EmulatorStagingError)) {
+		throw new Error(`expected an EmulatorStagingError, got ${String(caught)}`);
+	}
+
+	return caught;
+}
 
 /**
  * Builds a minimal Rojo project tree: one `$path` mount whose directory is a
@@ -67,7 +83,9 @@ describe("stageEmulatorMounts", () => {
 
 		// Rojo's nested-project rule: the package folder is REPLACED by its
 		// declared name; ree skips dot entries — staging renames them to `_x`.
-		const isMainStaged = fs.existsSync(path.join(staged, "ReplicatedStorage/TS/client/main.luau"));
+		const isMainStaged = fs.existsSync(
+			path.join(staged, "ReplicatedStorage/TS/client/main.luau"),
+		);
 		const isNestedStaged = fs.existsSync(
 			path.join(staged, "ReplicatedStorage/TS/node_modules/@acme/Widgets/init.luau"),
 		);
@@ -81,7 +99,9 @@ describe("stageEmulatorMounts", () => {
 			path.join(staged, "ReplicatedStorage/TS/node_modules/@acme"),
 		);
 		const isVerbatimDropped = !nestedParentEntries.includes("widgets");
-		const isDotRenamed = fs.existsSync(path.join(staged, "ReplicatedStorage/TS/_cache/junk.txt"));
+		const isDotRenamed = fs.existsSync(
+			path.join(staged, "ReplicatedStorage/TS/_cache/junk.txt"),
+		);
 		fs.rmSync(root, { force: true, recursive: true });
 
 		expect(isMainStaged).toBeTrue();
@@ -92,7 +112,9 @@ describe("stageEmulatorMounts", () => {
 
 		expect(isDotRenamed).toBeTrue();
 
-		expect(result.mappings.map((mapping) => mapping.dataModelPath)).toContain("ReplicatedStorage/TS");
+		expect(result.mappings.map((mapping) => mapping.dataModelPath)).toContain(
+			"ReplicatedStorage/TS",
+		);
 	});
 
 	it("should write a manifest carrying the effective mappings", () => {
@@ -121,7 +143,10 @@ describe("stageEmulatorMounts", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "emu-stage-"));
 		const projectPath = writeFixtureTree(root);
 		const reflectionPath = path.join(root, "reflection.json");
-		fs.writeFileSync(reflectionPath, JSON.stringify({ classes: [{ name: "Frame" }, { name: "TextBox" }] }));
+		fs.writeFileSync(
+			reflectionPath,
+			JSON.stringify({ classes: [{ name: "Frame" }, { name: "TextBox" }] }),
+		);
 
 		stageEmulatorMounts({
 			reflectionPath,
@@ -144,5 +169,94 @@ describe("stageEmulatorMounts", () => {
 		expect(tags).toContain('"Frame"');
 
 		expect(serio).toContain('"Luau"');
+	});
+
+	it("should name both ends of every mapping the stage did not write", () => {
+		expect.assertions(4);
+
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "emu-stage-"));
+		const present: EmulatorStageMapping = {
+			dataModelPath: "ReplicatedStorage/TS/client",
+			fsPath: path.join(root, "out/client"),
+		};
+		const missing: EmulatorStageMapping = {
+			dataModelPath: "ReplicatedStorage/PacketProfiler/Components",
+			fsPath: path.join(root, "submodules/packet-profiler/src/Components"),
+		};
+		fs.mkdirSync(path.join(root, "stage/ReplicatedStorage/TS/client"), { recursive: true });
+
+		let caught: unknown;
+		try {
+			assertStagedMounts({
+				mappings: [present, missing],
+				stageDirectory: path.join(root, "stage"),
+			});
+		} catch (err) {
+			caught = err;
+		} finally {
+			fs.rmSync(root, { force: true, recursive: true });
+		}
+
+		expect(caught).toBeInstanceOf(EmulatorStagingError);
+
+		const error = stagingErrorOf(caught);
+
+		expect(error.missing).toStrictEqual([missing]);
+
+		expect(error.message).toContain(missing.dataModelPath);
+
+		// The source is named too, and marked gone when it no longer exists.
+		expect(error.message).toContain(`${missing.fsPath} (its source is gone too)`);
+	});
+
+	it("should pass a stage whose every mapping landed", () => {
+		expect.assertions(1);
+
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "emu-stage-"));
+		const mapping: EmulatorStageMapping = {
+			dataModelPath: "ReplicatedStorage/TS/client",
+			fsPath: path.join(root, "out/client"),
+		};
+		fs.mkdirSync(path.join(root, "stage/ReplicatedStorage/TS/client"), { recursive: true });
+
+		let shouldThrow = false;
+		try {
+			assertStagedMounts({ mappings: [mapping], stageDirectory: path.join(root, "stage") });
+		} catch {
+			shouldThrow = true;
+		} finally {
+			fs.rmSync(root, { force: true, recursive: true });
+		}
+
+		expect(shouldThrow).toBeFalse();
+	});
+
+	it("should not claim a source is gone when it is still on disk", () => {
+		expect.assertions(3);
+
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "emu-stage-"));
+		// The source is there; the copy is what did not land. The message must
+		// not send the reader looking for a deleted directory.
+		const mapping: EmulatorStageMapping = {
+			dataModelPath: "ReplicatedStorage/PacketProfiler/Components",
+			fsPath: path.join(root, "submodules/packet-profiler/src/Components"),
+		};
+		fs.mkdirSync(mapping.fsPath, { recursive: true });
+
+		let caught: unknown;
+		try {
+			assertStagedMounts({ mappings: [mapping], stageDirectory: path.join(root, "stage") });
+		} catch (err) {
+			caught = err;
+		} finally {
+			fs.rmSync(root, { force: true, recursive: true });
+		}
+
+		expect(caught).toBeInstanceOf(EmulatorStagingError);
+
+		const error = stagingErrorOf(caught);
+
+		expect(error.message).toContain(mapping.fsPath);
+		expect(error.message).not.toContain("its source is gone too");
 	});
 });

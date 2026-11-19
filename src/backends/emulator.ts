@@ -2,20 +2,10 @@ import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { decodeEnvelope } from "./envelope.ts";
-import type {
-	Backend,
-	BackendKind,
-	BackendOptions,
-	BackendResult,
-	EnvelopeEntry,
-	ProjectJob,
-	RawBackendEntry,
-} from "./interface.ts";
 import type { ResolvedConfig } from "../config/schema.ts";
-import { LuauScriptError } from "../reporter/luau-script-error.ts";
 import { NOOP_RUN_PROGRESS } from "../progress/reporter.ts";
 import { describeProjectCount } from "../progress/stages.ts";
+import { LuauScriptError } from "../reporter/luau-script-error.ts";
 import type { ChildProcessRunner } from "../utils/child-process.ts";
 import { nodeChildProcessRunner } from "../utils/child-process.ts";
 import {
@@ -31,7 +21,17 @@ import {
 import { applyCoverageTwins } from "./emulator-coverage.ts";
 import { buildEmulatorHarnessLuau } from "./emulator-harness.luau.ts";
 import type { EmulatorStageResult } from "./emulator-stage.ts";
-import { stageEmulatorMounts } from "./emulator-stage.ts";
+import { assertStagedMounts, EmulatorStagingError, stageEmulatorMounts } from "./emulator-stage.ts";
+import { decodeEnvelope } from "./envelope.ts";
+import type {
+	Backend,
+	BackendKind,
+	BackendOptions,
+	BackendResult,
+	EnvelopeEntry,
+	ProjectJob,
+	RawBackendEntry,
+} from "./interface.ts";
 
 /** One `ree` process: stdout/stderr and the exit outcome. */
 export interface EmulatorRun {
@@ -71,6 +71,12 @@ export interface EmulatorBackendOptions {
 const JEST_RESULTS_MARKER = "@JEST_RESULTS ";
 const DEFAULT_STAGE_DIRECTORY = ".jest-roblox/emulator";
 const DEFAULT_SECONDS = 30;
+/**
+ * What ree says when a `--mount` target is not on disk. Windows reports the
+ * path in the message with `os error 3`; the message text is stable across
+ * the platforms that reach this branch.
+ */
+const MOUNT_PATH_MISS_PATTERN = /(?:os error 3\b|cannot find the path specified)/iu;
 
 /** One prepared run: the stage, its mount args and the written harness. */
 interface PreparedRun {
@@ -107,7 +113,8 @@ export class EmulatorBackend implements Backend {
 	constructor(options: EmulatorBackendOptions) {
 		this.config = options.config;
 		this.reePath = options.reePath ?? options.config.emulator?.reePath ?? "ree";
-		this.launch = options.launch ?? defaultLauncher(options.processRunner ?? nodeChildProcessRunner);
+		this.launch =
+			options.launch ?? defaultLauncher(options.processRunner ?? nodeChildProcessRunner);
 		this.stage = options.stage ?? stageEmulatorMounts;
 		this.writeFile = options.writeFile ?? fs.writeFileSync;
 	}
@@ -153,7 +160,146 @@ export class EmulatorBackend implements Backend {
 		};
 	}
 
+	/**
+	 * Launches one ree process and waits for its outcome.
+	 *
+	 * @param args - The full argument list for `ree run`.
+	 * @returns The process exit code and captured output.
+	 */
+	private async launchRunAsync(
+		args: Array<string>,
+	): Promise<{ code: number; stderr: string; stdout: string }> {
+		const run = await this.launch({
+			args,
+			cwd: this.config.rootDir,
+			reePath: this.reePath,
+		});
+		return run.done;
+	}
+
 	private prepareOnce(firstJob: ProjectJob): PreparedRun {
+		// A stage that leaves a mount missing is rebuilt once before it is
+		// reported: the miss is usually a link that dangled mid-copy, and a
+		// second walk of the tree resolves or drops it for good. Only a miss
+		// that survives the rebuild is a staging failure worth failing the run
+		// on — and it fails here, naming both ends of the pair, instead of at
+		// ree launch as a bare "cannot find the path specified".
+		const prepared = this.stageOnce(firstJob);
+		try {
+			this.verifyMounts(prepared);
+			return prepared;
+		} catch (err) {
+			if (!(err instanceof EmulatorStagingError)) {
+				throw err;
+			}
+
+			console.warn(`[jest-roblox] emulator: ${err.message}\nRebuilding the stage once.`);
+		}
+
+		const rebuilt = this.stageOnce(firstJob);
+		this.verifyMounts(rebuilt);
+		return rebuilt;
+	}
+
+	private async runJobAsync(job: ProjectJob, prepared: PreparedRun): Promise<EnvelopeEntry> {
+		const emulatorConfig = this.config.emulator;
+		const startedAt = Date.now();
+
+		const roots = collectJobRoots(job, prepared.stage.mappings);
+		const setupFiles = collectSetupFiles(job, prepared.stage.mappings);
+		const ignorePatterns = (emulatorConfig?.ignorePatterns ?? []).map(toInstancePattern);
+
+		const context = {
+			ci: false,
+			coverage: this.config.collectCoverage,
+			ignorePatterns,
+			pattern: job.config.testPathPattern,
+			roots,
+			runnerPath: job.config.jestPath,
+			setupFiles,
+			testNamePattern: job.config.testNamePattern,
+			verbose: false,
+		};
+
+		const args = [
+			"run",
+			"--harness",
+			prepared.harnessPath,
+			...prepared.mountArgs,
+			"--mode",
+			"play",
+			"--seconds",
+			String(emulatorConfig?.seconds ?? DEFAULT_SECONDS),
+			"--run-context",
+			deriveRunContext(roots),
+			"--context",
+			JSON.stringify(context),
+		];
+
+		// Verify immediately before the launch: the stage was built once for
+		// the whole run and is read by every job, so a mount directory removed
+		// since then would surface as ree's path miss rather than as the
+		// staging problem it is. Throwing here names the mapping and its source.
+		this.verifyMounts(prepared);
+		let outcome = await this.launchRunAsync(args);
+
+		// One retry when ree reports a mount path miss. Re-staging here would
+		// mean mutating a stage other jobs may still be reading, so the retry
+		// re-verifies and relaunches: a miss that was transient (a filesystem
+		// still settling, a cleaner that has moved on) resolves, and one that
+		// persists fails at `verifyMounts` with the mapping named. The retry is
+		// bounded to one so a genuinely missing mount cannot loop.
+		if (isMountPathMiss(outcome)) {
+			console.warn(
+				`[jest-roblox] emulator: ree reported a missing mount path; verifying the stage and retrying once: ${tail(outcome.stderr)}`,
+			);
+			this.verifyMounts(prepared);
+			outcome = await this.launchRunAsync(args);
+		}
+
+		const summary = parseSummary(outcome.stdout, outcome);
+
+		const output = summary.output ?? [];
+		const markerEntry = output.find((entry): entry is ReeOutputEntry & { message: string } => {
+			return entry.message?.startsWith(JEST_RESULTS_MARKER) === true;
+		});
+		const gameOutput = JSON.stringify(
+			output.filter((entry) => {
+				return (
+					entry.message === undefined || !entry.message.startsWith(JEST_RESULTS_MARKER)
+				);
+			}),
+		);
+
+		if (markerEntry === undefined) {
+			const error = new LuauScriptError(
+				`emulator run produced no test results (status ${summary.status ?? "unknown"}): ${tail(
+					outcome.stderr,
+					outcome.stdout,
+				)}`,
+			);
+			error.gameOutput = gameOutput;
+			throw error;
+		}
+
+		const envelope = decodeEnvelope(markerEntry.message.slice(JEST_RESULTS_MARKER.length));
+		const first = envelope.entries[0];
+		if (first === undefined) {
+			const error = new LuauScriptError("emulator envelope carried no entries");
+			error.gameOutput = gameOutput;
+			throw error;
+		}
+
+		return {
+			elapsedMs: Date.now() - startedAt,
+			gameOutput,
+			jestOutput: first.jestOutput,
+			pkg: job.pkg,
+			project: job.displayName,
+		};
+	}
+
+	private stageOnce(firstJob: ProjectJob): PreparedRun {
 		const emulatorConfig = this.config.emulator;
 		const stageDirectory = path.resolve(
 			this.config.rootDir,
@@ -166,7 +312,9 @@ export class EmulatorBackend implements Backend {
 					: path.resolve(this.config.rootDir, emulatorConfig.reflectionPath),
 			rojoProjectPath: path.resolve(
 				this.config.rootDir,
-				emulatorConfig?.rojoProjectPath ?? firstJob.config.rojoProject ?? "default.project.json",
+				emulatorConfig?.rojoProjectPath ??
+					firstJob.config.rojoProject ??
+					"default.project.json",
 			),
 			stageDirectory,
 		});
@@ -190,7 +338,10 @@ export class EmulatorBackend implements Backend {
 		// so the stage path reads identically in CI and locally.
 		const stageRoot = stage.stageDirectory.replaceAll("\\", "/");
 		for (const mapping of stage.mappings) {
-			mountArgs.push("--mount", `${mapping.dataModelPath}=${stageRoot}/${mapping.dataModelPath}`);
+			mountArgs.push(
+				"--mount",
+				`${mapping.dataModelPath}=${stageRoot}/${mapping.dataModelPath}`,
+			);
 		}
 
 		// Studio-authored containers (ReplicatedStorage.{UI,Models,VFX,...}) are
@@ -200,7 +351,10 @@ export class EmulatorBackend implements Backend {
 		// container stubs, so a fresh checkout without the place cache still
 		// runs specs that only need the containers to exist.
 		if (emulatorConfig?.snapshotsDirectory !== undefined) {
-			const snapshotsDirectory = path.resolve(this.config.rootDir, emulatorConfig.snapshotsDirectory);
+			const snapshotsDirectory = path.resolve(
+				this.config.rootDir,
+				emulatorConfig.snapshotsDirectory,
+			);
 			if (fs.existsSync(snapshotsDirectory)) {
 				mountArgs.push("--snapshot-dir", snapshotsDirectory);
 			} else {
@@ -217,81 +371,22 @@ export class EmulatorBackend implements Backend {
 		};
 	}
 
-	private async runJobAsync(job: ProjectJob, prepared: PreparedRun): Promise<EnvelopeEntry> {
-		const emulatorConfig = this.config.emulator;
-		const startedAt = Date.now();
-
-		const roots = collectJobRoots(job, prepared.stage.mappings);
-		const setupFiles = collectSetupFiles(job, prepared.stage.mappings);
-		const ignorePatterns = (emulatorConfig?.ignorePatterns ?? []).map(toInstancePattern);
-
-		const context = {
-			ci: false,
-			coverage:  this.config.collectCoverage,
-			ignorePatterns,
-			pattern: job.config.testPathPattern,
-			roots,
-			runnerPath: job.config.jestPath,
-			setupFiles,
-			testNamePattern: job.config.testNamePattern,
-			verbose: false,
-		};
-
-		const run = await this.launch({
-			args: [
-				"run",
-				"--harness",
-				prepared.harnessPath,
-				...prepared.mountArgs,
-				"--mode",
-				"play",
-				"--seconds",
-				String(emulatorConfig?.seconds ?? DEFAULT_SECONDS),
-				"--run-context",
-				deriveRunContext(roots),
-				"--context",
-				JSON.stringify(context),
-			],
-			cwd: this.config.rootDir,
-			reePath: this.reePath,
+	/**
+	 * Fails when a stage mapping has no directory under the stage root.
+	 *
+	 * Called once at staging and again immediately before every launch: the
+	 * stage is built once per run and read many times, so a directory that was
+	 * removed between the two — a cleaner running alongside, a tree rewritten
+	 * by a later stage attempt — would otherwise reach ree as a path miss.
+	 *
+	 * @param prepared - The prepared run whose stage must be intact.
+	 * @throws {EmulatorStagingError} Naming every mapping the stage is missing.
+	 */
+	private verifyMounts(prepared: PreparedRun): void {
+		assertStagedMounts({
+			mappings: prepared.stage.mappings,
+			stageDirectory: prepared.stage.stageDirectory,
 		});
-		const outcome = await run.done;
-		const summary = parseSummary(outcome.stdout, outcome);
-
-		const output = summary.output ?? [];
-		const markerEntry = output.find((entry): entry is ReeOutputEntry & { message: string } => {
-			return entry.message?.startsWith(JEST_RESULTS_MARKER) === true;
-		});
-		const gameOutput = JSON.stringify(
-			output.filter((entry) => {
-				return entry.message === undefined || !entry.message.startsWith(JEST_RESULTS_MARKER);
-			}),
-		);
-
-		if (markerEntry === undefined) {
-			const error = new LuauScriptError(
-				`emulator run produced no test results (status ${summary.status ?? "unknown"}): ${ 
-					tail(outcome.stderr, outcome.stdout)}`,
-			);
-			error.gameOutput = gameOutput;
-			throw error;
-		}
-
-		const envelope = decodeEnvelope(markerEntry.message.slice(JEST_RESULTS_MARKER.length));
-		const first = envelope.entries[0];
-		if (first === undefined) {
-			const error = new LuauScriptError("emulator envelope carried no entries");
-			error.gameOutput = gameOutput;
-			throw error;
-		}
-
-		return {
-			elapsedMs: Date.now() - startedAt,
-			gameOutput,
-			jestOutput: first.jestOutput,
-			pkg: job.pkg,
-			project: job.displayName,
-		};
 	}
 }
 
@@ -302,6 +397,24 @@ export class EmulatorBackend implements Backend {
  */
 export function createEmulatorBackend(options: EmulatorBackendOptions): EmulatorBackend {
 	return new EmulatorBackend(options);
+}
+
+/**
+ * Whether ree's outcome reads as a missing mount directory rather than as a
+ * script failure. Ree reports a `--mount` target it cannot open before any
+ * Luau runs, so a run carrying this text produced no results at all.
+ *
+ * @param outcome - The failed ree outcome.
+ * @returns True when the process output names a mount path miss.
+ */
+function isMountPathMiss(outcome: { code: number; stderr: string; stdout: string }): boolean {
+	if (outcome.code === 0) {
+		return false;
+	}
+
+	return (
+		MOUNT_PATH_MISS_PATTERN.test(outcome.stderr) || MOUNT_PATH_MISS_PATTERN.test(outcome.stdout)
+	);
 }
 
 function defaultLauncher(processRunner: ChildProcessRunner): EmulatorLauncher {

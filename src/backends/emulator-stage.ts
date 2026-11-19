@@ -3,7 +3,6 @@ import { collectMounts, loadRojoProject, type Mount } from "@isentinel/rojo-util
 import * as fs from "node:fs";
 import * as path from "node:path";
 import process from "node:process";
-
 import color from "tinyrainbow";
 
 /**
@@ -69,6 +68,53 @@ interface NestedProject {
 }
 
 /**
+ * The stage tree lacks a mount the launch would pass to ree.
+ *
+ * A mapping can be emitted without its directory landing: `copyDeref` walks
+ * away from a source whose realpath no longer resolves (a link that dangled
+ * between the mount scan and the copy), and the walk of a large tree can be
+ * interrupted without failing the mount as a whole. Neither leaves an error
+ * behind, and ree only finds out at launch — as a bare "cannot find the path
+ * specified" that names no source. This error carries both ends of the pair
+ * instead, at the phase that built it.
+ */
+export class EmulatorStagingError extends Error {
+	/** The mappings that did not land, in copy order. */
+	public readonly missing: ReadonlyArray<EmulatorStageMapping>;
+	/** The constructor name, so a cross-realm copy still reads as its own. */
+	public override readonly name = "EmulatorStagingError";
+	/** Absolute stage root the mounts were written under. */
+	public readonly stageDirectory: string;
+
+	/**
+	 * Builds the message from the mappings the stage is missing.
+	 *
+	 * @param options - The mappings that did not land and the stage root.
+	 */
+	constructor({
+		missing,
+		stageDirectory,
+	}: {
+		missing: ReadonlyArray<EmulatorStageMapping>;
+		stageDirectory: string;
+	}) {
+		const lines = missing.map((mapping) => {
+			const gone = fs.existsSync(mapping.fsPath) ? "" : " (its source is gone too)";
+			return `  ${mapping.dataModelPath} <- ${mapping.fsPath}${gone}`;
+		});
+		super(
+			[
+				`emulator staging did not produce ${missing.length.toString()} mapped path(s) under ${stageDirectory}:`,
+				...lines,
+				'ree would fail at launch with a bare "cannot find the path specified"; fix the mount source or the Rojo project entry.',
+			].join("\n"),
+		);
+		this.missing = missing;
+		this.stageDirectory = stageDirectory;
+	}
+}
+
+/**
  * Builds the stage. Returns the effective mounts; callers derive harness
  * mounts from `mappings` (one `--mount
  * <dataModelPath>=<stage>/<dataModelPath>` per entry) and resolve setup files
@@ -91,7 +137,9 @@ export function stageEmulatorMounts(options: EmulatorStageOptions): EmulatorStag
 			// Rojo resolves relative `$path`s against the project file's
 			// directory; the mappings must be absolute so path-prefix matching
 			// against absolute test-file paths (rootDir-joined) works downstream.
-			fsPath: path.isAbsolute(mount.fsPath) ? mount.fsPath : path.resolve(projectDirectory, mount.fsPath),
+			fsPath: path.isAbsolute(mount.fsPath)
+				? mount.fsPath
+				: path.resolve(projectDirectory, mount.fsPath),
 		};
 	});
 
@@ -104,7 +152,37 @@ export function stageEmulatorMounts(options: EmulatorStageOptions): EmulatorStag
 	patchSerio(stageDirectory);
 	writeManifest(stageDirectory, mappings);
 
+	// Not asserted here: the backend verifies the result and rebuilds once on a
+	// miss (see `EmulatorBackend.prepareOnce`), which it cannot do if this
+	// throws on the first attempt.
 	return { mappings, stageDirectory };
+}
+
+/**
+ * Fails when a mapping has no directory under the stage root.
+ *
+ * The check runs at the end of staging and again immediately before a launch,
+ * so a stage tree that was cleaned or half-written between the two cannot
+ * reach ree as a path miss. It is a handful of `existsSync` calls against a
+ * stage built once per run — cheaper than one misdiagnosed ree failure.
+ *
+ * @param options - The mappings to check and the stage root they should sit under.
+ * @throws {EmulatorStagingError} Naming every mapping the stage is missing.
+ */
+export function assertStagedMounts({
+	mappings,
+	stageDirectory,
+}: {
+	mappings: ReadonlyArray<EmulatorStageMapping>;
+	stageDirectory: string;
+}): void {
+	const missing = mappings.filter((mapping) => {
+		return !fs.existsSync(path.join(stageDirectory, mapping.dataModelPath));
+	});
+
+	if (missing.length > 0) {
+		throw new EmulatorStagingError({ missing, stageDirectory });
+	}
 }
 
 function classifyPath(fsPath: string): "directory" | "file" | "missing" {
@@ -286,7 +364,9 @@ function flattenNestedProjects({
 			continue;
 		}
 
-		mappings.push(projectNestedPackage({ instancePrefix, nested, packageDirectory, stageDirectory }));
+		mappings.push(
+			projectNestedPackage({ instancePrefix, nested, packageDirectory, stageDirectory }),
+		);
 	}
 }
 
@@ -427,7 +507,9 @@ function findStageDirectory(root: string, segments: Array<string>): string | und
 			continue;
 		}
 
-		const candidates = entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith("."));
+		const candidates = entries.filter(
+			(entry) => entry.isDirectory() && !entry.name.startsWith("."),
+		);
 		for (const entry of candidates) {
 			const full = path.join(current, entry.name);
 			if (entry.name === segments[0]) {
@@ -537,5 +619,8 @@ function writeManifest(stageDirectory: string, mappings: Array<EmulatorStageMapp
 			};
 		}),
 	};
-	fs.writeFileSync(path.join(stageDirectory, "manifest.json"), `${JSON.stringify(manifest, undefined, "\t")}\n`);
+	fs.writeFileSync(
+		path.join(stageDirectory, "manifest.json"),
+		`${JSON.stringify(manifest, undefined, "\t")}\n`,
+	);
 }
