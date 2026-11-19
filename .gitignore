@@ -6,6 +6,10 @@ coverage/
 reports/
 projectStructure.cache.json
 *.tsbuildinfo
+# The e2e harness points mise at a scratch dir under the spec directory;
+# it fills with a downloaded toolchain, so keep it out of the tree.
+test/e2e/cli/.tmp/
+
 # Local scratch. The e2e fixtures use `.jest-roblox/` for their own state, so
 # only the root `.tmp/` is ignored.
 /.tmp/
